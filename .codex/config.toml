@@ -1,0 +1,19 @@
+model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
+web_search = "live"
+personality = "pragmatic"
+
+# Minimal repo-local Codex config. If you want Codex to trust this repo:
+#   Add a [projects."/absolute/path/to/agentic-lite"] section in your *user* config.
+
+[features]
+parallel = true
+skills = true
+unified_exec = true
+view_image_tool = true
+
+[shell_environment_policy]
+inherit = "all"
+
+[projects."/Users/richardwei/agentic-lite"]
+trust_level = "trusted"

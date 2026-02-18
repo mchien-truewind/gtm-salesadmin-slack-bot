@@ -1,0 +1,87 @@
+name: Daily Lead Progress
+
+on:
+  schedule:
+    # Run both 01:00 and 02:00 UTC; job logic gates to exactly 18:00 America/Los_Angeles.
+    - cron: "0 1 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      target_channel:
+        description: "Optional channel name override (e.g., slack-testing)"
+        required: false
+        type: string
+      dry_run:
+        description: "Compute only; do not post"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  post-progress:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: daily-lead-progress
+      cancel-in-progress: false
+    env:
+      SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
+      LEAD_REPORT_TARGET_CHANNEL: ${{ vars.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general' }}
+      LEAD_REPORT_INBOUND_CHANNEL: ${{ vars.LEAD_REPORT_INBOUND_CHANNEL || 'leads' }}
+      LEAD_REPORT_OUTBOUND_CHANNEL: ${{ vars.LEAD_REPORT_OUTBOUND_CHANNEL || 'gtm-outbound' }}
+      LEAD_REPORT_INBOUND_PHRASE: ${{ vars.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting' }}
+      LEAD_REPORT_OUTBOUND_PHRASE: ${{ vars.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting' }}
+      LEAD_REPORT_WINDOW_HOURS: ${{ vars.LEAD_REPORT_WINDOW_HOURS || '24' }}
+      LEAD_REPORT_TIMEZONE: ${{ vars.LEAD_REPORT_TIMEZONE || 'America/Los_Angeles' }}
+      INPUT_TARGET_CHANNEL: ${{ github.event.inputs.target_channel || '' }}
+      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Schedule Gate (6 PM Pacific)
+        id: gate
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          HOUR_PT=$(python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("America/Los_Angeles"))
+          print(now.strftime("%H"))
+          PY
+          )
+
+          if [[ "$HOUR_PT" == "18" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping run because Pacific hour is ${HOUR_PT}, not 18."
+          fi
+
+      - name: Run Daily Progress Post
+        if: steps.gate.outputs.should_run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [[ -n "${INPUT_TARGET_CHANNEL}" ]]; then
+            args+=(--target-channel "${INPUT_TARGET_CHANNEL}")
+          fi
+          if [[ "${INPUT_DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          python3 scripts/slack/post_daily_progress.py "${args[@]}"

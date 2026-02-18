@@ -1,0 +1,13 @@
+.env.local
+.DS_Store
+
+# Task logs and stitched context are local-only by default
+docs/tasks/
+docs/context/
+docs/logs/
+
+# Worktrees directory (created by git worktree under the common dir)
+.worktrees/
+
+# Scratch
+/tmp/
