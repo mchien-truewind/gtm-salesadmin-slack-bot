@@ -147,7 +147,7 @@ def build_message(
     week_total = week_inbound + week_outbound
     if now_local.weekday() == 5:
         return (
-            "This week so far\n"
+            ":star2: Total Count for The Week\n"
             f"Inbound: {week_inbound}\n"
             f"Outbound: {week_outbound}\n"
             f"Total: {week_total}"
