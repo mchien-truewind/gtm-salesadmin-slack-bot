@@ -2,9 +2,10 @@
 """Post daily lead progress counts to Slack.
 
 Default behavior:
-- Inbound count: messages in #leads containing "Booked Calendly Meeting" in last 24 hours
-- Outbound count: messages in #gtm-outbound containing "New Meeting" in last 24 hours
+- Inbound count: messages in #leads containing "Booked Calendly Meeting"
+- Outbound count: messages in #gtm-outbound containing "New Meeting"
 - Target channel: #gtm-general
+- Week is Sunday-Saturday in report timezone.
 """
 
 from __future__ import annotations
@@ -63,7 +64,6 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
-        "window_hours": pick("LEAD_REPORT_WINDOW_HOURS", "24"),
     }
 
 
@@ -137,18 +137,37 @@ def count_contains_phrase(token: str, channel_id: str, phrase: str, oldest: floa
             return total
 
 
-def build_message(date_str: str, inbound: int, outbound: int) -> str:
-    total = inbound + outbound
+def build_message(
+    now_local: datetime,
+    today_inbound: int,
+    today_outbound: int,
+    week_inbound: int,
+    week_outbound: int,
+) -> str:
+    week_total = week_inbound + week_outbound
+    if now_local.weekday() == 5:
+        return (
+            ":star2: Total Count for The Week\n"
+            f"Inbound: {week_inbound}\n"
+            f"Outbound: {week_outbound}\n"
+            f"Total: {week_total}"
+        )
+
+    today_total = today_inbound + today_outbound
     return (
-        "Today's Progress\n"
-        f"Date: {date_str}\n"
-        f":hand: Today's Inbound Leads: {inbound}\n"
-        f":outbox_tray: Today's Outbound Leads: {outbound}\n"
-        f"Total Meetings Booked: {total}"
+        "Today Date\n"
+        f"Inbound: {today_inbound}\n"
+        f"Outbound: {today_outbound}\n"
+        f"Total: {today_total}\n"
+        "\n"
+        "This week so far\n"
+        f"Inbound: {week_inbound}\n"
+        f"Outbound: {week_outbound}\n"
+        f"Total: {week_total}"
     )
 
 
-def compute_counts(config: Dict[str, str]) -> Tuple[int, int]:
+def compute_counts(config: Dict[str, str]) -> Tuple[datetime, int, int, int, int, str]:
     token = config["token"]
     names = [config["inbound_channel"], config["outbound_channel"], config["target_channel"]]
     channels = resolve_public_channels(token, names)
@@ -157,26 +176,35 @@ def compute_counts(config: Dict[str, str]) -> Tuple[int, int]:
         if name not in channels:
             raise RuntimeError(f"Channel not found or not public: #{name}")
 
-    hours = int(config["window_hours"])
-    now_utc = datetime.now(timezone.utc)
-    oldest = (now_utc - timedelta(hours=hours)).timestamp()
-    latest = now_utc.timestamp()
+    report_tz = ZoneInfo(config["report_tz"])
+    now_local = datetime.now(report_tz)
+    start_today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    days_since_sunday = (now_local.weekday() + 1) % 7
+    start_week_local = start_today_local - timedelta(days=days_since_sunday)
 
-    inbound = count_contains_phrase(
-        token,
-        channels[config["inbound_channel"]],
-        config["inbound_phrase"],
-        oldest,
-        latest,
-    )
-    outbound = count_contains_phrase(
-        token,
-        channels[config["outbound_channel"]],
-        config["outbound_phrase"],
-        oldest,
-        latest,
-    )
-    return inbound, outbound
+    def count_for_window(start_local: datetime) -> Tuple[int, int]:
+        oldest = start_local.astimezone(timezone.utc).timestamp()
+        latest = now_local.astimezone(timezone.utc).timestamp()
+        inbound = count_contains_phrase(
+            token,
+            channels[config["inbound_channel"]],
+            config["inbound_phrase"],
+            oldest,
+            latest,
+        )
+        outbound = count_contains_phrase(
+            token,
+            channels[config["outbound_channel"]],
+            config["outbound_phrase"],
+            oldest,
+            latest,
+        )
+        return inbound, outbound
+
+    today_inbound, today_outbound = count_for_window(start_today_local)
+    week_inbound, week_outbound = count_for_window(start_week_local)
+    target_channel_id = channels[config["target_channel"]]
+    return now_local, today_inbound, today_outbound, week_inbound, week_outbound, target_channel_id
 
 
 def main() -> int:
@@ -184,19 +212,19 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     config = get_config(repo_root, args)
 
-    inbound, outbound = compute_counts(config)
-    report_tz = ZoneInfo(config["report_tz"])
-    date_str = datetime.now(report_tz).strftime("%Y-%m-%d")
-    text = build_message(date_str, inbound, outbound)
+    (
+        now_local,
+        today_inbound,
+        today_outbound,
+        week_inbound,
+        week_outbound,
+        target_channel_id,
+    ) = compute_counts(config)
+    text = build_message(now_local, today_inbound, today_outbound, week_inbound, week_outbound)
 
     if args.dry_run:
         print(text)
         return 0
-
-    channels = resolve_public_channels(config["token"], [config["target_channel"]])
-    if config["target_channel"] not in channels:
-        raise RuntimeError(f"Target channel not found: #{config['target_channel']}")
-    target_channel_id = channels[config["target_channel"]]
 
     payload = slack_api(
         "chat.postMessage",
@@ -206,7 +234,10 @@ def main() -> int:
     )
     print(
         f"posted channel=#{config['target_channel']} "
-        f"channel_id={target_channel_id} ts={payload.get('ts')} inbound={inbound} outbound={outbound}"
+        f"channel_id={target_channel_id} ts={payload.get('ts')} "
+        f"today_inbound={today_inbound} today_outbound={today_outbound} "
+        f"week_inbound={week_inbound} week_outbound={week_outbound} "
+        f"local_time={now_local.isoformat()}"
     )
     return 0
 
