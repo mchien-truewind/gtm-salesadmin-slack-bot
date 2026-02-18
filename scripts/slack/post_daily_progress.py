@@ -147,7 +147,7 @@ def build_message(
     week_total = week_inbound + week_outbound
     if now_local.weekday() == 5:
         return (
-            "Total this week so far\n"
+            "This week so far\n"
             f"Inbound: {week_inbound}\n"
             f"Outbound: {week_outbound}\n"
             f"Total: {week_total}"
@@ -155,12 +155,12 @@ def build_message(
 
     today_total = today_inbound + today_outbound
     return (
-        f"Today Date: {now_local.strftime('%Y-%m-%d')}\n"
+        "Today Date\n"
         f"Inbound: {today_inbound}\n"
         f"Outbound: {today_outbound}\n"
         f"Total: {today_total}\n"
         "\n"
-        "Total this week so far\n"
+        "This week so far\n"
         f"Inbound: {week_inbound}\n"
         f"Outbound: {week_outbound}\n"
         f"Total: {week_total}"
