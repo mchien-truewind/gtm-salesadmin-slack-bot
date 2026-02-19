@@ -64,6 +64,7 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
+        "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "17.5"),
     }
 
 
@@ -143,27 +144,40 @@ def build_message(
     today_outbound: int,
     week_inbound: int,
     week_outbound: int,
+    weekly_goal: float,
 ) -> str:
+    def fmt_num(value: float) -> str:
+        text = f"{value:.2f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+
+    date_label = f"{now_local.month}/{now_local.day}/{now_local.strftime('%y')}"
     week_total = week_inbound + week_outbound
+    remaining = max(weekly_goal - week_total, 0.0)
     if now_local.weekday() == 5:
         return (
             ":star2: Total Count for The Week\n"
             f"Inbound: {week_inbound}\n"
             f"Outbound: {week_outbound}\n"
-            f"Total: {week_total}"
+            f"Total: {week_total}\n"
+            "\n"
+            f"Weekly Goal: {fmt_num(weekly_goal)}\n"
+            f":star2: How many more do we need? {fmt_num(remaining)}"
         )
 
     today_total = today_inbound + today_outbound
     return (
-        "Today Date\n"
+        f"Today {date_label}\n"
         f"Inbound: {today_inbound}\n"
         f"Outbound: {today_outbound}\n"
         f"Total: {today_total}\n"
-        "\n"
+        "\n\n"
         "This week so far\n"
         f"Inbound: {week_inbound}\n"
         f"Outbound: {week_outbound}\n"
-        f"Total: {week_total}"
+        f"Total: {week_total}\n"
+        "\n"
+        f"Weekly Goal: {fmt_num(weekly_goal)}\n"
+        f":star2: How many more do we need? {fmt_num(remaining)}"
     )
 
 
@@ -211,6 +225,10 @@ def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
     config = get_config(repo_root, args)
+    try:
+        weekly_goal = float(config["weekly_goal"])
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid LEAD_REPORT_WEEKLY_GOAL: {config['weekly_goal']}") from exc
 
     (
         now_local,
@@ -220,7 +238,14 @@ def main() -> int:
         week_outbound,
         target_channel_id,
     ) = compute_counts(config)
-    text = build_message(now_local, today_inbound, today_outbound, week_inbound, week_outbound)
+    text = build_message(
+        now_local,
+        today_inbound,
+        today_outbound,
+        week_inbound,
+        week_outbound,
+        weekly_goal,
+    )
 
     if args.dry_run:
         print(text)
