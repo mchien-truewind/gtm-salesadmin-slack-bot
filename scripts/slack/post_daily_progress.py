@@ -65,6 +65,7 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
         "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "17.5"),
+        "force_mode": pick("LEAD_REPORT_FORCE_MODE", ""),
     }
 
 
@@ -138,6 +139,52 @@ def count_contains_phrase(token: str, channel_id: str, phrase: str, oldest: floa
             return total
 
 
+def pick_report_mode(now_local: datetime, force_mode: str) -> str:
+    mode = force_mode.strip().lower()
+    if mode in {"daily", "weekly"}:
+        return mode
+    # Default weekly summary on Sunday; daily on other days.
+    return "weekly" if now_local.weekday() == 6 else "daily"
+
+
+def date_label(now_local: datetime) -> str:
+    return f"{now_local.month}/{now_local.day}/{now_local.strftime('%y')}"
+
+
+def already_posted(token: str, target_channel_id: str, now_local: datetime, mode: str) -> bool:
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    oldest = start_local.astimezone(timezone.utc).timestamp()
+    latest = now_local.astimezone(timezone.utc).timestamp()
+
+    daily_prefix = f"Today {date_label(now_local)}"
+    weekly_prefix = ":star2: Total Count for The Week"
+
+    cursor = ""
+    while True:
+        payload = slack_api(
+            "conversations.history",
+            token,
+            {
+                "channel": target_channel_id,
+                "oldest": str(oldest),
+                "latest": str(latest),
+                "inclusive": "true",
+                "limit": "200",
+                "cursor": cursor,
+            },
+            use_get=True,
+        )
+        for msg in payload.get("messages", []):
+            text = msg.get("text") or ""
+            if mode == "daily" and text.startswith(daily_prefix):
+                return True
+            if mode == "weekly" and text.startswith(weekly_prefix):
+                return True
+        cursor = (payload.get("response_metadata") or {}).get("next_cursor", "")
+        if not cursor:
+            return False
+
+
 def build_message(
     now_local: datetime,
     today_inbound: int,
@@ -145,15 +192,15 @@ def build_message(
     week_inbound: int,
     week_outbound: int,
     weekly_goal: float,
+    mode: str,
 ) -> str:
     def fmt_num(value: float) -> str:
         text = f"{value:.2f}".rstrip("0").rstrip(".")
         return text if text else "0"
 
-    date_label = f"{now_local.month}/{now_local.day}/{now_local.strftime('%y')}"
     week_total = week_inbound + week_outbound
     remaining = max(weekly_goal - week_total, 0.0)
-    if now_local.weekday() == 5:
+    if mode == "weekly":
         return (
             ":star2: Total Count for The Week\n"
             f"Inbound: {week_inbound}\n"
@@ -166,7 +213,7 @@ def build_message(
 
     today_total = today_inbound + today_outbound
     return (
-        f"Today {date_label}\n"
+        f"Today {date_label(now_local)}\n"
         f"Inbound: {today_inbound}\n"
         f"Outbound: {today_outbound}\n"
         f"Total: {today_total}\n"
@@ -238,6 +285,8 @@ def main() -> int:
         week_outbound,
         target_channel_id,
     ) = compute_counts(config)
+
+    mode = pick_report_mode(now_local, config["force_mode"])
     text = build_message(
         now_local,
         today_inbound,
@@ -245,10 +294,18 @@ def main() -> int:
         week_inbound,
         week_outbound,
         weekly_goal,
+        mode,
     )
 
     if args.dry_run:
         print(text)
+        return 0
+
+    if already_posted(config["token"], target_channel_id, now_local, mode):
+        print(
+            f"skipped duplicate mode={mode} channel=#{config['target_channel']} "
+            f"local_time={now_local.isoformat()}"
+        )
         return 0
 
     payload = slack_api(
@@ -260,6 +317,7 @@ def main() -> int:
     print(
         f"posted channel=#{config['target_channel']} "
         f"channel_id={target_channel_id} ts={payload.get('ts')} "
+        f"mode={mode} "
         f"today_inbound={today_inbound} today_outbound={today_outbound} "
         f"week_inbound={week_inbound} week_outbound={week_outbound} "
         f"local_time={now_local.isoformat()}"

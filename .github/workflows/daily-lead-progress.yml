@@ -2,13 +2,14 @@ name: Daily Lead Progress
 
 on:
   schedule:
-    # Run both DST variants for:
-    # - 18:00 America/Los_Angeles on Monday-Saturday
-    # - 23:59 America/Los_Angeles on Sunday
-    - cron: "0 1 * * *"
-    - cron: "0 2 * * *"
-    - cron: "59 6 * * 1"
-    - cron: "59 7 * * 1"
+    # Two UTC schedules for DST handling.
+    # Daily report for local Monday-Saturday at ~6 PM PT.
+    # (UTC Tue-Sun because local PT date is previous day for 01/02 UTC.)
+    - cron: "7 1 * * 0,2-6"
+    - cron: "7 2 * * 0,2-6"
+    # Weekly report for local Sunday at ~11:59 PM PT (UTC Monday).
+    - cron: "57 6 * * 1"
+    - cron: "57 7 * * 1"
   workflow_dispatch:
     inputs:
       target_channel:
@@ -38,8 +39,10 @@ jobs:
       LEAD_REPORT_INBOUND_PHRASE: ${{ vars.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting' }}
       LEAD_REPORT_OUTBOUND_PHRASE: ${{ vars.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting' }}
       LEAD_REPORT_TIMEZONE: ${{ vars.LEAD_REPORT_TIMEZONE || 'America/Los_Angeles' }}
+      LEAD_REPORT_FORCE_MODE: ${{ steps.gate.outputs.report_mode || '' }}
       INPUT_TARGET_CHANNEL: ${{ github.event.inputs.target_channel || '' }}
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      INPUT_SCHEDULE: ${{ github.event.schedule || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,30 +52,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Schedule Gate (Mon-Sat 6 PM PT, Sun 11:59 PM PT)
+      - name: Schedule Gate (Mode Selection)
         id: gate
         shell: bash
         run: |
           if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "report_mode=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          read -r WEEKDAY_PT HOUR_PT MINUTE_PT <<< "$(python - <<'PY'
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          now = datetime.now(ZoneInfo("America/Los_Angeles"))
-          print(f"{now.weekday()} {now.strftime('%H')} {now.strftime('%M')}")
-          PY
-          )"
-
-          if { [[ "$WEEKDAY_PT" =~ ^(0|1|2|3|4|5)$ ]] && [[ "$HOUR_PT" == "18" ]]; } || \
-             { [[ "$WEEKDAY_PT" == "6" ]] && [[ "$HOUR_PT" == "23" ]]; }; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping run at Pacific time weekday=${WEEKDAY_PT} hour=${HOUR_PT} minute=${MINUTE_PT}."
-          fi
+          case "${INPUT_SCHEDULE}" in
+            "7 1 * * 0,2-6"|"7 2 * * 0,2-6")
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              echo "report_mode=daily" >> "$GITHUB_OUTPUT"
+              ;;
+            "57 6 * * 1"|"57 7 * * 1")
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              echo "report_mode=weekly" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "should_run=false" >> "$GITHUB_OUTPUT"
+              echo "report_mode=" >> "$GITHUB_OUTPUT"
+              echo "Skipping run due to unknown schedule expression: ${INPUT_SCHEDULE}"
+              ;;
+          esac
 
       - name: Run Daily Progress Post
         if: steps.gate.outputs.should_run == 'true'
