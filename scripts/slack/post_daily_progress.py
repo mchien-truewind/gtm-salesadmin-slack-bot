@@ -147,12 +147,28 @@ def pick_report_mode(now_local: datetime, force_mode: str) -> str:
     return "weekly" if now_local.weekday() == 6 else "daily"
 
 
+def defer_reason(now_local: datetime, mode: str) -> str:
+    # Never post before end-of-day windows.
+    if mode == "daily" and now_local.hour < 17:
+        return "daily post deferred until 5 PM local time"
+    # Weekly summary should only post late Sunday night local time.
+    if mode == "weekly":
+        if now_local.weekday() != 6:
+            return "weekly post deferred because local day is not Sunday"
+        if now_local.hour < 23:
+            return "weekly post deferred until 11 PM local time"
+    return ""
+
+
 def date_label(now_local: datetime) -> str:
     return f"{now_local.month}/{now_local.day}/{now_local.strftime('%y')}"
 
 
 def already_posted(token: str, target_channel_id: str, now_local: datetime, mode: str) -> bool:
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if mode == "weekly":
+        days_since_sunday = (now_local.weekday() + 1) % 7
+        start_local = start_local - timedelta(days=days_since_sunday)
     oldest = start_local.astimezone(timezone.utc).timestamp()
     latest = now_local.astimezone(timezone.utc).timestamp()
 
@@ -287,6 +303,14 @@ def main() -> int:
     ) = compute_counts(config)
 
     mode = pick_report_mode(now_local, config["force_mode"])
+
+    reason = defer_reason(now_local, mode)
+    if reason:
+        print(
+            f"deferred mode={mode} reason={reason} local_time={now_local.isoformat()}"
+        )
+        return 0
+
     text = build_message(
         now_local,
         today_inbound,
