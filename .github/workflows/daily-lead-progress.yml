@@ -39,7 +39,6 @@ jobs:
       LEAD_REPORT_INBOUND_PHRASE: ${{ vars.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting' }}
       LEAD_REPORT_OUTBOUND_PHRASE: ${{ vars.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting' }}
       LEAD_REPORT_TIMEZONE: ${{ vars.LEAD_REPORT_TIMEZONE || 'America/Los_Angeles' }}
-      LEAD_REPORT_FORCE_MODE: ${{ steps.gate.outputs.report_mode || '' }}
       INPUT_TARGET_CHANNEL: ${{ github.event.inputs.target_channel || '' }}
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_SCHEDULE: ${{ github.event.schedule || '' }}
@@ -81,6 +80,8 @@ jobs:
       - name: Run Daily Progress Post
         if: steps.gate.outputs.should_run == 'true'
         shell: bash
+        env:
+          LEAD_REPORT_FORCE_MODE: ${{ steps.gate.outputs.report_mode || '' }}
         run: |
           set -euo pipefail
 
