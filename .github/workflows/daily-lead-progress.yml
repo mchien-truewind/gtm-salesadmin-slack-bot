@@ -3,12 +3,12 @@ name: Daily Lead Progress
 on:
   schedule:
     # Run both DST variants for:
-    # - ~18:07 America/Los_Angeles on Sun-Fri (off top-of-hour)
-    # - ~23:57 America/Los_Angeles on Saturday (weekly-only post, off top-of-hour)
-    - cron: "7 1 * * *"
-    - cron: "7 2 * * *"
-    - cron: "57 6 * * 0"
-    - cron: "57 7 * * 0"
+    # - 18:00 America/Los_Angeles on Monday-Saturday
+    # - 23:59 America/Los_Angeles on Sunday
+    - cron: "0 1 * * *"
+    - cron: "0 2 * * *"
+    - cron: "59 6 * * 1"
+    - cron: "59 7 * * 1"
   workflow_dispatch:
     inputs:
       target_channel:
@@ -49,7 +49,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Schedule Gate (Sun-Fri ~6 PM PT, Sat ~11:57 PM PT)
+      - name: Schedule Gate (Mon-Sat 6 PM PT, Sun 11:59 PM PT)
         id: gate
         shell: bash
         run: |
@@ -66,8 +66,8 @@ jobs:
           PY
           )"
 
-          if { [[ "$WEEKDAY_PT" =~ ^(6|0|1|2|3|4)$ ]] && [[ "$HOUR_PT" == "18" ]]; } || \
-             { [[ "$WEEKDAY_PT" == "5" ]] && [[ "$HOUR_PT" == "23" ]]; }; then
+          if { [[ "$WEEKDAY_PT" =~ ^(0|1|2|3|4|5)$ ]] && [[ "$HOUR_PT" == "18" ]]; } || \
+             { [[ "$WEEKDAY_PT" == "6" ]] && [[ "$HOUR_PT" == "23" ]]; }; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
