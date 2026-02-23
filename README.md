@@ -79,3 +79,39 @@ This runs even when your Mac is offline.
 Notes:
 - The workflow is DST-safe for 6:00 PM Pacific by scheduling at both `01:00` and `02:00` UTC and gating to Pacific hour `18`.
 - It posts with the same message format used in local runs.
+
+## Google Calendar Meeting Creation
+
+Use this local CLI to create meetings from Codex.
+
+1. Create a virtual environment and install dependencies:
+   ```sh
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python3 -m pip install -r requirements-google-calendar.txt
+   ```
+2. Copy calendar env defaults:
+   ```sh
+   cp .env.google-calendar.example .env
+   mkdir -p secrets
+   ```
+3. In Google Cloud Console:
+   - Enable Google Calendar API
+   - Create OAuth client credentials (Desktop app)
+   - Save the JSON to `secrets/google-calendar-credentials.json`
+4. Authenticate once:
+   ```sh
+   python3 scripts/google_calendar/calendar_cli.py auth
+   ```
+5. Create a meeting:
+   ```sh
+   python3 scripts/google_calendar/calendar_cli.py create \
+     --title "1:1 with Alex" \
+     --start "2026-02-24T14:00" \
+     --duration-minutes 30 \
+     --attendee "alex@example.com" \
+     --description "Weekly sync" \
+     --with-meet
+   ```
+
+If `pip` is not found on your machine, always use `python3 -m pip ...`.

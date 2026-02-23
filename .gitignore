@@ -11,3 +11,13 @@ docs/logs/
 
 # Scratch
 /tmp/
+
+# Google Calendar helper
+.venv/
+.env
+.env.google-calendar
+secrets/*.json
+
+# Python cache
+__pycache__/
+*.pyc
