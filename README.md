@@ -115,3 +115,24 @@ Use this local CLI to create meetings from Codex.
    ```
 
 If `pip` is not found on your machine, always use `python3 -m pip ...`.
+
+## Pre-Meeting 1:1 Focus Briefs
+
+Generate a focus brief for upcoming 1:1 meetings by combining Calendar events + matching 1:1 Google Docs.
+
+1. Ensure Workspace token exists with Docs + Drive metadata scopes:
+   ```sh
+   python3 scripts/google_workspace/premeeting_briefs.py --lookahead-hours 1
+   ```
+   The first run may open a browser for OAuth consent.
+
+2. Run the briefing command:
+   ```sh
+   python3 scripts/google_workspace/premeeting_briefs.py --lookahead-hours 168
+   ```
+
+Output includes, per person:
+- Meeting title/time
+- Calendar link
+- Matched 1:1 doc link
+- Suggested focus bullets extracted from recent actionable lines in that doc
