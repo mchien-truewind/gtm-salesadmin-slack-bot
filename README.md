@@ -249,3 +249,29 @@ Logs:
 
 - `~/Library/Logs/agentic-lite/recruiting-sync.out.log`
 - `~/Library/Logs/agentic-lite/recruiting-sync.err.log`
+
+### Always-On (GitHub Actions)
+
+If your laptop sleeps, use the cloud scheduler in `.github/workflows/recruiting-sync.yml`.
+
+Required repository secrets:
+- `NOTION_INTERNAL_INTEGRATION_SECRET`
+- `NOTION_ATS_DB_ID`
+- `GOOGLE_DRIVE_FOLDER_ATS`
+- `RECRUITING_FROM_EMAIL`
+- `SLACK_BOT_TOKEN` or `SLACK_USER_TOKEN`
+- `GOOGLE_GMAIL_CREDENTIALS_JSON`
+- `GOOGLE_GMAIL_TOKEN_JSON`
+- `GOOGLE_DRIVE_CREDENTIALS_JSON`
+- `GOOGLE_DRIVE_TOKEN_JSON`
+- `GOOGLE_CALENDAR_CREDENTIALS_JSON`
+- `GOOGLE_CALENDAR_TOKEN_JSON`
+- Optional: `PDL_API`
+
+Recommended repository variables:
+- `RECRUITING_SLACK_REVIEW_CHANNEL_ID` (for example `C0AHRKW87LN`)
+- `RECRUITING_SLACK_REVIEW_CHANNEL` (fallback channel name, default `hiring-review`)
+
+Behavior:
+- Runs every 10 minutes (`*/10 * * * *`) regardless of laptop sleep.
+- You can also trigger it manually from GitHub Actions via **Run workflow**.

@@ -1,0 +1,96 @@
+name: Recruiting Sync
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recruiting-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: recruiting-sync
+      cancel-in-progress: true
+    env:
+      NOTION_INTERNAL_INTEGRATION_SECRET: ${{ secrets.NOTION_INTERNAL_INTEGRATION_SECRET }}
+      NOTION_ATS_DB_ID: ${{ secrets.NOTION_ATS_DB_ID }}
+      GOOGLE_DRIVE_FOLDER_ATS: ${{ secrets.GOOGLE_DRIVE_FOLDER_ATS }}
+      RECRUITING_FROM_EMAIL: ${{ secrets.RECRUITING_FROM_EMAIL }}
+      PDL_API: ${{ secrets.PDL_API }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
+      RECRUITING_SLACK_REVIEW_CHANNEL: ${{ vars.RECRUITING_SLACK_REVIEW_CHANNEL || 'hiring-review' }}
+      RECRUITING_SLACK_REVIEW_CHANNEL_ID: ${{ vars.RECRUITING_SLACK_REVIEW_CHANNEL_ID || '' }}
+      RECRUITING_REJECT_DELAY_HOURS: ${{ vars.RECRUITING_REJECT_DELAY_HOURS || '24' }}
+      RECRUITING_GMAIL_LABEL: ${{ vars.RECRUITING_GMAIL_LABEL || 'hiring@' }}
+      RECRUITING_GMAIL_QUERY: ${{ vars.RECRUITING_GMAIL_QUERY || 'subject:\"[hiring@]\" has:attachment' }}
+      RECRUITING_GMAIL_MAX_MESSAGES: ${{ vars.RECRUITING_GMAIL_MAX_MESSAGES || '50' }}
+      RECRUITING_SCHEDULING_TIMEZONE: ${{ vars.RECRUITING_SCHEDULING_TIMEZONE || 'America/Los_Angeles' }}
+      RECRUITING_SLOT_MINUTES: ${{ vars.RECRUITING_SLOT_MINUTES || '20' }}
+      RECRUITING_SCHEDULING_BUFFER_MINUTES: ${{ vars.RECRUITING_SCHEDULING_BUFFER_MINUTES || '10' }}
+      RECRUITING_SCHEDULING_MIN_NOTICE_HOURS: ${{ vars.RECRUITING_SCHEDULING_MIN_NOTICE_HOURS || '24' }}
+      RECRUITING_SCHEDULING_LOOKAHEAD_DAYS: ${{ vars.RECRUITING_SCHEDULING_LOOKAHEAD_DAYS || '14' }}
+      RECRUITING_SCHEDULING_WEEKDAYS: ${{ vars.RECRUITING_SCHEDULING_WEEKDAYS || 'MON,TUE,WED,THU,FRI' }}
+      RECRUITING_SCHEDULING_START_LOCAL: ${{ vars.RECRUITING_SCHEDULING_START_LOCAL || '10:00' }}
+      RECRUITING_SCHEDULING_END_LOCAL: ${{ vars.RECRUITING_SCHEDULING_END_LOCAL || '16:00' }}
+      GOOGLE_CALENDAR_DEFAULT_CALENDAR_ID: ${{ vars.GOOGLE_CALENDAR_DEFAULT_CALENDAR_ID || 'primary' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-recruiting.txt
+
+      - name: Materialize Google OAuth files
+        env:
+          GOOGLE_GMAIL_CREDENTIALS_JSON: ${{ secrets.GOOGLE_GMAIL_CREDENTIALS_JSON }}
+          GOOGLE_GMAIL_TOKEN_JSON: ${{ secrets.GOOGLE_GMAIL_TOKEN_JSON }}
+          GOOGLE_DRIVE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_DRIVE_CREDENTIALS_JSON }}
+          GOOGLE_DRIVE_TOKEN_JSON: ${{ secrets.GOOGLE_DRIVE_TOKEN_JSON }}
+          GOOGLE_CALENDAR_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CALENDAR_CREDENTIALS_JSON }}
+          GOOGLE_CALENDAR_TOKEN_JSON: ${{ secrets.GOOGLE_CALENDAR_TOKEN_JSON }}
+        run: |
+          set -euo pipefail
+          mkdir -p secrets
+          printf '%s' "$GOOGLE_GMAIL_CREDENTIALS_JSON" > secrets/google-gmail-credentials.json
+          printf '%s' "$GOOGLE_GMAIL_TOKEN_JSON" > secrets/google-gmail-token.json
+          printf '%s' "$GOOGLE_DRIVE_CREDENTIALS_JSON" > secrets/google-drive-credentials.json
+          printf '%s' "$GOOGLE_DRIVE_TOKEN_JSON" > secrets/google-drive-token.json
+          printf '%s' "$GOOGLE_CALENDAR_CREDENTIALS_JSON" > secrets/google-calendar-credentials.json
+          printf '%s' "$GOOGLE_CALENDAR_TOKEN_JSON" > secrets/google-calendar-token.json
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+          test -n "${NOTION_INTERNAL_INTEGRATION_SECRET}"
+          test -n "${NOTION_ATS_DB_ID}"
+          test -n "${RECRUITING_FROM_EMAIL}"
+          test -f "secrets/google-gmail-credentials.json"
+          test -f "secrets/google-gmail-token.json"
+          test -f "secrets/google-drive-credentials.json"
+          test -f "secrets/google-drive-token.json"
+          test -f "secrets/google-calendar-credentials.json"
+          test -f "secrets/google-calendar-token.json"
+
+      - name: Run recruiting cycle
+        env:
+          GOOGLE_GMAIL_CREDENTIALS_FILE: secrets/google-gmail-credentials.json
+          GOOGLE_GMAIL_TOKEN_FILE: secrets/google-gmail-token.json
+          GOOGLE_DRIVE_CREDENTIALS_FILE: secrets/google-drive-credentials.json
+          GOOGLE_DRIVE_TOKEN_FILE: secrets/google-drive-token.json
+          GOOGLE_CALENDAR_CREDENTIALS_FILE: secrets/google-calendar-credentials.json
+          GOOGLE_CALENDAR_TOKEN_FILE: secrets/google-calendar-token.json
+        run: |
+          python scripts/recruiting/coordinator_cli.py run
