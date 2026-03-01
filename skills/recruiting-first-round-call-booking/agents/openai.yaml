@@ -1,0 +1,4 @@
+interface:
+  display_name: "Recruiting Round-1 Booking"
+  short_description: "Book recruiting first-round calls from Gmail threads"
+  default_prompt: "Use $recruiting-first-round-call-booking to schedule this recruiting first-round call and draft (not send) the confirmation email."
