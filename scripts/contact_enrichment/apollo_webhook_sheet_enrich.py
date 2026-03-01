@@ -116,6 +116,17 @@ def _pick(row: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def _identity_key(first_name: str, last_name: str, company: str, title: str) -> str:
+    return "||".join(
+        [
+            (first_name or "").strip().lower(),
+            (last_name or "").strip().lower(),
+            (company or "").strip().lower(),
+            (title or "").strip().lower(),
+        ]
+    )
+
+
 def ensure_tab(sheets, spreadsheet_id: str, tab_name: str) -> int:
     meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     for sheet in meta.get("sheets", []):
@@ -167,6 +178,37 @@ def read_source_rows(sheets, spreadsheet_id: str, tab_name: str) -> list[dict[st
         if column not in normalized[0]:
             raise RuntimeError(f"Source tab missing required column: {column}")
     return normalized
+
+
+def read_existing_target_map(
+    sheets, spreadsheet_id: str, tab_name: str
+) -> dict[str, dict[str, str]]:
+    resp = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!A:I")
+        .execute()
+    )
+    values = resp.get("values", [])
+    if not values:
+        return {}
+
+    headers = [_normalize_header(v) for v in values[0]]
+    rows = [_row_to_dict(headers, row) for row in values[1:]]
+    result: dict[str, dict[str, str]] = {}
+
+    for row in rows:
+        first_name = _pick(row, "first name", "firstname", "first_name")
+        last_name = _pick(row, "last name", "lastname", "last_name")
+        company = _pick(row, "company")
+        title = _pick(row, "title", "job title", "role")
+        email = _pick(row, "email")
+        phone = _pick(row, "phone")
+        if not (first_name or last_name or company):
+            continue
+        key = _identity_key(first_name, last_name, company, title)
+        result[key] = {"email": email, "phone": phone}
+    return result
 
 
 def write_target_rows(
@@ -320,6 +362,10 @@ def empty_stats() -> dict[str, Any]:
         "apollo_http_200": 0,
         "apollo_http_errors": 0,
         "apollo_person_id_missing": 0,
+        "reused_email_rows": 0,
+        "reused_phone_rows": 0,
+        "reused_full_rows": 0,
+        "skipped_already_enriched": 0,
         "webhook_callbacks_seen": 0,
         "webhook_callbacks_parsed": 0,
         "webhook_phones_applied": 0,
@@ -342,6 +388,7 @@ class RuntimeConfig:
     max_poll_minutes: float
     save_every: int
     write_every: int
+    submit_write_every: int
     max_submit: int | None
 
 
@@ -350,24 +397,47 @@ def initialize_state(
     cfg: RuntimeConfig,
     webhook_token: str,
     webhook_url: str,
+    existing_target_map: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
+    stats = empty_stats()
     rows: dict[str, dict[str, Any]] = {}
     for index, src in enumerate(source_rows):
         key = str(index)
+        first_name = src.get("first name", "")
+        last_name = src.get("last name", "")
+        company = src.get("company", "")
+        title = src.get("title", "")
+        lookup_key = _identity_key(first_name, last_name, company, title)
+        existing = (existing_target_map or {}).get(lookup_key, {})
+        existing_email = str(existing.get("email", "")).strip()
+        existing_phone = str(existing.get("phone", "")).strip()
+
+        if existing_email:
+            stats["reused_email_rows"] = _to_int(stats.get("reused_email_rows"), 0) + 1
+        if existing_phone:
+            stats["reused_phone_rows"] = _to_int(stats.get("reused_phone_rows"), 0) + 1
+
+        submitted = bool(existing_email and existing_phone)
+        if submitted:
+            stats["reused_full_rows"] = _to_int(stats.get("reused_full_rows"), 0) + 1
+            stats["skipped_already_enriched"] = _to_int(
+                stats.get("skipped_already_enriched"), 0
+            ) + 1
+
         rows[key] = {
-            "first name": src.get("first name", ""),
-            "last name": src.get("last name", ""),
-            "company": src.get("company", ""),
-            "title": src.get("title", ""),
-            "email": "",
-            "phone": "",
+            "first name": first_name,
+            "last name": last_name,
+            "company": company,
+            "title": title,
+            "email": existing_email,
+            "phone": existing_phone,
             "city": src.get("city", ""),
             "state": src.get("state", ""),
             "country": src.get("country", ""),
-            "submitted": False,
+            "submitted": submitted,
             "person_id": "",
             "request_id": "",
-            "submit_http_status": None,
+            "submit_http_status": "reused" if submitted else None,
             "submit_error": "",
         }
 
@@ -384,7 +454,7 @@ def initialize_state(
         "rows": rows,
         "person_to_rows": {},
         "seen_callback_ids": [],
-        "stats": empty_stats(),
+        "stats": stats,
     }
 
 
@@ -414,7 +484,7 @@ def write_sheet(state: dict[str, Any], sheets, cfg: RuntimeConfig) -> None:
     state["stats"]["sheet_writes"] = _to_int(state["stats"].get("sheet_writes"), 0) + 1
 
 
-def submit_apollo_jobs(state: dict[str, Any], cfg: RuntimeConfig) -> None:
+def submit_apollo_jobs(state: dict[str, Any], cfg: RuntimeConfig, sheets=None) -> None:
     sent_in_run = 0
     for row_key in state["row_order"]:
         if cfg.max_submit is not None and sent_in_run >= cfg.max_submit:
@@ -470,6 +540,19 @@ def submit_apollo_jobs(state: dict[str, Any], cfg: RuntimeConfig) -> None:
         sent_in_run += 1
         if sent_in_run % cfg.save_every == 0:
             save_state(state, cfg)
+        if sheets is not None and sent_in_run % cfg.submit_write_every == 0:
+            write_sheet(state, sheets, cfg)
+            save_state(state, cfg)
+            email_count = sum(
+                1 for k in state["row_order"] if state["rows"][k].get("email")
+            )
+            phone_count = sum(
+                1 for k in state["row_order"] if state["rows"][k].get("phone")
+            )
+            print(
+                f"submit_progress submitted={sent_in_run} "
+                f"emails={email_count} phones={phone_count}"
+            )
         time.sleep(cfg.submit_sleep_seconds)
 
 
@@ -649,6 +732,12 @@ def parse_args() -> argparse.Namespace:
         help="Write destination sheet every N new callbacks",
     )
     parser.add_argument(
+        "--submit-write-every",
+        type=int,
+        default=10,
+        help="Write destination sheet every N Apollo submissions",
+    )
+    parser.add_argument(
         "--max-submit",
         type=int,
         default=None,
@@ -695,6 +784,7 @@ def main() -> int:
         max_poll_minutes=max(1.0, args.max_poll_minutes),
         save_every=max(1, args.save_every),
         write_every=max(1, args.write_every),
+        submit_write_every=max(1, args.submit_write_every),
         max_submit=args.max_submit,
     )
 
@@ -708,6 +798,13 @@ def main() -> int:
     else:
         source_rows = read_source_rows(sheets, cfg.sheet_id, cfg.source_tab)
         print(f"source_rows={len(source_rows)}")
+        existing_target_map = read_existing_target_map(
+            sheets, cfg.sheet_id, cfg.target_tab
+        )
+        print(
+            f"existing_target_rows_with_data="
+            f"{sum(1 for v in existing_target_map.values() if v.get('email') or v.get('phone'))}"
+        )
 
         if args.webhook_url:
             webhook_url = args.webhook_url.strip()
@@ -719,11 +816,17 @@ def main() -> int:
             webhook_token, webhook_url = create_webhook_site_token()
 
         print(f"webhook_url={webhook_url}")
-        state = initialize_state(source_rows, cfg, webhook_token, webhook_url)
+        state = initialize_state(
+            source_rows,
+            cfg,
+            webhook_token,
+            webhook_url,
+            existing_target_map=existing_target_map,
+        )
         write_sheet(state, sheets, cfg)
         save_state(state, cfg)
 
-    submit_apollo_jobs(state, cfg)
+    submit_apollo_jobs(state, cfg, sheets=sheets)
     save_state(state, cfg)
     write_sheet(state, sheets, cfg)
 

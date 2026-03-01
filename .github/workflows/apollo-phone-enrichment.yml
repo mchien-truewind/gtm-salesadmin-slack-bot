@@ -64,6 +64,8 @@ jobs:
             --google-token-file "secrets/google-drive-token.json" \
             --state-file "outputs/contact_enrichment/apollo_webhook_enrichment_state.json" \
             --summary-file "outputs/contact_enrichment/apollo_webhook_enrichment_summary.json" \
+            --submit-write-every 10 \
+            --write-every 1 \
             --max-poll-minutes "${{ inputs.max_poll_minutes || '480' }}" \
             $MAX_SUBMIT_ARGS
 
