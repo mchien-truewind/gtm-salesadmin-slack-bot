@@ -79,3 +79,54 @@ This runs even when your Mac is offline.
 Notes:
 - The workflow is DST-safe for 6:00 PM Pacific by scheduling at both `01:00` and `02:00` UTC and gating to Pacific hour `18`.
 - It posts with the same message format used in local runs.
+
+## Overnight Apollo Phone Enrichment (Webhook + Google Sheets)
+
+This runner submits Apollo `people/match` requests with `reveal_phone_number=true`, polls webhook callbacks, and continuously writes updates into a target sheet tab.
+
+Script:
+- `scripts/contact_enrichment/apollo_webhook_sheet_enrich.py`
+
+Required env:
+- `APOLLO_SEARCH` in `.env.local`
+
+Required auth file:
+- `secrets/google-drive-token.json` (Drive scope)
+
+Example run:
+```sh
+python3 scripts/contact_enrichment/apollo_webhook_sheet_enrich.py \
+  --sheet-id 1ftKEvAFFyietBwBKieylaEc5LvVjwE0_GvmrfnjmUP4 \
+  --source-tab "Non-Accounting Firm Buyers (2025)" \
+  --target-tab "Non-Accounting Buyers Enriched" \
+  --state-file outputs/contact_enrichment/apollo_webhook_enrichment_state.json \
+  --summary-file outputs/contact_enrichment/apollo_webhook_enrichment_summary.json \
+  --max-poll-minutes 480
+```
+
+Resume an interrupted run:
+```sh
+python3 scripts/contact_enrichment/apollo_webhook_sheet_enrich.py \
+  --sheet-id 1ftKEvAFFyietBwBKieylaEc5LvVjwE0_GvmrfnjmUP4 \
+  --resume \
+  --state-file outputs/contact_enrichment/apollo_webhook_enrichment_state.json \
+  --summary-file outputs/contact_enrichment/apollo_webhook_enrichment_summary.json
+```
+
+Run overnight (detached):
+```sh
+mkdir -p outputs/contact_enrichment
+nohup python3 scripts/contact_enrichment/apollo_webhook_sheet_enrich.py \
+  --sheet-id 1ftKEvAFFyietBwBKieylaEc5LvVjwE0_GvmrfnjmUP4 \
+  --source-tab "Non-Accounting Firm Buyers (2025)" \
+  --target-tab "Non-Accounting Buyers Enriched" \
+  --state-file outputs/contact_enrichment/apollo_webhook_enrichment_state.json \
+  --summary-file outputs/contact_enrichment/apollo_webhook_enrichment_summary.json \
+  --max-poll-minutes 480 \
+  > outputs/contact_enrichment/apollo_webhook_overnight.log 2>&1 &
+```
+
+Tail logs:
+```sh
+tail -f outputs/contact_enrichment/apollo_webhook_overnight.log
+```
