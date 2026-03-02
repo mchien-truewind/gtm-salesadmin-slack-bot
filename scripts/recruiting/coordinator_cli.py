@@ -7,15 +7,17 @@ import json
 import mimetypes
 import os
 import re
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
+from html import unescape
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
 try:
@@ -47,7 +49,12 @@ DEFAULT_REJECT_TEMPLATE = (
 DEFAULT_SCHEDULING_TEMPLATE = (
     "Thanks for the quick reply. Are you available for a 20-minute intro call on {slot_label}?"
 )
+DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
+DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
+
+_DOCLING_CONVERTER: Any | None = None
+_DOCLING_CHECKED = False
 
 
 @dataclass
@@ -58,6 +65,7 @@ class NotionPropertyMap:
     resume_url: str = "Resume URL"
     career_stage: str = "Career Stage"
     linkedin_url: str = "LinkedIn URL"
+    linkedin_confidence: str = "Confidence Level - LI"
     company: str = "Company"
     current_title: str = "Current Title"
     location: str = "Location"
@@ -293,6 +301,9 @@ def load_config() -> Config:
         resume_url=os.getenv("RECRUITING_NOTION_PROP_RESUME_URL", "Resume URL").strip(),
         career_stage=os.getenv("RECRUITING_NOTION_PROP_CAREER_STAGE", "Career Stage").strip(),
         linkedin_url=os.getenv("RECRUITING_NOTION_PROP_LINKEDIN_URL", "LinkedIn URL").strip(),
+        linkedin_confidence=os.getenv(
+            "RECRUITING_NOTION_PROP_LINKEDIN_CONFIDENCE", "Confidence Level - LI"
+        ).strip(),
         company=os.getenv("RECRUITING_NOTION_PROP_COMPANY", "Company").strip(),
         current_title=os.getenv("RECRUITING_NOTION_PROP_CURRENT_TITLE", "Current Title").strip(),
         location=os.getenv("RECRUITING_NOTION_PROP_LOCATION", "Location").strip(),
@@ -527,12 +538,18 @@ def build_notion_value(prop_schema: dict[str, Any], value: Any) -> dict[str, Any
     if value is None:
         return None
 
+    def notion_text(text_value: Any, max_len: int = 2000) -> str:
+        text = str(text_value).strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip()
+
     prop_type = prop_schema.get("type")
     if prop_type == "title":
-        text = str(value).strip()
+        text = notion_text(value)
         return {"title": [{"type": "text", "text": {"content": text}}]} if text else {"title": []}
     if prop_type == "rich_text":
-        text = str(value).strip()
+        text = notion_text(value)
         return {"rich_text": [{"type": "text", "text": {"content": text}}]} if text else {"rich_text": []}
     if prop_type == "email":
         return {"email": str(value).strip() or None}
@@ -645,8 +662,79 @@ def extract_text_from_docx(raw: bytes) -> str:
     return text.strip()
 
 
+def get_docling_converter() -> Any | None:
+    global _DOCLING_CONVERTER, _DOCLING_CHECKED
+    if _DOCLING_CHECKED:
+        return _DOCLING_CONVERTER
+
+    _DOCLING_CHECKED = True
+    try:
+        from docling.document_converter import DocumentConverter
+    except Exception:
+        _DOCLING_CONVERTER = None
+        return None
+
+    try:
+        _DOCLING_CONVERTER = DocumentConverter()
+    except Exception:
+        _DOCLING_CONVERTER = None
+    return _DOCLING_CONVERTER
+
+
+def extract_text_with_docling(filename: str, raw: bytes) -> str:
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext not in DOCLING_PARSE_EXTENSIONS:
+        return ""
+
+    converter = get_docling_converter()
+    if converter is None:
+        return ""
+
+    suffix = f".{ext}" if ext else ".pdf"
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="resume-", suffix=suffix, delete=False) as handle:
+            handle.write(raw)
+            temp_path = Path(handle.name)
+
+        result = converter.convert(str(temp_path))
+        document = getattr(result, "document", None)
+        if document is None:
+            return ""
+
+        markdown_text = ""
+        text_plain = ""
+        export_markdown = getattr(document, "export_to_markdown", None)
+        export_text = getattr(document, "export_to_text", None)
+        if callable(export_markdown):
+            try:
+                markdown_text = str(export_markdown() or "").strip()
+            except Exception:
+                markdown_text = ""
+        if callable(export_text):
+            try:
+                text_plain = str(export_text() or "").strip()
+            except Exception:
+                text_plain = ""
+
+        if markdown_text:
+            return markdown_text
+        return text_plain
+    except Exception:
+        return ""
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
 def extract_resume_text(filename: str, raw: bytes) -> str:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    docling_text = extract_text_with_docling(filename, raw)
+    if docling_text:
+        return unescape(docling_text)
     if ext in {"txt", "rtf"}:
         return raw.decode("utf-8", errors="ignore").strip()
     if ext == "docx":
@@ -700,53 +788,244 @@ def split_resume_lines(text: str) -> list[str]:
     return lines
 
 
-def infer_current_title_and_company_from_resume(resume_text: str, snippet: str) -> tuple[str, str]:
-    source = resume_text if resume_text.strip() else snippet
-    lines = split_resume_lines(source)
-    title_keywords = {
-        "engineer",
-        "developer",
-        "manager",
-        "director",
-        "analyst",
-        "designer",
-        "consultant",
-        "specialist",
-        "lead",
-        "principal",
-        "architect",
-        "scientist",
-        "coordinator",
-        "recruiter",
-        "founder",
-    }
+TITLE_KEYWORDS = {
+    "engineer",
+    "developer",
+    "manager",
+    "director",
+    "analyst",
+    "designer",
+    "consultant",
+    "specialist",
+    "lead",
+    "principal",
+    "architect",
+    "scientist",
+    "coordinator",
+    "recruiter",
+    "founder",
+    "advisor",
+    "president",
+    "officer",
+    "head",
+    "executive",
+}
 
-    for line in lines:
-        match = re.match(r"(?i)^(?P<title>.+?)\s+at\s+(?P<company>.+)$", line)
+MONTH_TO_INDEX = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+LINKEDIN_CONFIDENCE_HIGH = "High"
+LINKEDIN_CONFIDENCE_MEDIUM = "Medium"
+LINKEDIN_CONFIDENCE_LOW = "Low"
+
+
+def looks_like_title(text: str) -> bool:
+    lowered = text.lower()
+    pattern = r"\b(" + "|".join(sorted((re.escape(item) for item in TITLE_KEYWORDS), key=len, reverse=True)) + r")\b"
+    return bool(re.search(pattern, lowered))
+
+
+def extract_title_phrase(text: str) -> str:
+    source = clean_text(text)
+    if not source:
+        return ""
+    matches = list(
+        re.finditer(
+            r"(?i)\b(?:sr\.?|senior|lead|principal|staff|associate|assistant|vp|vice president|head|chief)?"
+            r"(?:\s+[a-z][a-z/&-]*){0,5}\s+"
+            r"(?:engineer|developer|manager|director|analyst|designer|consultant|specialist|lead|principal|"
+            r"architect|scientist|coordinator|recruiter|founder|advisor|president|officer|executive)\b"
+            r"(?:\s+[a-z0-9/&(),.-]+){0,4}",
+            source,
+        )
+    )
+    if not matches:
+        return source
+    phrase = source[matches[-1].start() : matches[-1].end()]
+    return clean_text(phrase.strip(" -,:;"))
+
+
+def clean_title_fragment(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.split(r"[•●|]", text, maxsplit=1)[0]
+    text = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b", " ", text)
+    text = re.sub(r"\b(?:19|20)\d{2}\b", " ", text)
+    if ". " in text and len(text) > 80:
+        tail = text.rsplit(". ", 1)[-1]
+        if looks_like_title(tail):
+            text = tail
+    vp_match = re.search(r"(?i)\b(vice president(?:,\s*[a-z0-9/&(). -]+)?)\b", text)
+    if vp_match:
+        return clean_text(vp_match.group(1).strip(" -,:;"))
+    text = extract_title_phrase(text)
+    text = clean_text(text.strip(" -,:;"))
+    if len(text) > 120:
+        text = text[:120].rstrip(" -,:;")
+    return text
+
+
+def clean_company_fragment(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.split(r"[•●|]", text, maxsplit=1)[0]
+    text = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b", " ", text)
+    text = re.sub(r"\b(?:19|20)\d{2}\b", " ", text)
+    text = re.sub(r"\((?:remote|hybrid|onsite|on[-\s]?site)[^)]*\)", " ", text, flags=re.IGNORECASE)
+    text = clean_text(text.split(",")[0].strip(" -,:;@"))
+    if len(text) > 100:
+        text = text[:100].rstrip(" -,:;")
+    return text
+
+
+def parse_role_company_line(line: str) -> tuple[str, str]:
+    text = clean_text(line)
+    if not text or len(text) > 900:
+        return "", ""
+
+    patterns = [
+        r"(?i)^(?P<title>.+?)\s+at\s+(?P<company>.+)$",
+        r"(?i)^(?P<title>.+?)\s*@\s*(?P<company>.+)$",
+        r"(?i)^(?P<company>.+?)\s+[|–—-]\s*(?P<title>.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text)
         if not match:
             continue
-        title = clean_text(match.group("title"))
-        company = clean_text(match.group("company"))
-        if any(keyword in title.lower() for keyword in title_keywords):
-            return title, company
-
-    for line in lines:
-        if " - " not in line:
+        title = clean_title_fragment(match.group("title"))
+        company = clean_company_fragment(match.group("company"))
+        if not title or not company:
             continue
-        left, right = [clean_text(part) for part in line.split(" - ", 1)]
-        left_lower = left.lower()
-        right_lower = right.lower()
-        left_is_title = any(keyword in left_lower for keyword in title_keywords)
-        right_is_title = any(keyword in right_lower for keyword in title_keywords)
-        if left_is_title and not right_is_title:
-            return left, right
-        if right_is_title and not left_is_title:
-            return right, left
+        if looks_like_title(title):
+            return title, company
+        reversed_title = clean_title_fragment(match.group("company"))
+        reversed_company = clean_company_fragment(match.group("title"))
+        if reversed_title and reversed_company and looks_like_title(reversed_title):
+            return reversed_title, reversed_company
+    return "", ""
+
+
+def normalize_resume_line(line: str) -> str:
+    return clean_text(line.replace("#", " ").strip())
+
+
+def split_company_and_date(line: str) -> tuple[str, str]:
+    text = normalize_resume_line(line)
+    date_pattern = (
+        r"(?i)\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}"
+        r"(?:\s*[-–—]\s*(?:present|current|now|"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}))?"
+    )
+    match = re.search(date_pattern, text)
+    if not match:
+        return "", ""
+    company_part = clean_text(text[: match.start()].strip(" -|,:"))
+    date_part = clean_text(text[match.start() :])
+    return company_part, date_part
+
+
+def infer_latest_from_docling_sections(source: str) -> tuple[str, str]:
+    lines = [line for line in source.splitlines() if line.strip()]
+    scored: list[tuple[int, str, str]] = []
+    for idx, raw_line in enumerate(lines):
+        company_part, date_part = split_company_and_date(raw_line)
+        if not company_part or not date_part:
+            continue
+
+        company = clean_company_fragment(company_part)
+        if not company or looks_like_title(company):
+            continue
+
+        best_title = ""
+        for look_ahead in range(1, 7):
+            if idx + look_ahead >= len(lines):
+                break
+            candidate_line = normalize_resume_line(lines[idx + look_ahead])
+            if not candidate_line:
+                continue
+            if split_company_and_date(candidate_line)[0]:
+                break
+            if candidate_line.lower().startswith("professional experience"):
+                continue
+            candidate_title = clean_title_fragment(candidate_line)
+            if looks_like_title(candidate_title):
+                best_title = candidate_title
+                break
+        if not best_title:
+            continue
+
+        rank = timeline_rank(date_part)
+        scored.append((rank, best_title, company))
+
+    if not scored:
+        return "", ""
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored[0][1], scored[0][2]
+
+
+def timeline_rank(text: str) -> int:
+    source = clean_text(text)
+    if not source:
+        return 0
+    if re.search(r"\b(present|current|now)\b", source, flags=re.IGNORECASE):
+        return 10_000_000
+
+    ranks: list[int] = []
+    for match in re.finditer(
+        r"(?i)\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+((?:19|20)\d{2})\b",
+        source,
+    ):
+        month = MONTH_TO_INDEX[match.group(1).lower()[:3]]
+        year = int(match.group(2))
+        ranks.append(year * 12 + month)
+    for match in re.finditer(r"\b((?:19|20)\d{2})\b", source):
+        ranks.append(int(match.group(1)) * 12)
+    return max(ranks) if ranks else 0
+
+
+def infer_current_title_and_company_from_resume(resume_text: str, snippet: str) -> tuple[str, str]:
+    source = resume_text if resume_text.strip() else snippet
+    latest_title, latest_company = infer_latest_from_docling_sections(source)
+    if latest_title and latest_company:
+        return latest_title, latest_company
+
+    lines = split_resume_lines(source)
+
+    scored_candidates: list[tuple[int, int, str, str]] = []
+    for idx, line in enumerate(lines):
+        title, company = parse_role_company_line(line)
+        if not title or not company:
+            continue
+        context = " ".join(lines[max(0, idx - 1) : min(len(lines), idx + 2)])
+        rank = max(timeline_rank(line), timeline_rank(context))
+        quality = 2
+        if any(token in line for token in {"•", "●"}) and len(line) > 150:
+            quality = 1
+        scored_candidates.append((rank, quality, title, company))
+
+    if scored_candidates:
+        scored_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _rank, _quality, best_title, best_company = scored_candidates[0]
+        return best_title or "Unknown", best_company or "Unknown"
 
     for line in lines:
-        lowered = line.lower()
-        if any(keyword in lowered for keyword in title_keywords):
-            return line, "Unknown"
+        candidate = clean_title_fragment(line)
+        if looks_like_title(candidate):
+            return candidate, "Unknown"
 
     return "Unknown", "Unknown"
 
@@ -765,10 +1044,38 @@ def normalize_linkedin_url(url: str) -> str:
     if "linkedin.com" not in host:
         return ""
     path = (parsed.path or "").rstrip("/")
+    query = parsed.query or ""
     lowered_path = path.lower()
-    if "/in/" not in lowered_path and "/pub/" not in lowered_path:
-        return ""
-    return f"https://{host}{path}"
+    if "/in/" in lowered_path or "/pub/" in lowered_path:
+        suffix = f"?{query}" if query else ""
+        return f"https://{host}{path}{suffix}"
+
+    # Some resumes use legacy profile links like linkedin.com/first-last (no /in/ segment).
+    segments = [segment for segment in lowered_path.split("/") if segment]
+    disallowed = {
+        "company",
+        "school",
+        "jobs",
+        "feed",
+        "learning",
+        "sales",
+        "groups",
+        "events",
+        "posts",
+        "news",
+        "pulse",
+        "showcase",
+        "help",
+        "signin",
+        "signup",
+        "in",
+        "pub",
+    }
+    if len(segments) == 1 and segments[0] not in disallowed:
+        if re.fullmatch(r"[a-z0-9][a-z0-9-]{1,120}", segments[0]):
+            suffix = f"?{query}" if query else ""
+            return f"https://{host}{path}{suffix}"
+    return ""
 
 
 def extract_linkedin_url_from_pdf(raw: bytes) -> str:
@@ -835,12 +1142,127 @@ def extract_linkedin_url(
             return from_docx
 
     source = f"{resume_text}\n{snippet}\n{message_body_text}\n{raw.decode('utf-8', errors='ignore')}"
-    match = re.search(r"(https?://(?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[^\s)>\"]+)", source, flags=re.IGNORECASE)
-    if not match:
-        match = re.search(r"((?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[^\s)>\"]+)", source, flags=re.IGNORECASE)
-    if not match:
-        return ""
-    return normalize_linkedin_url(match.group(1))
+    patterns = [
+        r"(https?://(?:[a-z]{2,3}\.)?linkedin\.com/[^\s)>\"]+)",
+        r"((?:[a-z]{2,3}\.)?linkedin\.com/[^\s)>\"]+)",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, source, flags=re.IGNORECASE):
+            normalized = normalize_linkedin_url(match.group(1))
+            if normalized:
+                return normalized
+    return ""
+
+
+def extract_linkedin_urls_from_search_html(html_text: str) -> list[str]:
+    source = unescape(html_text or "")
+    candidates: list[str] = []
+
+    for match in re.finditer(r"/url\?q=([^&\"'>]+)", source, flags=re.IGNORECASE):
+        candidate = normalize_linkedin_url(unquote(match.group(1)))
+        if candidate:
+            candidates.append(candidate)
+
+    for match in re.finditer(
+        r"https?://[^\s\"'<>]*linkedin\.com/(?:in|pub)/[^\s\"'<>]+",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        candidate = normalize_linkedin_url(unquote(match.group(0)))
+        if candidate:
+            candidates.append(candidate)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
+    return deduped
+
+
+def linkedin_confidence_for_result(
+    linkedin_url: str,
+    candidate_name: str,
+    company: str,
+    current_title: str,
+    page_text: str,
+) -> tuple[str, int]:
+    score = 0
+    parsed = urlparse(linkedin_url)
+    slug = parsed.path.lower().replace("-", " ").replace("/", " ")
+    haystack = clean_text(page_text).lower()
+
+    name_tokens = [token for token in re.findall(r"[a-z]+", candidate_name.lower()) if len(token) >= 3]
+    if name_tokens:
+        matched_name_tokens = sum(1 for token in name_tokens if token in slug)
+        if matched_name_tokens >= 2:
+            score += 3
+        elif matched_name_tokens == 1:
+            score += 1
+
+    company_tokens = [token for token in re.findall(r"[a-z]+", company.lower()) if len(token) >= 4]
+    if company_tokens and any(token in haystack for token in company_tokens):
+        score += 2
+
+    title_tokens = [token for token in re.findall(r"[a-z]+", current_title.lower()) if len(token) >= 5]
+    if title_tokens and any(token in haystack for token in title_tokens):
+        score += 1
+
+    if score >= 5:
+        return LINKEDIN_CONFIDENCE_HIGH, score
+    if score >= 3:
+        return LINKEDIN_CONFIDENCE_MEDIUM, score
+    return LINKEDIN_CONFIDENCE_LOW, score
+
+
+def google_search_linkedin_url(candidate_name: str, company: str, current_title: str) -> tuple[str, str]:
+    if requests is None or not candidate_name.strip():
+        return "", ""
+
+    query_parts = [candidate_name.strip(), "LinkedIn"]
+    if company.strip():
+        query_parts.append(company.strip())
+    elif current_title.strip():
+        query_parts.append(current_title.strip())
+    query = " ".join(query_parts)
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; RecruiterBot/1.0)"}
+    search_requests = [
+        ("https://www.google.com/search", {"q": query, "num": "5", "hl": "en"}),
+        ("https://duckduckgo.com/html/", {"q": query}),
+    ]
+
+    best_url = ""
+    best_confidence = ""
+    best_score = -1
+
+    for endpoint, params in search_requests:
+        try:
+            response = requests.get(endpoint, params=params, headers=headers, timeout=15)
+        except Exception:
+            continue
+        if not response.ok:
+            continue
+
+        html_text = response.text
+        for candidate_url in extract_linkedin_urls_from_search_html(html_text):
+            confidence, score = linkedin_confidence_for_result(
+                candidate_url,
+                candidate_name=candidate_name,
+                company=company,
+                current_title=current_title,
+                page_text=html_text,
+            )
+            if score > best_score:
+                best_score = score
+                best_url = candidate_url
+                best_confidence = confidence
+                if best_confidence == LINKEDIN_CONFIDENCE_HIGH:
+                    return best_url, best_confidence
+
+    return best_url, best_confidence
 
 
 def enrich_title_company_from_linkedin(linkedin_url: str, pdl_api_key: str) -> tuple[str, str]:
@@ -1075,6 +1497,8 @@ def create_reply_draft(
     message["Subject"] = reply_subject
     message["In-Reply-To"] = replied_message_id
     message["References"] = merged_references
+    if normalize_email(to_email) != normalize_email(DEFAULT_DRAFT_BCC):
+        message["Bcc"] = DEFAULT_DRAFT_BCC
     message.set_content(body_text)
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
@@ -1256,11 +1680,35 @@ def slack_enabled(config: Config) -> bool:
     return bool(config.slack_token and config.slack_review_channel)
 
 
+def load_slack_posted_threads(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if isinstance(payload, list):
+        return {str(item).strip() for item in payload if str(item).strip()}
+    if isinstance(payload, dict):
+        raw_items = payload.get("posted_thread_ids", [])
+        if isinstance(raw_items, list):
+            return {str(item).strip() for item in raw_items if str(item).strip()}
+    return set()
+
+
+def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"posted_thread_ids": sorted(thread_ids)}
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
     if not candidates or not slack_enabled(config):
         return 0, 0
 
     client = SlackClient(config.slack_token)
+    posted_threads = load_slack_posted_threads(config.slack_state_file)
+    state_changed = False
     try:
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
@@ -1269,13 +1717,22 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
     failed = 0
 
     for candidate in candidates:
-        marker = slack_thread_marker(candidate["thread_id"])
+        thread_id = candidate.get("thread_id", "").strip()
+        if not thread_id:
+            failed += 1
+            continue
+        if thread_id in posted_threads:
+            continue
+
+        marker = slack_thread_marker(thread_id)
         fallback_text = (
             f"New candidate: {candidate['candidate_name']} ({candidate['role']}) "
             f"- react :white_check_mark: to proceed or :x: to reject. {marker}"
         )
         resume_url = candidate.get("resume_url", "")
         notion_url = candidate.get("notion_url", "")
+        linkedin_url = candidate.get("linkedin_url", "")
+        linkedin_display = linkedin_url if linkedin_url else "Not found"
         blocks: list[dict[str, Any]] = [
             {
                 "type": "section",
@@ -1283,10 +1740,13 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
                     "type": "mrkdwn",
                     "text": (
                         f"*New Applicant*  {marker}\n"
+                        f"*Role at Truewind:* {candidate['role']}\n"
                         f"*Name:* {candidate['candidate_name']}\n"
-                        f"*Role:* {candidate['role']}\n"
-                        f"*Current:* {candidate['current_title']} @ {candidate['company']}\n"
-                        f"*Career Stage:* {candidate['career_stage']}  |  *Location:* {candidate['location']}\n"
+                        f"*Current role:* {candidate['current_title']}\n"
+                        f"*Current Company:* {candidate['company']}\n"
+                        f"*Location:* {candidate['location']}\n"
+                        f"*Career Stage:* {candidate['career_stage']}\n"
+                        f"*LinkedIn:* {linkedin_display}\n"
                         "React with :white_check_mark: to `Proceed` or :x: to `Reject`."
                     ),
                 },
@@ -1315,10 +1775,52 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         try:
             client.post_message(channel_id, fallback_text, blocks)
             posted += 1
+            posted_threads.add(thread_id)
+            state_changed = True
         except Exception:
             failed += 1
 
+    if state_changed:
+        save_slack_posted_threads(config.slack_state_file, posted_threads)
     return posted, failed
+
+
+def collect_review_candidates_for_slack(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> list[dict[str, str]]:
+    properties_schema = database_schema.get("properties", {})
+    title_prop_name = resolve_title_property_name(properties_schema, prop_map.candidate_name)
+    candidates: list[dict[str, str]] = []
+    for page in notion.query_pages({"page_size": 100}):
+        props = page.get("properties", {})
+        status = notion_prop_value(props.get(prop_map.status, {})).strip().lower()
+        if status and status != "awaiting decision":
+            continue
+
+        thread_id = notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip()
+        if not thread_id:
+            continue
+
+        candidates.append(
+            {
+                "candidate_name": notion_prop_value(props.get(title_prop_name, {})).strip() or "Unknown",
+                "role": notion_prop_value(props.get(prop_map.role, {})).strip() or "Unknown",
+                "current_title": notion_prop_value(props.get(prop_map.current_title, {})).strip() or "Unknown",
+                "company": notion_prop_value(props.get(prop_map.company, {})).strip() or "Unknown",
+                "career_stage": notion_prop_value(props.get(prop_map.career_stage, {})).strip() or "Mid",
+                "location": notion_prop_value(props.get(prop_map.location, {})).strip() or "Unknown",
+                "linkedin_url": notion_prop_value(props.get(prop_map.linkedin_url, {})).strip(),
+                "resume_url": notion_prop_value(props.get(prop_map.resume_url, {})).strip(),
+                "thread_id": thread_id,
+                "notion_url": notion_page_url(page.get("id", "")),
+                "date_first_entered": notion_prop_value(props.get(prop_map.date_first_entered, {})).strip(),
+            }
+        )
+
+    candidates.sort(key=lambda item: item.get("date_first_entered", ""))
+    return candidates
 
 
 def sync_slack_decisions(
@@ -1487,6 +1989,7 @@ def upsert_candidate_page(
     resume_url: str,
     career_stage: str,
     linkedin_url: str,
+    linkedin_confidence: str,
     company: str,
     current_title: str,
     location: str,
@@ -1508,6 +2011,7 @@ def upsert_candidate_page(
         prop_map.resume_url: resume_url,
         prop_map.career_stage: career_stage,
         prop_map.linkedin_url: linkedin_url,
+        prop_map.linkedin_confidence: linkedin_confidence,
         prop_map.company: company,
         prop_map.current_title: current_title,
         prop_map.location: location,
@@ -1630,6 +2134,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         )
         existing_resume_url = ""
         existing_linkedin_url = ""
+        existing_linkedin_confidence = ""
         existing_current_title = ""
         existing_company = ""
         existing_date_first_entered = ""
@@ -1641,6 +2146,9 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             existing_linkedin_url = notion_prop_value(
                 props.get(config.property_map.linkedin_url, {})
             ).strip()
+            existing_linkedin_confidence = notion_prop_value(
+                props.get(config.property_map.linkedin_confidence, {})
+            ).strip()
             existing_current_title = notion_prop_value(
                 props.get(config.property_map.current_title, {})
             ).strip()
@@ -1651,9 +2159,24 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
                 props.get(config.property_map.date_first_entered, {})
             ).strip()
 
-        linkedin_url = extract_linkedin_url(
+        resume_linkedin_url = extract_linkedin_url(
             resume_text, snippet, filename, raw, message_body_text
-        ) or existing_linkedin_url
+        )
+        linkedin_url = resume_linkedin_url or existing_linkedin_url
+        linkedin_confidence = (
+            LINKEDIN_CONFIDENCE_HIGH if resume_linkedin_url else existing_linkedin_confidence
+        )
+        if not linkedin_url:
+            fallback_url, fallback_confidence = google_search_linkedin_url(
+                candidate_name,
+                resume_company or existing_company,
+                resume_title or existing_current_title,
+            )
+            if fallback_url:
+                linkedin_url = fallback_url
+                linkedin_confidence = fallback_confidence or LINKEDIN_CONFIDENCE_LOW
+        elif not linkedin_confidence:
+            linkedin_confidence = LINKEDIN_CONFIDENCE_MEDIUM
 
         linkedin_title = ""
         linkedin_company = ""
@@ -1670,8 +2193,10 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
                 linkedin_url, config.pdl_api_key
             )
 
-        current_title = linkedin_title or resume_title or existing_current_title or "Unknown"
-        company = linkedin_company or resume_company or existing_company or "Unknown"
+        resume_title_value = resume_title if resume_title and resume_title.lower() != "unknown" else ""
+        resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""
+        current_title = resume_title_value or linkedin_title or existing_current_title or "Unknown"
+        company = resume_company_value or linkedin_company or existing_company or "Unknown"
         resume_url = existing_resume_url or upload_resume_to_drive(
             drive_service, filename, raw, config.drive_folder_id
         )
@@ -1696,6 +2221,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             resume_url=resume_url,
             career_stage=stage,
             linkedin_url=linkedin_url,
+            linkedin_confidence=linkedin_confidence,
             company=company,
             current_title=current_title,
             location=location,
@@ -1716,6 +2242,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
                     "company": company,
                     "career_stage": stage,
                     "location": location,
+                    "linkedin_url": linkedin_url,
                     "resume_url": resume_url,
                     "thread_id": thread_id,
                     "notion_url": notion_page_url(page_id),
@@ -1724,8 +2251,17 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         else:
             updated += 1
 
-    if created_candidates and slack_enabled(config):
-        slack_posts, slack_post_failures = post_candidate_reviews_to_slack(config, created_candidates)
+    if slack_enabled(config):
+        running_in_github_actions = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
+        if running_in_github_actions:
+            review_candidates = created_candidates
+        else:
+            review_candidates = collect_review_candidates_for_slack(
+                notion,
+                database_schema,
+                config.property_map,
+            )
+        slack_posts, slack_post_failures = post_candidate_reviews_to_slack(config, review_candidates)
 
     print(f"Processed messages: {processed}")
     print(f"Created Notion records: {created}")
@@ -1975,6 +2511,7 @@ def schema_check_cmd(_args: argparse.Namespace) -> None:
         config.property_map.resume_url,
         config.property_map.career_stage,
         config.property_map.linkedin_url,
+        config.property_map.linkedin_confidence,
         config.property_map.company,
         config.property_map.current_title,
         config.property_map.location,

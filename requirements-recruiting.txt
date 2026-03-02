@@ -4,3 +4,4 @@ google-auth-oauthlib==1.2.2
 python-dotenv==1.1.1
 requests==2.32.3
 pypdf==5.9.0
+docling==2.75.0
