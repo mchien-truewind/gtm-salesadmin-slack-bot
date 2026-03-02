@@ -222,6 +222,8 @@ source .venv/bin/activate
 python3 -m pip install -r requirements-recruiting.txt
 ```
 
+`requirements-recruiting.txt` now includes `docling`, which the recruiter uses as the primary parser for resume PDFs/docx to improve latest role/company and LinkedIn extraction quality.
+
 2. Configure env vars in `.env.local`.
 
 You can use canonical names:
