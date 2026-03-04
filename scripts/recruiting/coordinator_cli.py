@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -41,10 +41,12 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 RESUME_EXTENSIONS = (".pdf", ".docx", ".doc", ".txt", ".rtf")
 
-DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. Are you free for a 20-minute intro call?"
+DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. When are you free for a 20-minute intro call?"
 DEFAULT_REJECT_TEMPLATE = (
-    "Thank you for your interest in our team. We reviewed your application and "
-    "decided not to move forward at this time."
+    "Thank you for your submission. We had an incredibly strong pool of applicants, and after careful "
+    "consideration, we won't be moving forward with your application at this time.\n\n"
+    "We're growing quickly, though, and new roles open up often. Please keep checking our careers page "
+    "for future opportunities. We'd be glad to see your application again in the future."
 )
 DEFAULT_SCHEDULING_TEMPLATE = (
     "Thanks for the quick reply. Are you available for a 20-minute intro call on {slot_label}?"
@@ -95,9 +97,12 @@ class Config:
     reject_template: str
     scheduling_template: str
     reject_delay_hours: int
+    sent_status_lookback_days: int
+    pipeline_label_name: str
     pdl_api_key: str
     slack_token: str
     slack_review_channel: str
+    slack_mention_user_id: str
     slack_history_lookback_days: int
     slack_proceed_reactions: set[str]
     slack_reject_reactions: set[str]
@@ -297,15 +302,27 @@ def load_config() -> Config:
     property_map = NotionPropertyMap(
         candidate_name=os.getenv("RECRUITING_NOTION_PROP_CANDIDATE_NAME", "Candidate Name").strip(),
         email=os.getenv("RECRUITING_NOTION_PROP_EMAIL", "Email").strip(),
-        role=os.getenv("RECRUITING_NOTION_PROP_ROLE", "Role").strip(),
+        role=(
+            os.getenv("RECRUITING_NOTION_PROP_ROLE_AT_TRUEWIND", "").strip()
+            or os.getenv("RECRUITING_NOTION_PROP_ROLE", "").strip()
+            or "Role at Truewind"
+        ),
         resume_url=os.getenv("RECRUITING_NOTION_PROP_RESUME_URL", "Resume URL").strip(),
         career_stage=os.getenv("RECRUITING_NOTION_PROP_CAREER_STAGE", "Career Stage").strip(),
         linkedin_url=os.getenv("RECRUITING_NOTION_PROP_LINKEDIN_URL", "LinkedIn URL").strip(),
         linkedin_confidence=os.getenv(
             "RECRUITING_NOTION_PROP_LINKEDIN_CONFIDENCE", "Confidence Level - LI"
         ).strip(),
-        company=os.getenv("RECRUITING_NOTION_PROP_COMPANY", "Company").strip(),
-        current_title=os.getenv("RECRUITING_NOTION_PROP_CURRENT_TITLE", "Current Title").strip(),
+        company=(
+            os.getenv("RECRUITING_NOTION_PROP_CURRENT_COMPANY", "").strip()
+            or os.getenv("RECRUITING_NOTION_PROP_COMPANY", "").strip()
+            or "Current Company"
+        ),
+        current_title=(
+            os.getenv("RECRUITING_NOTION_PROP_CURRENT_ROLE", "").strip()
+            or os.getenv("RECRUITING_NOTION_PROP_CURRENT_TITLE", "").strip()
+            or "Current Role"
+        ),
         location=os.getenv("RECRUITING_NOTION_PROP_LOCATION", "Location").strip(),
         date_first_entered=os.getenv("RECRUITING_NOTION_PROP_DATE_FIRST_ENTERED", "Date first entered").strip(),
         decision=os.getenv("RECRUITING_NOTION_PROP_DECISION", "Decision").strip(),
@@ -336,11 +353,17 @@ def load_config() -> Config:
             os.getenv("RECRUITING_SCHEDULING_TEMPLATE", "").strip() or DEFAULT_SCHEDULING_TEMPLATE
         ),
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
+        sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
+        pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
         slack_token=get_env_first("SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
         slack_review_channel=(
             os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL_ID", "").strip()
             or os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL", "hiring-review").strip().lstrip("#")
+        ),
+        slack_mention_user_id=(
+            os.getenv("RECRUITING_SLACK_MENTION_USER_ID", "").strip()
+            or os.getenv("SLACK_USER_ID", "").strip()
         ),
         slack_history_lookback_days=parse_env_int("RECRUITING_SLACK_HISTORY_LOOKBACK_DAYS", 14),
         slack_proceed_reactions=parse_csv_set(
@@ -446,6 +469,9 @@ class SlackClient:
         if not body.get("ok"):
             raise RuntimeError(f"Slack API error {method}: {body.get('error', 'unknown_error')}")
         return body
+
+    def auth_test(self) -> dict[str, Any]:
+        return self._request("auth.test", {})
 
     def resolve_channel_id(self, channel_name_or_id: str) -> str:
         cleaned = channel_name_or_id.strip().lstrip("#")
@@ -1582,6 +1608,67 @@ def candidate_replied_since(
     return False
 
 
+def sender_sent_since(
+    gmail_service,
+    *,
+    thread_id: str,
+    sender_email: str,
+    since: datetime,
+    to_email: str = "",
+) -> bool:
+    thread = (
+        gmail_service.users()
+        .threads()
+        .get(userId="me", id=thread_id, format="metadata", metadataHeaders=["From", "To"])
+        .execute()
+    )
+    sender_email = normalize_email(sender_email)
+    to_email = normalize_email(to_email)
+
+    for message in thread.get("messages", []):
+        internal_ms = int(message.get("internalDate", "0") or "0")
+        internal_dt = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc)
+        if internal_dt <= since.astimezone(timezone.utc):
+            continue
+
+        label_ids = set(message.get("labelIds", []) or [])
+        sent_labeled = "SENT" in label_ids
+        headers = {
+            entry.get("name", "").lower(): entry.get("value", "")
+            for entry in message.get("payload", {}).get("headers", [])
+        }
+        from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        # Prefer SENT-labeled thread messages, and fallback to explicit from-email match.
+        if not sent_labeled and from_email != sender_email:
+            continue
+
+        if to_email:
+            recipients: set[str] = set()
+            for token in headers.get("to", "").split(","):
+                parsed = normalize_email(parseaddr(token)[1])
+                if parsed:
+                    recipients.add(parsed)
+            if recipients and to_email not in recipients:
+                continue
+
+        return True
+    return False
+
+
+def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
+    if not label_id:
+        return False
+    try:
+        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="minimal").execute()
+    except Exception:
+        return False
+    for message in thread.get("messages", []):
+        labels = set(message.get("labelIds", []) or [])
+        if label_id in labels:
+            return True
+    return False
+
+
 def find_next_available_slot(config: Config, calendar_service, start_anchor: datetime) -> datetime | None:
     tz = ZoneInfo(config.timezone_name)
     search_start = max(start_anchor, now_local(config.timezone_name) + timedelta(hours=config.min_notice_hours))
@@ -1715,6 +1802,13 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         return 0, len(candidates)
     posted = 0
     failed = 0
+    mention_user_id = config.slack_mention_user_id
+    if not mention_user_id:
+        try:
+            mention_user_id = (client.auth_test().get("user_id", "") or "").strip()
+        except Exception:
+            mention_user_id = ""
+    mention_prefix = f"<@{mention_user_id}> " if mention_user_id else ""
 
     for candidate in candidates:
         thread_id = candidate.get("thread_id", "").strip()
@@ -1726,7 +1820,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
 
         marker = slack_thread_marker(thread_id)
         fallback_text = (
-            f"New candidate: {candidate['candidate_name']} ({candidate['role']}) "
+            f"{mention_prefix}New candidate: {candidate['candidate_name']} ({candidate['role']}) "
             f"- react :white_check_mark: to proceed or :x: to reject. {marker}"
         )
         resume_url = candidate.get("resume_url", "")
@@ -1752,6 +1846,14 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
                 },
             },
         ]
+        if mention_prefix:
+            blocks.insert(
+                0,
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"{mention_prefix}new applicant to review"},
+                },
+            )
         action_elements: list[dict[str, Any]] = []
         if resume_url:
             action_elements.append(
@@ -1832,7 +1934,7 @@ def sync_slack_decisions(
         return 0, 0, 0, 0
 
     properties = database_schema.get("properties", {})
-    prop = config.property_map
+    prop = resolve_property_map(config.property_map, database_schema)
     required_props = [prop.decision, prop.decision_time, prop.gmail_thread_id]
     for required in required_props:
         if required not in properties:
@@ -1947,6 +2049,46 @@ def resolve_title_property_name(properties_schema: dict[str, Any], preferred: st
     raise KeyError("Notion database must contain a title property.")
 
 
+def resolve_property_name(
+    properties_schema: dict[str, Any],
+    preferred: str,
+    aliases: list[str],
+) -> str:
+    if preferred in properties_schema:
+        return preferred
+    for alias in aliases:
+        if alias in properties_schema:
+            return alias
+    return preferred
+
+
+def resolve_property_map(prop_map: NotionPropertyMap, database_schema: dict[str, Any]) -> NotionPropertyMap:
+    properties_schema = database_schema.get("properties", {})
+    return replace(
+        prop_map,
+        candidate_name=resolve_property_name(
+            properties_schema,
+            prop_map.candidate_name,
+            ["Candidate Name", "Name"],
+        ),
+        role=resolve_property_name(
+            properties_schema,
+            prop_map.role,
+            ["Role at Truewind", "Role @ Truewind", "Role"],
+        ),
+        current_title=resolve_property_name(
+            properties_schema,
+            prop_map.current_title,
+            ["Current Role", "Current Title", "Title"],
+        ),
+        company=resolve_property_name(
+            properties_schema,
+            prop_map.company,
+            ["Current Company", "Company"],
+        ),
+    )
+
+
 def thread_filter(prop_name: str, prop_schema: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
     prop_type = prop_schema.get("type")
     if prop_type == "rich_text":
@@ -2052,6 +2194,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     config = load_config()
     notion = NotionClient(config.notion_token, config.notion_database_id)
     database_schema = notion.get_database()
+    prop_map = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
         api_name="gmail",
@@ -2130,7 +2273,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             continue
 
         existing_page = find_existing_candidate_page(
-            notion, database_schema, config.property_map, thread_id
+            notion, database_schema, prop_map, thread_id
         )
         existing_resume_url = ""
         existing_linkedin_url = ""
@@ -2141,22 +2284,22 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         if existing_page:
             props = existing_page.get("properties", {})
             existing_resume_url = notion_prop_value(
-                props.get(config.property_map.resume_url, {})
+                props.get(prop_map.resume_url, {})
             ).strip()
             existing_linkedin_url = notion_prop_value(
-                props.get(config.property_map.linkedin_url, {})
+                props.get(prop_map.linkedin_url, {})
             ).strip()
             existing_linkedin_confidence = notion_prop_value(
-                props.get(config.property_map.linkedin_confidence, {})
+                props.get(prop_map.linkedin_confidence, {})
             ).strip()
             existing_current_title = notion_prop_value(
-                props.get(config.property_map.current_title, {})
+                props.get(prop_map.current_title, {})
             ).strip()
             existing_company = notion_prop_value(
-                props.get(config.property_map.company, {})
+                props.get(prop_map.company, {})
             ).strip()
             existing_date_first_entered = notion_prop_value(
-                props.get(config.property_map.date_first_entered, {})
+                props.get(prop_map.date_first_entered, {})
             ).strip()
 
         resume_linkedin_url = extract_linkedin_url(
@@ -2214,7 +2357,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         page_id, was_created = upsert_candidate_page(
             notion,
             database_schema,
-            config.property_map,
+            prop_map,
             candidate_name=candidate_name,
             candidate_email=candidate_email,
             role=role,
@@ -2236,8 +2379,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             created += 1
             created_candidates.append(
                 {
-                    "candidate_name": candidate_name,
-                    "role": role,
+                "candidate_name": candidate_name,
+                "role": role,
                     "current_title": current_title,
                     "company": company,
                     "career_stage": stage,
@@ -2259,7 +2402,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             review_candidates = collect_review_candidates_for_slack(
                 notion,
                 database_schema,
-                config.property_map,
+                prop_map,
             )
         slack_posts, slack_post_failures = post_candidate_reviews_to_slack(config, review_candidates)
 
@@ -2278,6 +2421,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     notion = NotionClient(config.notion_token, config.notion_database_id)
     database_schema = notion.get_database()
     properties_schema = database_schema.get("properties", {})
+    prop = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
         api_name="gmail",
@@ -2300,30 +2444,51 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         help_text="Set GOOGLE_CALENDAR_CREDENTIALS_FILE or place Calendar OAuth credentials in secrets/.",
     )
 
-    prop = config.property_map
     pages = notion.query_pages({"page_size": 100})
 
     proceed_drafts = 0
     reject_scheduled = 0
     reject_drafts = 0
+    reject_marked_sent = 0
+    in_process_marked = 0
     scheduling_drafts = 0
+    status_lookback_anchor = now_local(config.timezone_name) - timedelta(days=config.sent_status_lookback_days)
+    pipeline_label_id = ""
+    if config.pipeline_label_name:
+        try:
+            pipeline_label_id = gmail_label_id(gmail_service, config.pipeline_label_name)
+        except Exception:
+            pipeline_label_id = ""
 
     for page in pages:
         page_props = page.get("properties", {})
         decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
-        if decision not in {"proceed", "reject"}:
-            continue
+        current_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
 
         candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
         thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
         if not candidate_email or not thread_id:
             continue
 
+        update_payload: dict[str, Any] = {}
+        in_pipeline = False
+        if pipeline_label_id and thread_has_label(gmail_service, thread_id=thread_id, label_id=pipeline_label_id):
+            in_pipeline = True
+            if current_status != "in process" and prop.status in properties_schema:
+                in_process_marked += 1
+                update_payload[prop.status] = build_notion_value(
+                    properties_schema[prop.status], "In Process"
+                )
+                current_status = "in process"
+
+        if decision not in {"proceed", "reject"}:
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+            continue
+
         decision_time_raw = notion_prop_value(page_props.get(prop.decision_time, {})).strip()
         decision_time = parse_iso_datetime(decision_time_raw, config.timezone_name)
         now = now_local(config.timezone_name)
-
-        update_payload: dict[str, Any] = {}
 
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
@@ -2425,6 +2590,24 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     update_payload[prop.status] = build_notion_value(
                         properties_schema[prop.status], "Reject Drafted"
                     )
+            if current_status != "rejected" and not in_pipeline:
+                # Mark as rejected once an outbound email is actually sent after the reject decision.
+                # This works for both generated drafts and manual sends.
+                sent_anchor = status_lookback_anchor
+                if decision_time and decision_time > sent_anchor:
+                    sent_anchor = decision_time
+                if sent_anchor and sender_sent_since(
+                    gmail_service,
+                    thread_id=thread_id,
+                    sender_email=config.from_email,
+                    since=sent_anchor,
+                    to_email=candidate_email,
+                ):
+                    reject_marked_sent += 1
+                    if prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], "Rejected"
+                        )
 
         if update_payload:
             notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -2432,6 +2615,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Proceed drafts created: {proceed_drafts}")
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
+    print(f"Reject records marked sent: {reject_marked_sent}")
+    print(f"In Process records marked from pipeline label: {in_process_marked}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
 
 
@@ -2504,28 +2689,30 @@ def schema_check_cmd(_args: argparse.Namespace) -> None:
     notion = NotionClient(config.notion_token, config.notion_database_id)
     db = notion.get_database()
     properties = db.get("properties", {})
-    title_prop_name = resolve_title_property_name(properties, config.property_map.candidate_name)
+    prop_map = resolve_property_map(config.property_map, db)
+    title_prop_name = resolve_title_property_name(properties, prop_map.candidate_name)
     required = [
         title_prop_name,
-        config.property_map.email,
-        config.property_map.resume_url,
-        config.property_map.career_stage,
-        config.property_map.linkedin_url,
-        config.property_map.linkedin_confidence,
-        config.property_map.company,
-        config.property_map.current_title,
-        config.property_map.location,
-        config.property_map.date_first_entered,
-        config.property_map.decision,
-        config.property_map.decision_time,
-        config.property_map.reject_send_at,
-        config.property_map.proceed_draft_id,
-        config.property_map.reject_draft_id,
-        config.property_map.gmail_thread_id,
-        config.property_map.status,
-        config.property_map.scheduling_draft_id,
-        config.property_map.proposed_slot,
-        config.property_map.last_sync_at,
+        prop_map.email,
+        prop_map.role,
+        prop_map.resume_url,
+        prop_map.career_stage,
+        prop_map.linkedin_url,
+        prop_map.linkedin_confidence,
+        prop_map.company,
+        prop_map.current_title,
+        prop_map.location,
+        prop_map.date_first_entered,
+        prop_map.decision,
+        prop_map.decision_time,
+        prop_map.reject_send_at,
+        prop_map.proceed_draft_id,
+        prop_map.reject_draft_id,
+        prop_map.gmail_thread_id,
+        prop_map.status,
+        prop_map.scheduling_draft_id,
+        prop_map.proposed_slot,
+        prop_map.last_sync_at,
     ]
 
     missing = [name for name in required if name not in properties]
@@ -2548,11 +2735,14 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "drive_folder_id_configured": bool(config.drive_folder_id),
         "slack_enabled": slack_enabled(config),
         "slack_review_channel": config.slack_review_channel,
+        "slack_mention_user_configured": bool(config.slack_mention_user_id),
         "slack_history_lookback_days": config.slack_history_lookback_days,
         "slack_allow_decision_override": config.slack_allow_decision_override,
         "slack_proceed_reactions": sorted(config.slack_proceed_reactions),
         "slack_reject_reactions": sorted(config.slack_reject_reactions),
         "reject_delay_hours": config.reject_delay_hours,
+        "sent_status_lookback_days": config.sent_status_lookback_days,
+        "pipeline_label_name": config.pipeline_label_name,
         "timezone": config.timezone_name,
         "slot_minutes": config.slot_minutes,
         "buffer_minutes": config.buffer_minutes,
