@@ -51,9 +51,17 @@ DEFAULT_REJECT_TEMPLATE = (
 DEFAULT_SCHEDULING_TEMPLATE = (
     "Thanks for the quick reply. Are you available for a 20-minute intro call on {slot_label}?"
 )
+DEFAULT_NO_RESPONSE_TEMPLATE = (
+    "Hi {first_name},\n\n"
+    "Haven't heard back from you in a while. We're going to close the loop on this process as you figure out your next steps.\n\n"
+    "We are growing quickly and we'll be glad to see your application again for another role in the future.\n\n"
+    "Thanks\n"
+    "Mercedes"
+)
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
+DEFAULT_ASSIGNMENT_KEYWORDS = "assignment,case study,take-home,take home,exercise,project"
 
 _DOCLING_CONVERTER: Any | None = None
 _DOCLING_CHECKED = False
@@ -96,7 +104,10 @@ class Config:
     proceed_template: str
     reject_template: str
     scheduling_template: str
+    no_response_template: str
     reject_delay_hours: int
+    no_response_wait_days: int
+    assignment_keywords: set[str]
     sent_status_lookback_days: int
     pipeline_label_name: str
     pdl_api_key: str
@@ -352,7 +363,14 @@ def load_config() -> Config:
         scheduling_template=(
             os.getenv("RECRUITING_SCHEDULING_TEMPLATE", "").strip() or DEFAULT_SCHEDULING_TEMPLATE
         ),
+        no_response_template=(
+            os.getenv("RECRUITING_NO_RESPONSE_TEMPLATE", "").strip() or DEFAULT_NO_RESPONSE_TEMPLATE
+        ),
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
+        no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
+        assignment_keywords=parse_csv_set(
+            os.getenv("RECRUITING_ASSIGNMENT_KEYWORDS", ""), default=DEFAULT_ASSIGNMENT_KEYWORDS
+        ),
         sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
         pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
@@ -1655,6 +1673,64 @@ def sender_sent_since(
     return False
 
 
+def extract_first_name(candidate_name: str, candidate_email: str) -> str:
+    name = clean_text(candidate_name)
+    if name and name.lower() != "unknown":
+        token = re.split(r"\s+", name)[0].strip(" ,.-")
+        if token:
+            return token
+    local = clean_text(candidate_email).split("@", 1)[0]
+    local = re.split(r"[._+\-]", local)[0].strip(" ,.-")
+    return local.capitalize() if local else "there"
+
+
+def render_no_response_template(template: str, first_name: str) -> str:
+    body = template.replace("{{first name}}", first_name).replace("{{first_name}}", first_name)
+    try:
+        body = body.format(first_name=first_name)
+    except Exception:
+        pass
+    return body
+
+
+def thread_latest_assignment_sent_at(
+    gmail_service,
+    *,
+    thread_id: str,
+    sender_email: str,
+    keywords: set[str],
+) -> datetime | None:
+    if not keywords:
+        return None
+    try:
+        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception:
+        return None
+
+    sender_email = normalize_email(sender_email)
+    lowered_keywords = {keyword.strip().lower() for keyword in keywords if keyword.strip()}
+    latest: datetime | None = None
+
+    for message in thread.get("messages", []):
+        headers = header_map(message)
+        from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        if from_email != sender_email:
+            continue
+
+        subject = clean_text(headers.get("subject", "")).lower()
+        snippet = clean_text(message.get("snippet", "")).lower()
+        body = clean_text(extract_message_body_text(message)).lower()
+        haystack = f"{subject}\n{snippet}\n{body}"
+        if not any(keyword in haystack for keyword in lowered_keywords):
+            continue
+
+        sent_at = message_internal_datetime(message)
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
+
+    return latest
+
+
 def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     if not label_id:
         return False
@@ -2451,6 +2527,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     reject_drafts = 0
     reject_marked_sent = 0
     in_process_marked = 0
+    no_response_drafts = 0
     scheduling_drafts = 0
     status_lookback_anchor = now_local(config.timezone_name) - timedelta(days=config.sent_status_lookback_days)
     pipeline_label_id = ""
@@ -2482,6 +2559,39 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 current_status = "in process"
 
         if decision not in {"proceed", "reject"}:
+            if current_status == "awaiting decision":
+                assignment_sent_at = thread_latest_assignment_sent_at(
+                    gmail_service,
+                    thread_id=thread_id,
+                    sender_email=config.from_email,
+                    keywords=config.assignment_keywords,
+                )
+                if assignment_sent_at:
+                    wait_delta = now_local(config.timezone_name).astimezone(timezone.utc) - assignment_sent_at
+                    if wait_delta >= timedelta(days=config.no_response_wait_days):
+                        if not candidate_replied_since(
+                            gmail_service,
+                            thread_id=thread_id,
+                            candidate_email=candidate_email,
+                            since=assignment_sent_at,
+                        ):
+                            first_name = extract_first_name(
+                                notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "there",
+                                candidate_email,
+                            )
+                            body = render_no_response_template(config.no_response_template, first_name)
+                            create_reply_draft(
+                                gmail_service,
+                                sender_email=config.from_email,
+                                to_email=candidate_email,
+                                thread_id=thread_id,
+                                body_text=body,
+                            )
+                            no_response_drafts += 1
+                            if prop.status in properties_schema:
+                                update_payload[prop.status] = build_notion_value(
+                                    properties_schema[prop.status], "No response"
+                                )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
             continue
@@ -2617,6 +2727,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Reject drafts created: {reject_drafts}")
     print(f"Reject records marked sent: {reject_marked_sent}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
+    print(f"No response drafts created: {no_response_drafts}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
 
 
@@ -2741,6 +2852,8 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "slack_proceed_reactions": sorted(config.slack_proceed_reactions),
         "slack_reject_reactions": sorted(config.slack_reject_reactions),
         "reject_delay_hours": config.reject_delay_hours,
+        "no_response_wait_days": config.no_response_wait_days,
+        "assignment_keywords": sorted(config.assignment_keywords),
         "sent_status_lookback_days": config.sent_status_lookback_days,
         "pipeline_label_name": config.pipeline_label_name,
         "timezone": config.timezone_name,
