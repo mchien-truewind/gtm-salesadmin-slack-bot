@@ -186,6 +186,63 @@ Output includes, per person:
 - Calendar link
 - Matched 1:1 doc link
 - Suggested focus bullets extracted from recent actionable lines in that doc
+
+## Gmail Inbox Auto-Filter + Draft Drafting
+
+Auto-process inbox threads with this workflow:
+- Auto-reply/subscription style emails -> label `gen-auto` + archive
+- Marketing/promotional emails -> label `gen-marketing` + archive
+- Conference/event threads -> label `gen-conference` + archive
+- Conversation threads -> create draft replies in Gmail Drafts (never auto-send), but only when:
+  - explicit actionable intent is detected, and
+  - draft confidence meets threshold (`--min-draft-confidence`, default `2`)
+- Low-confidence conversation threads are labeled `gen-needs-review` instead of drafting.
+
+Script:
+- `scripts/google_workspace/gmail_inbox_triage.py`
+
+1. Ensure Gmail OAuth credentials exist:
+   - `secrets/google-gmail-credentials.json`
+
+2. Authenticate (first run or after scope changes):
+   ```sh
+   python3 scripts/google_workspace/gmail_inbox_triage.py auth
+   ```
+
+3. Run safely in dry-run mode first:
+   ```sh
+   python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --dry-run
+   ```
+
+4. Run with mutations enabled:
+   ```sh
+   python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25
+   ```
+
+Optional: force-refresh existing drafts for unchanged inbound messages:
+```sh
+python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --refresh-existing-drafts
+```
+
+Optional: control style-learning cache behavior (default reuses cached profile for 24h):
+```sh
+python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --style-cache-ttl-hours 24
+python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --refresh-style-profile
+```
+
+5. Audit drafts addressed to blocked/no-reply senders (report-only):
+   ```sh
+   python3 scripts/google_workspace/gmail_inbox_triage.py audit-blocked-drafts --max-drafts 500 --dry-run
+   ```
+
+6. Delete blocked drafts found by the audit:
+   ```sh
+   python3 scripts/google_workspace/gmail_inbox_triage.py audit-blocked-drafts --max-drafts 500 --delete
+   ```
+
+Outputs:
+- Triage state: `outputs/gmail/inbox_triage_state.json`
+- Learned style profile: `outputs/gmail/style_profile.json`
 ## Notion ATS Recruiting Coordinator (Draft-Only)
 
 Treat Notion as your ATS for every candidate email in Gmail label `hiring@`.
