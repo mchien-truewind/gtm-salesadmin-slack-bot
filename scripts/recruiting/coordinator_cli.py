@@ -1522,6 +1522,40 @@ def extract_last_thread_message_headers(gmail_service, thread_id: str) -> tuple[
     return subject, message_id, references
 
 
+def resolve_recipient_first_name(gmail_service, thread_id: str, to_email: str) -> str:
+    recipient_email = normalize_email(to_email)
+    if not recipient_email:
+        return "there"
+    try:
+        thread = (
+            gmail_service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="metadata", metadataHeaders=["From"])
+            .execute()
+        )
+    except Exception:
+        return extract_first_name("", recipient_email)
+
+    for message in reversed(thread.get("messages", [])):
+        headers = {
+            entry.get("name", "").lower(): entry.get("value", "")
+            for entry in message.get("payload", {}).get("headers", [])
+        }
+        from_name, from_email = parseaddr(headers.get("from", ""))
+        if normalize_email(from_email) == recipient_email:
+            return extract_first_name(from_name, recipient_email)
+    return extract_first_name("", recipient_email)
+
+
+def apply_email_greeting(body_text: str, first_name: str) -> str:
+    text = (body_text or "").strip()
+    if not text:
+        return f"Hi {first_name},"
+    if re.match(r"(?is)^hi\s+[^\n,]+,\s*\n", text):
+        return text
+    return f"Hi {first_name},\n\n{text}"
+
+
 def create_reply_draft(
     gmail_service,
     *,
@@ -1534,6 +1568,8 @@ def create_reply_draft(
     subject, replied_message_id, references = extract_last_thread_message_headers(gmail_service, thread_id)
     reply_subject = subject_override or (subject if subject.lower().startswith("re:") else f"Re: {subject}")
     merged_references = references if replied_message_id in references else f"{references} {replied_message_id}".strip()
+    first_name = resolve_recipient_first_name(gmail_service, thread_id, to_email)
+    body_with_greeting = apply_email_greeting(body_text, first_name)
 
     message = EmailMessage()
     message["From"] = sender_email
@@ -1543,7 +1579,7 @@ def create_reply_draft(
     message["References"] = merged_references
     if normalize_email(to_email) != normalize_email(DEFAULT_DRAFT_BCC):
         message["Bcc"] = DEFAULT_DRAFT_BCC
-    message.set_content(body_text)
+    message.set_content(body_with_greeting)
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     created = (
