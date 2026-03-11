@@ -255,10 +255,20 @@ def fetch_meetings_from_api(access_token: str, api_base: str, max_meetings: int 
 
 def fetch_meeting_detail(access_token: str, api_base: str, meeting_id: str) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    detail_path = f"/meetings/{meeting_id}"
+    expanded_query = urllib.parse.urlencode(
+        [
+            ("expand[]", "summary"),
+            ("expand[]", "topics"),
+            ("expand[]", "key_questions"),
+            ("expand[]", "transcript"),
+        ]
+    )
     for suffix in (
-        f"/meetings/{meeting_id}",
-        f"/meetings/{meeting_id}?include=all",
-        f"/meetings/{meeting_id}?expand=transcript",
+        f"{detail_path}?{expanded_query}",
+        detail_path,
+        f"{detail_path}?include=all",
+        f"{detail_path}?expand=transcript",
     ):
         url = f"{api_base.rstrip('/')}{suffix}"
         try:
@@ -603,7 +613,7 @@ def format_timestamp(now_local: datetime) -> str:
 
 def build_message(now_local: datetime, calls: list[CallItem], max_quotes_per_bullet: int) -> str:
     lines: list[str] = [
-        ":star: Learnings from Past Week's Discovery Calls :star:",
+        ":star: Learnings from Past 2 Day's Discovery Calls :star:",
         "",
         f"Analyzed from *{len(calls)} first discovery calls* as of *{format_timestamp(now_local)}*",
         "",
