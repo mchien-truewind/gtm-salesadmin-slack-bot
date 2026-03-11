@@ -3,8 +3,8 @@ name: Weekly Discovery Recap
 on:
   schedule:
     # DST-safe: run at both UTC hours for 6 AM Pacific on Wed/Fri, then gate by Pacific hour.
-    - cron: "15 13 * * 3,5"
-    - cron: "15 14 * * 3,5"
+    - cron: "0 13 * * 3,5"
+    - cron: "0 14 * * 3,5"
   workflow_dispatch:
     inputs:
       target_channel:
