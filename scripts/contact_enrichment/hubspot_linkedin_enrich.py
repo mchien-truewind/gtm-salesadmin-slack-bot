@@ -226,13 +226,16 @@ def pdl_match_linkedin(
     last_name: str,
     company: str,
     domain: str = "",
+    email: str = "",
 ) -> str | None:
     """Call PDL person enrichment and return LinkedIn URL if found."""
-    params: dict[str, str] = {
-        "first_name": first_name,
-        "last_name": last_name,
-        "company": company,
-    }
+    params: dict[str, str] = {}
+    # Email is the strongest signal — try it first
+    if email:
+        params["email"] = email
+    params["first_name"] = first_name
+    params["last_name"] = last_name
+    params["company"] = company
     if domain:
         params["website"] = domain
 
@@ -298,7 +301,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-pdl",
         action="store_true",
-        help="Skip PDL fallback, only use Apollo",
+        help="Skip PDL, only use Apollo",
+    )
+    parser.add_argument(
+        "--skip-apollo",
+        action="store_true",
+        help="Skip Apollo, only use PDL",
     )
     parser.add_argument(
         "--dry-run",
@@ -408,7 +416,7 @@ def main() -> int:
         to_enrich = to_enrich[: args.max_enrich]
         print(f"  Limiting to {args.max_enrich} contacts")
 
-    # Step 3: Enrich via Apollo (then PDL fallback)
+    # Step 4: Enrich via PDL first (then Apollo fallback)
     updates: list[dict[str, Any]] = []
     misses: list[dict[str, str]] = []
 
@@ -425,31 +433,34 @@ def main() -> int:
             print(f"  [{i+1}/{len(to_enrich)}] Skipping {contact['id']} — no name")
             continue
 
-        # Try Apollo first
-        linkedin_url = apollo_match_linkedin(
-            apollo_key, first, last, company, domain=domain, email=email
-        )
+        if not company and not domain and not email:
+            print(f"  [{i+1}/{len(to_enrich)}] Skipping {first} {last} — no company/domain/email")
+            misses.append({"id": contact["id"], "name": f"{first} {last}", "company": company, "title": title, "reason": "no_company"})
+            continue
 
-        if linkedin_url:
-            stats.apollo_found += 1
-            print(f"  [{i+1}/{len(to_enrich)}] Apollo: {first} {last} @ {company} → {linkedin_url}")
-        else:
-            stats.apollo_miss += 1
+        linkedin_url = None
 
-            # Try PDL fallback
-            if not args.skip_pdl and pdl_key:
-                linkedin_url = pdl_match_linkedin(pdl_key, first, last, company, domain=domain)
-                if linkedin_url:
-                    stats.pdl_found += 1
-                    print(f"  [{i+1}/{len(to_enrich)}] PDL:    {first} {last} @ {company} → {linkedin_url}")
-                else:
-                    stats.pdl_miss += 1
-                    print(f"  [{i+1}/{len(to_enrich)}] MISS:   {first} {last} @ {company} ({title})")
-                    misses.append({"id": contact["id"], "name": f"{first} {last}", "company": company, "title": title})
+        # Try PDL first (higher hit rate for this dataset)
+        if not args.skip_pdl and pdl_key:
+            linkedin_url = pdl_match_linkedin(
+                pdl_key, first, last, company, domain=domain, email=email
+            )
+            if linkedin_url:
+                stats.pdl_found += 1
+                print(f"  [{i+1}/{len(to_enrich)}] PDL:    {first} {last} @ {company} → {linkedin_url}")
             else:
                 stats.pdl_miss += 1
-                print(f"  [{i+1}/{len(to_enrich)}] MISS:   {first} {last} @ {company} ({title})")
-                misses.append({"id": contact["id"], "name": f"{first} {last}", "company": company, "title": title})
+
+        # Fall back to Apollo
+        if not linkedin_url and not args.skip_apollo and apollo_key:
+            linkedin_url = apollo_match_linkedin(
+                apollo_key, first, last, company, domain=domain, email=email
+            )
+            if linkedin_url:
+                stats.apollo_found += 1
+                print(f"  [{i+1}/{len(to_enrich)}] Apollo: {first} {last} @ {company} → {linkedin_url}")
+            else:
+                stats.apollo_miss += 1
 
         if linkedin_url:
             updates.append({
@@ -459,6 +470,9 @@ def main() -> int:
                     "hs_linkedin_url": linkedin_url,
                 },
             })
+        else:
+            print(f"  [{i+1}/{len(to_enrich)}] MISS:   {first} {last} @ {company} ({title})")
+            misses.append({"id": contact["id"], "name": f"{first} {last}", "company": company, "title": title, "reason": "not_found"})
 
         time.sleep(args.sleep)
 
