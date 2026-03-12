@@ -21,7 +21,6 @@
 //     [--skip-lifecycle] \
 //     [--skip-icp] \
 //     [--skip-enrichment] \
-//     [--skip-contact-type] \
 //     [--max-enrich 50] \
 //     [--log-file ./pipeline.csv]
 //
@@ -86,7 +85,6 @@ function parseCliArgs() {
     skipEnrichment: false,
     skipApollo: false,
     skipPdl: false,
-    skipContactType: false,
     maxEnrich: null,
   };
 
@@ -118,9 +116,6 @@ function parseCliArgs() {
         break;
       case "--skip-pdl":
         opts.skipPdl = true;
-        break;
-      case "--skip-contact-type":
-        opts.skipContactType = true;
         break;
       case "--max-enrich":
         opts.maxEnrich = parseInt(args[++i], 10);
@@ -955,7 +950,7 @@ async function main() {
     opts.skipLifecycle ? "" : "lifecycle",
     opts.skipIcp ? "" : "icp",
     opts.skipEnrichment ? "" : "enrichment",
-    opts.skipContactType ? "" : "contact_type",
+    "contact_type",
   ]
     .filter(Boolean)
     .join(" → ")}`);
@@ -981,11 +976,8 @@ async function main() {
     enrichResults = await stepLinkedinEnrichment(opts);
   }
 
-  // Step 4: Contact Type Tagging
-  let contactTypeTagged = 0;
-  if (!opts.skipContactType) {
-    contactTypeTagged = await stepContactTypeTagging(opts);
-  }
+  // Step 4: Contact Type Tagging (always runs)
+  const contactTypeTagged = await stepContactTypeTagging(opts);
 
   // Final summary
   console.log("\n========================================");
@@ -1004,9 +996,7 @@ async function main() {
     console.log(`LinkedIn found:           ${enrichResults.found}`);
     console.log(`LinkedIn missed:          ${enrichResults.missed}`);
   }
-  if (!opts.skipContactType) {
-    console.log(`Contact type tagged:      ${contactTypeTagged}`);
-  }
+  console.log(`Contact type tagged:      ${contactTypeTagged}`);
   console.log(`Audit log:                ${opts.logFile}`);
   if (opts.dryRun) {
     console.log("\n** DRY RUN — no changes were made **");
