@@ -8,6 +8,8 @@
 //      "Not in ICP" status; ICP contacts re-qualified by activity.
 //   3. LinkedIn Enrichment — remaining ICP contacts enriched with LinkedIn
 //      URLs via PDL-first → Apollo fallback waterfall.
+//   4. Contact Type Tagging — sets contact_type = "Prospective Customer"
+//      on all owner contacts so BDRs can filter views to prospects only.
 //
 // Usage:
 //   HUBSPOT_ACCESS_TOKEN="..." node scripts/bdr_lead_pipeline.js \
@@ -19,6 +21,7 @@
 //     [--skip-lifecycle] \
 //     [--skip-icp] \
 //     [--skip-enrichment] \
+//     [--skip-contact-type] \
 //     [--max-enrich 50] \
 //     [--log-file ./pipeline.csv]
 //
@@ -83,6 +86,7 @@ function parseCliArgs() {
     skipEnrichment: false,
     skipApollo: false,
     skipPdl: false,
+    skipContactType: false,
     maxEnrich: null,
   };
 
@@ -114,6 +118,9 @@ function parseCliArgs() {
         break;
       case "--skip-pdl":
         opts.skipPdl = true;
+        break;
+      case "--skip-contact-type":
+        opts.skipContactType = true;
         break;
       case "--max-enrich":
         opts.maxEnrich = parseInt(args[++i], 10);
@@ -198,11 +205,11 @@ async function batchUpdateContacts(inputs) {
   }
 }
 
-async function searchAllContacts(filters, properties) {
+async function searchAllContacts(filters, properties, maxResults = 10000) {
   const all = [];
   let afterCursor;
 
-  while (true) {
+  while (all.length < maxResults) {
     const body = {
       filterGroups: [{ filters }],
       properties,
@@ -211,7 +218,14 @@ async function searchAllContacts(filters, properties) {
     };
     if (afterCursor) body.after = afterCursor;
 
-    const data = await hubspotFetch("POST", "/crm/v3/objects/contacts/search", body);
+    let data;
+    try {
+      data = await hubspotFetch("POST", "/crm/v3/objects/contacts/search", body);
+    } catch (e) {
+      // HubSpot 400 at 10k cursor limit — return what we have
+      if (e.message && e.message.includes("400")) break;
+      throw e;
+    }
     all.push(...data.results);
 
     if (!data.paging?.next?.after) break;
@@ -480,35 +494,79 @@ async function stepIcpCleanup(opts) {
     passNumber++;
     console.log(`--- Pass ${passNumber} ---`);
 
-    const contacts = await searchAllContacts(
-      [{ propertyName: "hubspot_owner_id", operator: "EQ", value: opts.ownerId }],
-      SEARCH_PROPERTIES
-    );
-
+    // Paginate through contacts (up to 10k per pass due to HubSpot cap)
+    let afterCursor;
     let moveBuffer = [];
     let requalifyBuffer = [];
     let passNonIcp = 0;
     let passIcp = 0;
+    let passFetched = 0;
 
-    for (const contact of contacts) {
-      const title = contact.properties?.jobtitle;
+    while (true) {
+      const body = {
+        filterGroups: [
+          { filters: [{ propertyName: "hubspot_owner_id", operator: "EQ", value: opts.ownerId }] },
+        ],
+        properties: SEARCH_PROPERTIES,
+        limit: SEARCH_LIMIT,
+        sorts: [{ propertyName: "hs_object_id", direction: "ASCENDING" }],
+      };
+      if (afterCursor) body.after = afterCursor;
 
-      if (isIcp(title)) {
-        passIcp++;
-        const status = (contact.properties?.hs_lead_status || "").toLowerCase();
-        if (status === "not in icp" || status === "disqualified") {
-          requalifyBuffer.push(contact);
-        } else {
-          logCsv(opts.logFile, "icp", contact, "kept", `ICP: ${title}`);
-          totalKept++;
-        }
-      } else {
-        passNonIcp++;
-        moveBuffer.push(contact);
+      let data;
+      try {
+        data = await hubspotFetch("POST", "/crm/v3/objects/contacts/search", body);
+      } catch (e) {
+        if (e.message && e.message.includes("400")) break;
+        throw e;
       }
+
+      passFetched += data.results.length;
+
+      for (const contact of data.results) {
+        const title = contact.properties?.jobtitle;
+
+        if (isIcp(title)) {
+          passIcp++;
+          const status = (contact.properties?.hs_lead_status || "").toLowerCase();
+          if (status === "not in icp" || status === "disqualified") {
+            requalifyBuffer.push(contact);
+          } else {
+            logCsv(opts.logFile, "icp", contact, "kept", `ICP: ${title}`);
+            totalKept++;
+          }
+        } else {
+          passNonIcp++;
+          moveBuffer.push(contact);
+
+          // Flush move buffer in chunks to avoid memory buildup
+          if (moveBuffer.length >= BATCH_SIZE) {
+            const inputs = moveBuffer.map((c) => ({
+              id: c.id,
+              properties: {
+                hubspot_owner_id: opts.targetOwnerId,
+                hs_lead_status: "Not in ICP",
+              },
+            }));
+            if (!opts.dryRun) {
+              try { await batchUpdateContacts(inputs); } catch (err) {
+                console.error(`  Batch FAILED (move): ${err.message}`);
+              }
+            }
+            for (const c of moveBuffer) {
+              logCsv(opts.logFile, "icp", c, "moved", `non-ICP: ${c.properties?.jobtitle || "(blank)"}`);
+            }
+            console.log(`  Moved batch of ${moveBuffer.length} non-ICP contacts`);
+            moveBuffer = [];
+          }
+        }
+      }
+
+      if (!data.paging?.next?.after) break;
+      afterCursor = data.paging.next.after;
     }
 
-    // Move non-ICP contacts
+    // Flush remaining move buffer
     if (moveBuffer.length > 0) {
       const inputs = moveBuffer.map((c) => ({
         id: c.id,
@@ -517,11 +575,11 @@ async function stepIcpCleanup(opts) {
           hs_lead_status: "Not in ICP",
         },
       }));
-
       if (!opts.dryRun) {
-        await batchUpdateContacts(inputs);
+        try { await batchUpdateContacts(inputs); } catch (err) {
+          console.error(`  Batch FAILED (move): ${err.message}`);
+        }
       }
-
       for (const c of moveBuffer) {
         logCsv(opts.logFile, "icp", c, "moved", `non-ICP: ${c.properties?.jobtitle || "(blank)"}`);
       }
@@ -562,8 +620,9 @@ async function stepIcpCleanup(opts) {
 
     totalMoved += passNonIcp;
 
-    console.log(`  Pass ${passNumber}: fetched=${contacts.length}, ICP=${passIcp}, non-ICP=${passNonIcp}`);
+    console.log(`  Pass ${passNumber}: fetched=${passFetched}, ICP=${passIcp}, non-ICP=${passNonIcp}`);
 
+    // If no non-ICP contacts were found this pass, we're done
     if (passNonIcp === 0) {
       console.log("  No more non-ICP contacts found. Done.");
       break;
@@ -834,6 +893,48 @@ async function stepLinkedinEnrichment(opts) {
 }
 
 // ---------------------------------------------------------------------------
+// Step 4: Contact Type Tagging
+// ---------------------------------------------------------------------------
+
+async function stepContactTypeTagging(opts) {
+  console.log("\n========================================");
+  console.log("STEP 4: Contact Type Tagging");
+  console.log("========================================\n");
+
+  // Find contacts for this owner that don't already have contact_type set
+  console.log("Finding contacts without contact_type...");
+  const contacts = await searchAllContacts(
+    [
+      { propertyName: "hubspot_owner_id", operator: "EQ", value: opts.ownerId },
+      { propertyName: "contact_type", operator: "NOT_HAS_PROPERTY" },
+    ],
+    ["firstname", "lastname", "jobtitle", "contact_type"]
+  );
+  console.log(`  Found ${contacts.length} contacts without contact_type`);
+
+  if (contacts.length === 0) {
+    console.log("  All contacts already tagged. Skipping.");
+    return 0;
+  }
+
+  const inputs = contacts.map((c) => ({
+    id: c.id,
+    properties: { contact_type: "Prospective Customer" },
+  }));
+
+  if (!opts.dryRun) {
+    await batchUpdateContacts(inputs);
+  }
+
+  for (const c of contacts) {
+    logCsv(opts.logFile, "contact_type", c, "tagged_prospect", "contact_type → Prospect");
+  }
+
+  console.log(`  Tagged ${contacts.length} contacts as Prospect`);
+  return contacts.length;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -854,6 +955,7 @@ async function main() {
     opts.skipLifecycle ? "" : "lifecycle",
     opts.skipIcp ? "" : "icp",
     opts.skipEnrichment ? "" : "enrichment",
+    opts.skipContactType ? "" : "contact_type",
   ]
     .filter(Boolean)
     .join(" → ")}`);
@@ -879,6 +981,12 @@ async function main() {
     enrichResults = await stepLinkedinEnrichment(opts);
   }
 
+  // Step 4: Contact Type Tagging
+  let contactTypeTagged = 0;
+  if (!opts.skipContactType) {
+    contactTypeTagged = await stepContactTypeTagging(opts);
+  }
+
   // Final summary
   console.log("\n========================================");
   console.log("FINAL SUMMARY");
@@ -895,6 +1003,9 @@ async function main() {
   if (!opts.skipEnrichment) {
     console.log(`LinkedIn found:           ${enrichResults.found}`);
     console.log(`LinkedIn missed:          ${enrichResults.missed}`);
+  }
+  if (!opts.skipContactType) {
+    console.log(`Contact type tagged:      ${contactTypeTagged}`);
   }
   console.log(`Audit log:                ${opts.logFile}`);
   if (opts.dryRun) {
