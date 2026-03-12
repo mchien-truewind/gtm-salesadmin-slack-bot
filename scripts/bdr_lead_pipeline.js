@@ -788,61 +788,66 @@ async function stepLinkedinEnrichment(opts) {
     console.log(`  Limiting to ${opts.maxEnrich} contacts`);
   }
 
-  // Enrich
+  // Enrich — in dry-run mode, skip API calls to avoid burning credits
   const updates = [];
   const misses = [];
   let pdlFound = 0;
   let apolloFound = 0;
 
-  for (let i = 0; i < toEnrich.length; i++) {
-    const c = toEnrich[i];
-    const p = c.properties || {};
-    const first = p.firstname || "";
-    const last = p.lastname || "";
-    const company = p.company || "";
-    const domain = p.domain || "";
-    const email = p.email || "";
-    const title = p.jobtitle || "";
+  if (opts.dryRun) {
+    console.log(`\n  [DRY RUN] Skipping PDL/Apollo API calls to save credits`);
+    console.log(`  ${toEnrich.length} contacts would be sent for enrichment`);
+  } else {
+    for (let i = 0; i < toEnrich.length; i++) {
+      const c = toEnrich[i];
+      const p = c.properties || {};
+      const first = p.firstname || "";
+      const last = p.lastname || "";
+      const company = p.company || "";
+      const domain = p.domain || "";
+      const email = p.email || "";
+      const title = p.jobtitle || "";
 
-    if (!first && !last) continue;
-    if (!company && !domain && !email) {
-      misses.push({ id: c.id, name: `${first} ${last}`, company, title, reason: "no_company" });
-      continue;
-    }
-
-    let linkedinUrl = null;
-
-    // PDL first
-    if (!opts.skipPdl && PDL_KEY) {
-      linkedinUrl = await pdlMatchLinkedin(first, last, company, domain, email);
-      if (linkedinUrl) {
-        pdlFound++;
-        console.log(`  [${i + 1}/${toEnrich.length}] PDL:    ${first} ${last} @ ${company} → ${linkedinUrl}`);
+      if (!first && !last) continue;
+      if (!company && !domain && !email) {
+        misses.push({ id: c.id, name: `${first} ${last}`, company, title, reason: "no_company" });
+        continue;
       }
-    }
 
-    // Apollo fallback
-    if (!linkedinUrl && !opts.skipApollo && APOLLO_KEY) {
-      linkedinUrl = await apolloMatchLinkedin(first, last, company, domain, email);
-      if (linkedinUrl) {
-        apolloFound++;
-        console.log(`  [${i + 1}/${toEnrich.length}] Apollo: ${first} ${last} @ ${company} → ${linkedinUrl}`);
+      let linkedinUrl = null;
+
+      // PDL first
+      if (!opts.skipPdl && PDL_KEY) {
+        linkedinUrl = await pdlMatchLinkedin(first, last, company, domain, email);
+        if (linkedinUrl) {
+          pdlFound++;
+          console.log(`  [${i + 1}/${toEnrich.length}] PDL:    ${first} ${last} @ ${company} → ${linkedinUrl}`);
+        }
       }
-    }
 
-    if (linkedinUrl) {
-      updates.push({
-        id: c.id,
-        properties: { linkedin___profile: linkedinUrl, hs_linkedin_url: linkedinUrl },
-      });
-      logCsv(opts.logFile, "enrichment", c, "linkedin_found", linkedinUrl);
-    } else {
-      console.log(`  [${i + 1}/${toEnrich.length}] MISS:   ${first} ${last} @ ${company} (${title})`);
-      misses.push({ id: c.id, name: `${first} ${last}`, company, title, reason: "not_found" });
-      logCsv(opts.logFile, "enrichment", c, "linkedin_miss", "not found");
-    }
+      // Apollo fallback
+      if (!linkedinUrl && !opts.skipApollo && APOLLO_KEY) {
+        linkedinUrl = await apolloMatchLinkedin(first, last, company, domain, email);
+        if (linkedinUrl) {
+          apolloFound++;
+          console.log(`  [${i + 1}/${toEnrich.length}] Apollo: ${first} ${last} @ ${company} → ${linkedinUrl}`);
+        }
+      }
 
-    await sleep(200);
+      if (linkedinUrl) {
+        updates.push({
+          id: c.id,
+          properties: { linkedin___profile: linkedinUrl, hs_linkedin_url: linkedinUrl },
+        });
+        logCsv(opts.logFile, "enrichment", c, "linkedin_found", linkedinUrl);
+      } else {
+        console.log(`  [${i + 1}/${toEnrich.length}] MISS:   ${first} ${last} @ ${company} (${title})`);
+        misses.push({ id: c.id, name: `${first} ${last}`, company, title, reason: "not_found" });
+        logCsv(opts.logFile, "enrichment", c, "linkedin_miss", "not found");
+      }
+
+      await sleep(200);
+    }
   }
 
   // Write updates to HubSpot
@@ -851,49 +856,51 @@ async function stepLinkedinEnrichment(opts) {
     await batchUpdateContacts(updates);
   }
 
-  // Save misses to JSON
-  const outputDir = path.dirname(outputPath);
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  // Save misses to JSON (skip in dry-run — found URLs aren't written either)
+  if (!opts.dryRun) {
+    const outputDir = path.dirname(outputPath);
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
-  const allMisses = [];
-  const seenMissIds = new Set();
-  // Keep previous misses
-  try {
-    if (fs.existsSync(outputPath)) {
-      const prev = JSON.parse(fs.readFileSync(outputPath, "utf-8"));
-      for (const m of prev.misses || []) {
-        if (m.id && !seenMissIds.has(String(m.id))) {
-          allMisses.push(m);
-          seenMissIds.add(String(m.id));
+    const allMisses = [];
+    const seenMissIds = new Set();
+    // Keep previous misses
+    try {
+      if (fs.existsSync(outputPath)) {
+        const prev = JSON.parse(fs.readFileSync(outputPath, "utf-8"));
+        for (const m of prev.misses || []) {
+          if (m.id && !seenMissIds.has(String(m.id))) {
+            allMisses.push(m);
+            seenMissIds.add(String(m.id));
+          }
         }
       }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
-  }
-  for (const m of misses) {
-    if (m.id && !seenMissIds.has(String(m.id))) {
-      allMisses.push(m);
-      seenMissIds.add(String(m.id));
+    for (const m of misses) {
+      if (m.id && !seenMissIds.has(String(m.id))) {
+        allMisses.push(m);
+        seenMissIds.add(String(m.id));
+      }
     }
-  }
 
-  fs.writeFileSync(
-    outputPath,
-    JSON.stringify(
-      {
-        timestamp: new Date().toISOString(),
-        owner_id: opts.ownerId,
-        stats: { pdl_found: pdlFound, apollo_found: apolloFound, misses: allMisses.length },
-        misses: allMisses,
-      },
-      null,
-      2
-    )
-  );
+    fs.writeFileSync(
+      outputPath,
+      JSON.stringify(
+        {
+          timestamp: new Date().toISOString(),
+          owner_id: opts.ownerId,
+          stats: { pdl_found: pdlFound, apollo_found: apolloFound, misses: allMisses.length },
+          misses: allMisses,
+        },
+        null,
+        2
+      )
+    );
+    console.log(`  Results saved to: ${outputPath}`);
+  }
 
   console.log(`\n  Enrichment Summary: PDL=${pdlFound}, Apollo=${apolloFound}, misses=${misses.length}`);
-  console.log(`  Results saved to: ${outputPath}`);
 
   return { found: pdlFound + apolloFound, missed: misses.length };
 }
