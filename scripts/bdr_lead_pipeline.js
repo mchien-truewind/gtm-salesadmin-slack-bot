@@ -484,6 +484,7 @@ async function stepIcpCleanup(opts) {
   let totalRequalifiedNew = 0;
   let totalKept = 0;
   let passNumber = 0;
+  const seenIds = new Set(); // persist across passes to avoid double-counting
 
   while (true) {
     passNumber++;
@@ -519,6 +520,9 @@ async function stepIcpCleanup(opts) {
       passFetched += data.results.length;
 
       for (const contact of data.results) {
+        if (seenIds.has(contact.id)) continue;
+        seenIds.add(contact.id);
+
         const title = contact.properties?.jobtitle;
 
         if (isIcp(title)) {
@@ -620,6 +624,13 @@ async function stepIcpCleanup(opts) {
     // If no non-ICP contacts were found this pass, we're done
     if (passNonIcp === 0) {
       console.log("  No more non-ICP contacts found. Done.");
+      break;
+    }
+
+    // In dry-run mode, contacts aren't actually moved so subsequent passes
+    // would find the same results. Run one pass only.
+    if (opts.dryRun) {
+      console.log("  Dry run — stopping after one pass.");
       break;
     }
   }
