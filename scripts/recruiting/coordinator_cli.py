@@ -1781,6 +1781,26 @@ def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     return False
 
 
+def remove_labels_from_thread(gmail_service, *, thread_id: str, label_ids: list[str]) -> bool:
+    remove_ids = sorted({label_id for label_id in label_ids if label_id})
+    if not remove_ids:
+        return False
+    try:
+        (
+            gmail_service.users()
+            .threads()
+            .modify(
+                userId="me",
+                id=thread_id,
+                body={"removeLabelIds": remove_ids},
+            )
+            .execute()
+        )
+    except Exception:
+        return False
+    return True
+
+
 def find_next_available_slot(config: Config, calendar_service, start_anchor: datetime) -> datetime | None:
     tz = ZoneInfo(config.timezone_name)
     search_start = max(start_anchor, now_local(config.timezone_name) + timedelta(hours=config.min_notice_hours))
@@ -2562,10 +2582,18 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     reject_scheduled = 0
     reject_drafts = 0
     reject_marked_sent = 0
+    reject_threads_archived = 0
+    reject_archive_failures = 0
     in_process_marked = 0
     no_response_drafts = 0
     scheduling_drafts = 0
     status_lookback_anchor = now_local(config.timezone_name) - timedelta(days=config.sent_status_lookback_days)
+    hiring_label_id = ""
+    if config.gmail_label_name:
+        try:
+            hiring_label_id = gmail_label_id(gmail_service, config.gmail_label_name)
+        except Exception:
+            hiring_label_id = ""
     pipeline_label_id = ""
     if config.pipeline_label_name:
         try:
@@ -2754,6 +2782,17 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         update_payload[prop.status] = build_notion_value(
                             properties_schema[prop.status], "Rejected"
                         )
+                    archive_labels = [hiring_label_id]
+                    if pipeline_label_id:
+                        archive_labels.append(pipeline_label_id)
+                    if remove_labels_from_thread(
+                        gmail_service,
+                        thread_id=thread_id,
+                        label_ids=archive_labels,
+                    ):
+                        reject_threads_archived += 1
+                    else:
+                        reject_archive_failures += 1
 
         if update_payload:
             notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -2762,6 +2801,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
     print(f"Reject records marked sent: {reject_marked_sent}")
+    print(f"Rejected threads archived from ATS labels: {reject_threads_archived}")
+    print(f"Rejected thread archive failures: {reject_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
     print(f"No response drafts created: {no_response_drafts}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
