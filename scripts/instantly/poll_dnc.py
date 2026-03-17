@@ -61,7 +61,7 @@ def api_request(
     url: str,
     headers: dict[str, str],
     body: dict | None = None,
-    retries: int = 3,
+    retries: int = 5,
 ) -> dict[str, Any] | list:
     data = json.dumps(body).encode("utf-8") if body else None
 
@@ -72,9 +72,10 @@ def api_request(
                 return json.loads(resp.read().decode("utf-8"))
         except error.HTTPError as exc:
             if exc.code == 429 and attempt < retries:
-                retry_after = int(exc.headers.get("Retry-After", 5))
-                print(f"  Rate limited, waiting {retry_after}s...")
-                time.sleep(retry_after)
+                retry_after = int(exc.headers.get("Retry-After", 0) or 0)
+                wait = max(retry_after, 10)
+                print(f"  Rate limited, waiting {wait}s (attempt {attempt + 1})...")
+                time.sleep(wait)
                 continue
             if exc.code in (500, 502, 503, 504) and attempt < retries:
                 time.sleep(2 ** attempt)
@@ -129,7 +130,7 @@ def fetch_recent_replies(api_key: str, since: datetime) -> list[dict[str, Any]]:
         cursor = resp.get("next_starting_after") if isinstance(resp, dict) else None
         if not cursor or not items:
             break
-        time.sleep(0.5)  # respect rate limits (20 req/min)
+        time.sleep(3.5)  # respect rate limits (20 req/min)
 
     return all_emails
 
