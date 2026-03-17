@@ -295,23 +295,34 @@ def resolve_channel_id(token: str, name: str) -> str | None:
     return None
 
 
-def post_slack_notification(
+def post_slack_summary(
     token: str,
+    reply_stats: dict[str, int],
+    unsub_stats: dict[str, int],
     updated_contacts: list[dict[str, str]],
 ) -> None:
-    """Post a summary of DNC updates to Slack."""
+    """Post run summary to Slack after every run."""
     channel_id = resolve_channel_id(token, SLACK_CHANNEL)
     if not channel_id:
         print(f"  Slack channel #{SLACK_CHANNEL} not found, skipping notification")
         return
 
-    lines = [f"*Instantly DNC Sync* — marked {len(updated_contacts)} contact(s) as Do Not Contact:\n"]
-    for c in updated_contacts:
-        lines.append(f"• {c['email']} — {c['reason']}")
+    lines = ["*DNC Action Ran: results*\n"]
+    lines.append(f"• Replied leads checked: {reply_stats.get('checked', 0)}")
+    lines.append(f"• Opt-out replies found: {reply_stats.get('opt_out', 0)}")
+    lines.append(f"• Unsubscribed leads: {unsub_stats.get('total', 0)}")
+    lines.append(f"• Newly marked DNC: {len(updated_contacts)}")
+    lines.append(f"• Already DNC: {reply_stats.get('already_dnc', 0) + unsub_stats.get('already_dnc', 0)}")
+    lines.append(f"• Not in HubSpot: {reply_stats.get('not_found', 0) + unsub_stats.get('not_found', 0)}")
+
+    if updated_contacts:
+        lines.append("\n*Contacts updated:*")
+        for c in updated_contacts:
+            lines.append(f"• {c['email']} — {c['reason']}")
 
     text = "\n".join(lines)
     slack_api("chat.postMessage", token, {"channel": channel_id, "text": text})
-    print(f"  Posted Slack notification to #{SLACK_CHANNEL}")
+    print(f"  Posted Slack summary to #{SLACK_CHANNEL}")
 
 
 # ---------------------------------------------------------------------------
@@ -477,10 +488,10 @@ def main() -> int:
     if not args.skip_unsubscribes:
         unsub_stats = process_unsubscribes(instantly_key, hubspot_token, updated_contacts, dry_run=args.dry_run)
 
-    # 3. Post Slack notification if any contacts were actually updated
-    if updated_contacts and slack_token and not args.dry_run:
-        post_slack_notification(slack_token, updated_contacts)
-    elif updated_contacts and not slack_token:
+    # 3. Post Slack summary after every run
+    if slack_token and not args.dry_run:
+        post_slack_summary(slack_token, reply_stats, unsub_stats, updated_contacts)
+    elif not slack_token:
         print("  No Slack token, skipping notification")
 
     # Summary

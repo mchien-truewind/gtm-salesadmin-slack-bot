@@ -2,7 +2,7 @@ name: Instantly DNC Sync
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 14 * * *"  # 6-7 AM PT daily
   workflow_dispatch:
     inputs:
       dry_run:
