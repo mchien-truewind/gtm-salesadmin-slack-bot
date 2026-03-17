@@ -1,0 +1,53 @@
+name: Instantly DNC Sync
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: "How far back to check (minutes)"
+        required: false
+        default: "30"
+        type: string
+      dry_run:
+        description: "Log only, don't update HubSpot"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  poll-dnc:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: instantly-dnc
+      cancel-in-progress: false
+    env:
+      INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
+      HUBSPOT_PRIVATE_TOKEN: ${{ secrets.HUBSPOT_PRIVATE_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Poll Instantly and sync DNC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=()
+          LOOKBACK="${{ github.event.inputs.lookback_minutes || '30' }}"
+          args+=(--lookback-minutes "$LOOKBACK")
+
+          if [[ "${{ github.event.inputs.dry_run || 'false' }}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          python3 scripts/instantly/poll_dnc.py "${args[@]}"
