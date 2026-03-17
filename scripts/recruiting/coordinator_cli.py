@@ -1400,6 +1400,10 @@ ROLE_CANONICAL = {
     "growth generalist": "Growth Generalist",
 }
 
+ROLE_NOISE_TOKENS = re.compile(
+    r"(?i)\b(application|applying|candidate|role|position|positions|job|submission)\b"
+)
+
 
 def classify_location(resume_text: str, snippet: str) -> str:
     source = resume_text if resume_text.strip() else snippet
@@ -1411,34 +1415,60 @@ def classify_location(resume_text: str, snippet: str) -> str:
     return "non-U.S."
 
 
-def parse_required_subject(subject: str) -> tuple[str, str] | None:
-    # Required format: ROLE - CANDIDATE NAME
+def canonicalize_truewind_role(raw_value: str) -> str:
+    cleaned = clean_text(raw_value)
+    lowered = cleaned.lower()
+    if not cleaned:
+        return "Unknown"
+
+    if lowered in ROLE_CANONICAL:
+        return ROLE_CANONICAL[lowered]
+    if "generalist" in lowered:
+        return "Growth Generalist"
+    if "bdr" in lowered or "business development representative" in lowered:
+        return "BDR"
+
+    stripped = ROLE_NOISE_TOKENS.sub(" ", cleaned)
+    stripped = clean_text(stripped).strip("-:|,;")
+    return stripped or "Unknown"
+
+
+def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> tuple[str, str] | None:
+    # Required prefix: [hiring@]. Candidate name may come from subject or sender fallback.
     normalized = clean_text(subject)
-    normalized = re.sub(r"^(?:fwd?:)\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^(?:fwd?:|re:)\s*", "", normalized, flags=re.IGNORECASE)
     normalized = normalized.replace("–", "-").replace("—", "-")
     prefix_match = re.match(r"^\[(?P<prefix>[^\]]+)\]\s*(?P<body>.+)$", normalized)
     if not prefix_match:
         return None
     if prefix_match.group("prefix").strip().lower() != "hiring@":
         return None
-    normalized = prefix_match.group("body")
+    body = clean_text(prefix_match.group("body"))
+    fallback_name = clean_text(fallback_candidate_name)
 
-    match = re.match(r"^\s*(?P<role>.+?)\s*-\s*(?P<candidate>.+?)\s*$", normalized)
-    if not match:
+    match = re.match(r"^\s*(?P<left>.+?)\s*-\s*(?P<right>.+?)\s*$", body)
+    if match:
+        left = clean_text(match.group("left"))
+        right = clean_text(match.group("right"))
+        role = canonicalize_truewind_role(left)
+        candidate_name = right
+
+        # Subjects like "Application - BDR Growth" contain role on the right side.
+        if role == "Unknown" and fallback_name:
+            alt_role = canonicalize_truewind_role(right)
+            if alt_role != "Unknown":
+                role = alt_role
+                candidate_name = fallback_name
+
+        if not candidate_name:
+            candidate_name = fallback_name
+        if role != "Unknown" and candidate_name:
+            return role, candidate_name
+
+    role = canonicalize_truewind_role(body)
+    if role == "Unknown" or not fallback_name:
         return None
-    role_raw = clean_text(match.group("role")).lower()
-    candidate_name = clean_text(match.group("candidate"))
-
-    role = ROLE_CANONICAL.get(role_raw)
-    if not role:
-        if "generalist" in role_raw:
-            role = "Growth Generalist"
-        elif "bdr" in role_raw or "business development representative" in role_raw:
-            role = "BDR"
-
-    if not role or not candidate_name:
-        return None
-    return role, candidate_name
+    return role, fallback_name
 
 
 def upload_resume_to_drive(drive_service, filename: str, raw: bytes, folder_id: str) -> str:
@@ -2370,7 +2400,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         message = gmail_service.users().messages().get(userId="me", id=message_id, format="full").execute()
         candidate_name, candidate_email, subject = parse_candidate_from_message(message)
-        parsed_subject = parse_required_subject(subject)
+        parsed_subject = parse_required_subject(subject, candidate_name)
         if not parsed_subject:
             skipped += 1
             subject_format_skipped += 1
