@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
+import urllib.parse
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Env loader
@@ -97,6 +99,7 @@ def instantly_headers(api_key: str) -> dict[str, str]:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0",
     }
 
 
@@ -237,6 +240,63 @@ def is_opt_out(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Slack helpers
+# ---------------------------------------------------------------------------
+
+SLACK_CHANNEL = "slack-testing"
+
+
+def slack_api(method: str, token: str, params: dict[str, str]) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {token}"}
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(f"https://slack.com/api/{method}", data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(f"Slack API {method} failed: {payload.get('error', 'unknown')}")
+    return payload
+
+
+def resolve_channel_id(token: str, name: str) -> str | None:
+    cursor = ""
+    while True:
+        params: dict[str, str] = {
+            "exclude_archived": "true",
+            "types": "public_channel",
+            "limit": "1000",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        payload = slack_api("conversations.list", token, params)
+        for ch in payload.get("channels", []):
+            if ch.get("name") == name:
+                return ch["id"]
+        cursor = payload.get("response_metadata", {}).get("next_cursor", "")
+        if not cursor:
+            break
+    return None
+
+
+def post_slack_notification(
+    token: str,
+    updated_contacts: list[dict[str, str]],
+) -> None:
+    """Post a summary of DNC updates to Slack."""
+    channel_id = resolve_channel_id(token, SLACK_CHANNEL)
+    if not channel_id:
+        print(f"  Slack channel #{SLACK_CHANNEL} not found, skipping notification")
+        return
+
+    lines = [f"*Instantly DNC Sync* — marked {len(updated_contacts)} contact(s) as Do Not Contact:\n"]
+    for c in updated_contacts:
+        lines.append(f"• {c['email']} — {c['reason']}")
+
+    text = "\n".join(lines)
+    slack_api("chat.postMessage", token, {"channel": channel_id, "text": text})
+    print(f"  Posted Slack notification to #{SLACK_CHANNEL}")
+
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
@@ -244,6 +304,7 @@ def mark_dnc(
     hubspot_token: str,
     email: str,
     reason: str,
+    updated_contacts: list[dict[str, str]],
     dry_run: bool = False,
 ) -> str:
     """Look up contact in HubSpot and set do_not_contact=true. Returns status."""
@@ -266,6 +327,7 @@ def mark_dnc(
 
     set_do_not_contact(hubspot_token, contact_id)
     print(f"  Marked DNC: {email} ({name}, id={contact_id}) — {reason}")
+    updated_contacts.append({"email": email, "name": name, "reason": reason})
     return "updated"
 
 
@@ -273,6 +335,7 @@ def process_replies(
     instantly_key: str,
     hubspot_token: str,
     since: datetime,
+    updated_contacts: list[dict[str, str]],
     dry_run: bool = False,
 ) -> dict[str, int]:
     """Check recent replies for opt-out phrases."""
@@ -294,7 +357,7 @@ def process_replies(
             continue
 
         stats["opt_out"] += 1
-        status = mark_dnc(hubspot_token, from_email, "opt-out reply", dry_run=dry_run)
+        status = mark_dnc(hubspot_token, from_email, "opt-out reply", updated_contacts, dry_run=dry_run)
         if status == "updated" or status == "dry_run":
             stats["updated"] += 1
         elif status == "already_dnc":
@@ -308,6 +371,7 @@ def process_replies(
 def process_unsubscribes(
     instantly_key: str,
     hubspot_token: str,
+    updated_contacts: list[dict[str, str]],
     dry_run: bool = False,
 ) -> dict[str, int]:
     """Check all unsubscribed leads."""
@@ -323,7 +387,7 @@ def process_unsubscribes(
         if not email:
             continue
 
-        status = mark_dnc(hubspot_token, email, "unsubscribed", dry_run=dry_run)
+        status = mark_dnc(hubspot_token, email, "unsubscribed", updated_contacts, dry_run=dry_run)
         if status == "updated" or status == "dry_run":
             stats["updated"] += 1
         elif status == "already_dnc":
@@ -361,6 +425,11 @@ def parse_args() -> argparse.Namespace:
         default="HUBSPOT_PRIVATE_TOKEN",
         help="Env var for HubSpot token",
     )
+    parser.add_argument(
+        "--slack-key-env",
+        default="SLACK_USER_TOKEN",
+        help="Env var for Slack token",
+    )
     return parser.parse_args()
 
 
@@ -370,6 +439,7 @@ def main() -> int:
 
     instantly_key = os.environ.get(args.instantly_key_env, "").strip()
     hubspot_token = os.environ.get(args.hubspot_key_env, "").strip()
+    slack_token = os.environ.get(args.slack_key_env, "").strip()
 
     if not instantly_key:
         raise SystemExit(f"Missing Instantly API key: {args.instantly_key_env}")
@@ -380,16 +450,23 @@ def main() -> int:
     print(f"Instantly → HubSpot DNC poll{mode}")
 
     since = datetime.now(timezone.utc) - timedelta(minutes=args.lookback_minutes)
+    updated_contacts: list[dict[str, str]] = []
 
     # 1. Check recent replies for opt-out phrases
     reply_stats = {"checked": 0, "opt_out": 0, "updated": 0}
     if not args.skip_replies:
-        reply_stats = process_replies(instantly_key, hubspot_token, since, dry_run=args.dry_run)
+        reply_stats = process_replies(instantly_key, hubspot_token, since, updated_contacts, dry_run=args.dry_run)
 
     # 2. Check unsubscribed leads
     unsub_stats = {"total": 0, "updated": 0}
     if not args.skip_unsubscribes:
-        unsub_stats = process_unsubscribes(instantly_key, hubspot_token, dry_run=args.dry_run)
+        unsub_stats = process_unsubscribes(instantly_key, hubspot_token, updated_contacts, dry_run=args.dry_run)
+
+    # 3. Post Slack notification if any contacts were actually updated
+    if updated_contacts and slack_token and not args.dry_run:
+        post_slack_notification(slack_token, updated_contacts)
+    elif updated_contacts and not slack_token:
+        print("  No Slack token, skipping notification")
 
     # Summary
     print(f"\n{'='*50}")

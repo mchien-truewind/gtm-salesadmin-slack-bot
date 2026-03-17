@@ -28,6 +28,7 @@ jobs:
     env:
       INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
       HUBSPOT_PRIVATE_TOKEN: ${{ secrets.HUBSPOT_PRIVATE_TOKEN }}
+      SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
