@@ -20,7 +20,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -104,35 +104,52 @@ def instantly_headers(api_key: str) -> dict[str, str]:
     }
 
 
-def fetch_recent_replies(api_key: str, since: datetime) -> list[dict[str, Any]]:
-    """Fetch all received emails since the given timestamp."""
+def fetch_replied_leads(api_key: str) -> list[dict[str, Any]]:
+    """Fetch all leads that have replied across campaigns."""
     headers = instantly_headers(api_key)
-    since_iso = since.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    all_emails: list[dict[str, Any]] = []
+    all_leads: list[dict[str, Any]] = []
     cursor: str | None = None
 
     while True:
-        params: dict[str, str] = {
-            "email_type": "received",
-            "min_timestamp_created": since_iso,
-            "limit": "100",
-            "sort_order": "desc",
+        body: dict[str, Any] = {
+            "filter": "FILTER_VAL_REPLIED",
+            "limit": 100,
         }
         if cursor:
-            params["starting_after"] = cursor
+            body["starting_after"] = cursor
 
-        url = f"{INSTANTLY_BASE}/emails?{parse.urlencode(params)}"
-        resp = api_request("GET", url, headers)
+        url = f"{INSTANTLY_BASE}/leads/list"
+        resp = api_request("POST", url, headers, body=body)
 
         items = resp.get("items", []) if isinstance(resp, dict) else []
-        all_emails.extend(items)
+        all_leads.extend(items)
 
         cursor = resp.get("next_starting_after") if isinstance(resp, dict) else None
         if not cursor or not items:
             break
-        time.sleep(3.5)  # respect rate limits (20 req/min)
+        time.sleep(0.3)
 
-    return all_emails
+    return all_leads
+
+
+def fetch_lead_reply_text(api_key: str, campaign_id: str, lead_email: str) -> str:
+    """Fetch the reply text for a specific lead in a campaign."""
+    headers = instantly_headers(api_key)
+    params: dict[str, str] = {
+        "email_type": "received",
+        "campaign_id": campaign_id,
+        "limit": "10",
+    }
+    url = f"{INSTANTLY_BASE}/emails?{parse.urlencode(params)}"
+    resp = api_request("GET", url, headers)
+
+    for item in resp.get("items", []) if isinstance(resp, dict) else []:
+        from_email = (item.get("from_address_email") or "").strip().lower()
+        if from_email == lead_email.lower():
+            body = item.get("body", {})
+            return body.get("text", "") if isinstance(body, dict) else ""
+
+    return ""
 
 
 def fetch_unsubscribed_leads(api_key: str) -> list[dict[str, Any]]:
@@ -335,30 +352,34 @@ def mark_dnc(
 def process_replies(
     instantly_key: str,
     hubspot_token: str,
-    since: datetime,
     updated_contacts: list[dict[str, str]],
     dry_run: bool = False,
 ) -> dict[str, int]:
-    """Check recent replies for opt-out phrases."""
+    """Check all replied leads for opt-out phrases."""
     stats = {"checked": 0, "opt_out": 0, "updated": 0, "already_dnc": 0, "not_found": 0}
 
-    print(f"\nFetching replies since {since.isoformat()}...")
-    replies = fetch_recent_replies(instantly_key, since)
-    print(f"  Found {len(replies)} replies")
+    print("\nFetching replied leads...")
+    leads = fetch_replied_leads(instantly_key)
+    print(f"  Found {len(leads)} replied leads")
 
-    for reply in replies:
+    for lead in leads:
         stats["checked"] += 1
-        from_email = (reply.get("from_address_email") or "").strip().lower()
-        body_text = reply.get("body", {}).get("text", "") if isinstance(reply.get("body"), dict) else ""
+        email = (lead.get("email") or "").strip().lower()
+        campaign = lead.get("campaign", "")
 
-        if not from_email:
+        if not email or not campaign:
             continue
 
-        if not is_opt_out(body_text):
+        # Fetch the actual reply text for this lead
+        reply_text = fetch_lead_reply_text(instantly_key, campaign, email)
+        time.sleep(3.5)  # respect rate limits (20 req/min on emails endpoint)
+
+        if not is_opt_out(reply_text):
             continue
 
         stats["opt_out"] += 1
-        status = mark_dnc(hubspot_token, from_email, "opt-out reply", updated_contacts, dry_run=dry_run)
+        print(f"  Opt-out detected: {email}")
+        status = mark_dnc(hubspot_token, email, "opt-out reply", updated_contacts, dry_run=dry_run)
         if status == "updated" or status == "dry_run":
             stats["updated"] += 1
         elif status == "already_dnc":
@@ -407,12 +428,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Poll Instantly for opt-outs/unsubscribes and set do_not_contact in HubSpot"
     )
-    parser.add_argument(
-        "--lookback-minutes",
-        type=int,
-        default=30,
-        help="How far back to check for replies (default: 30)",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Log actions without updating HubSpot")
     parser.add_argument("--skip-replies", action="store_true", help="Skip checking replies")
     parser.add_argument("--skip-unsubscribes", action="store_true", help="Skip checking unsubscribes")
@@ -450,13 +465,12 @@ def main() -> int:
     mode = " [DRY RUN]" if args.dry_run else ""
     print(f"Instantly → HubSpot DNC poll{mode}")
 
-    since = datetime.now(timezone.utc) - timedelta(minutes=args.lookback_minutes)
     updated_contacts: list[dict[str, str]] = []
 
-    # 1. Check recent replies for opt-out phrases
+    # 1. Check replied leads for opt-out phrases
     reply_stats = {"checked": 0, "opt_out": 0, "updated": 0}
     if not args.skip_replies:
-        reply_stats = process_replies(instantly_key, hubspot_token, since, updated_contacts, dry_run=args.dry_run)
+        reply_stats = process_replies(instantly_key, hubspot_token, updated_contacts, dry_run=args.dry_run)
 
     # 2. Check unsubscribed leads
     unsub_stats = {"total": 0, "updated": 0}
