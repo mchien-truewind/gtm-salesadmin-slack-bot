@@ -35,6 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for partial envs
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -57,6 +58,15 @@ DEFAULT_NO_RESPONSE_TEMPLATE = (
     "We are growing quickly and we'll be glad to see your application again for another role in the future.\n\n"
     "Thanks\n"
     "Mercedes"
+)
+MANUAL_REJECTION_RE = re.compile(
+    r"(?i)("
+    r"won[’']?t\s+be\s+moving\s+forward"
+    r"|will\s+not\s+be\s+moving\s+forward"
+    r"|not\s+be\s+moving\s+forward\s+with\s+your\s+application"
+    r"|strong\s+pool\s+of\s+applicants"
+    r"|keep\s+checking\s+our\s+careers?\s+page"
+    r")"
 )
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
@@ -1797,6 +1807,53 @@ def thread_latest_assignment_sent_at(
     return latest
 
 
+def thread_latest_manual_rejection_sent_at(
+    gmail_service,
+    *,
+    thread_id: str,
+    sender_email: str,
+    candidate_email: str,
+) -> datetime | None:
+    try:
+        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception:
+        return None
+
+    sender_email = normalize_email(sender_email)
+    candidate_email = normalize_email(candidate_email)
+    latest: datetime | None = None
+
+    for message in thread.get("messages", []):
+        headers = header_map(message)
+        from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        label_ids = set(message.get("labelIds", []) or [])
+        sent_labeled = "SENT" in label_ids
+        if from_email != sender_email and not sent_labeled:
+            continue
+
+        recipients: set[str] = set()
+        for header_name in ("to", "cc", "bcc"):
+            for token in headers.get(header_name, "").split(","):
+                parsed = normalize_email(parseaddr(token)[1])
+                if parsed:
+                    recipients.add(parsed)
+        if recipients and candidate_email not in recipients:
+            continue
+
+        subject = clean_text(headers.get("subject", ""))
+        snippet = clean_text(message.get("snippet", ""))
+        body = clean_text(extract_message_body_text(message))
+        haystack = f"{subject}\n{snippet}\n{body}"
+        if not MANUAL_REJECTION_RE.search(haystack):
+            continue
+
+        sent_at = message_internal_datetime(message)
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
+
+    return latest
+
+
 def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     if not label_id:
         return False
@@ -2612,6 +2669,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     reject_scheduled = 0
     reject_drafts = 0
     reject_marked_sent = 0
+    manual_reject_marked = 0
     reject_threads_archived = 0
     reject_archive_failures = 0
     in_process_marked = 0
@@ -2651,6 +2709,47 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     properties_schema[prop.status], "In Process"
                 )
                 current_status = "in process"
+
+        manual_reject_sent_at: datetime | None = None
+        if current_status != "rejected" and not in_pipeline:
+            manual_reject_sent_at = thread_latest_manual_rejection_sent_at(
+                gmail_service,
+                thread_id=thread_id,
+                sender_email=config.from_email,
+                candidate_email=candidate_email,
+            )
+            if manual_reject_sent_at:
+                manual_reject_marked += 1
+                if prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+                    current_status = "rejected"
+                if prop.decision in properties_schema and decision != "reject":
+                    update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
+                    decision = "reject"
+                if prop.decision_time in properties_schema:
+                    existing_decision_time = notion_prop_value(page_props.get(prop.decision_time, {})).strip()
+                    if not existing_decision_time:
+                        update_payload[prop.decision_time] = build_notion_value(
+                            properties_schema[prop.decision_time],
+                            iso(manual_reject_sent_at.astimezone(timezone.utc)),
+                        )
+
+                archive_labels = [hiring_label_id]
+                if pipeline_label_id:
+                    archive_labels.append(pipeline_label_id)
+                if remove_labels_from_thread(
+                    gmail_service,
+                    thread_id=thread_id,
+                    label_ids=archive_labels,
+                ):
+                    reject_threads_archived += 1
+                else:
+                    reject_archive_failures += 1
+
+        if manual_reject_sent_at:
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+            continue
 
         if decision not in {"proceed", "reject"}:
             if current_status == "awaiting decision":
@@ -2831,6 +2930,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
     print(f"Reject records marked sent: {reject_marked_sent}")
+    print(f"Manual rejection sends auto-marked: {manual_reject_marked}")
     print(f"Rejected threads archived from ATS labels: {reject_threads_archived}")
     print(f"Rejected thread archive failures: {reject_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
