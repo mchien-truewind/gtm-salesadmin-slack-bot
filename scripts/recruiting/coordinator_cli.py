@@ -41,6 +41,15 @@ CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 RESUME_EXTENSIONS = (".pdf", ".docx", ".doc", ".txt", ".rtf")
+RESUME_LINK_HOST_HINTS = (
+    "drive.google.com",
+    "docs.google.com",
+    "dropbox.com",
+    "onedrive.live.com",
+    "sharepoint.com",
+)
+RESUME_LINK_FILE_HINTS = (".pdf", ".doc", ".docx", ".rtf", ".txt")
+RESUME_LINK_RE = re.compile(r"https?://[^\s<>\")']+", flags=re.IGNORECASE)
 
 DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. When are you free for a 20-minute intro call?"
 DEFAULT_REJECT_TEMPLATE = (
@@ -364,7 +373,7 @@ def load_config() -> Config:
         notion_token=notion_token,
         notion_database_id=notion_db,
         gmail_label_name=os.getenv("RECRUITING_GMAIL_LABEL", "hiring@").strip(),
-        gmail_query=os.getenv("RECRUITING_GMAIL_QUERY", 'subject:"[hiring@]" has:attachment').strip(),
+        gmail_query=os.getenv("RECRUITING_GMAIL_QUERY", 'subject:"[hiring@]"').strip(),
         gmail_max_messages=parse_env_int("RECRUITING_GMAIL_MAX_MESSAGES", 50),
         hiring_alias=os.getenv("RECRUITING_HIRING_ALIAS", "").strip().lower(),
         from_email=from_email,
@@ -664,6 +673,27 @@ def extract_primary_resume_part(message: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
+def sorted_thread_messages(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    def sort_key(message: dict[str, Any]) -> int:
+        raw = str(message.get("internalDate", "") or "").strip()
+        try:
+            return int(raw)
+        except ValueError:
+            return 0
+
+    return sorted(thread.get("messages", []) or [], key=sort_key)
+
+
+def extract_primary_resume_part_from_thread(thread: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    for message in sorted_thread_messages(thread):
+        part = extract_primary_resume_part(message)
+        if part:
+            message_id = str(message.get("id", "") or "").strip()
+            if message_id:
+                return message_id, part
+    return None
+
+
 def extract_message_body_text(message: dict[str, Any]) -> str:
     payload = message.get("payload", {})
     chunks: list[str] = []
@@ -680,6 +710,25 @@ def extract_message_body_text(message: dict[str, Any]) -> str:
             continue
         chunks.append(decoded)
     return "\n".join(chunks)
+
+
+def extract_resume_link_from_text(text: str) -> str:
+    for match in RESUME_LINK_RE.finditer(text or ""):
+        candidate = clean_text(match.group(0)).rstrip(".,;:)>\"'")
+        lowered = candidate.lower()
+        if any(host in lowered for host in RESUME_LINK_HOST_HINTS):
+            return candidate
+        if lowered.endswith(RESUME_LINK_FILE_HINTS):
+            return candidate
+    return ""
+
+
+def extract_resume_link_from_thread(thread: dict[str, Any]) -> str:
+    for message in sorted_thread_messages(thread):
+        link = extract_resume_link_from_text(extract_message_body_text(message))
+        if link:
+            return link
+    return ""
 
 
 def gmail_message_attachment_bytes(gmail_service, message_id: str, part: dict[str, Any]) -> bytes:
@@ -1413,6 +1462,11 @@ ROLE_CANONICAL = {
 ROLE_NOISE_TOKENS = re.compile(
     r"(?i)\b(application|applying|candidate|role|position|positions|job|submission)\b"
 )
+INVALID_ROLE_FRAGMENTS = (
+    "fwd:",
+    "former yc",
+    "recruitment continues",
+)
 
 
 def classify_location(resume_text: str, snippet: str) -> str:
@@ -1437,9 +1491,16 @@ def canonicalize_truewind_role(raw_value: str) -> str:
         return "Growth Generalist"
     if "bdr" in lowered or "business development representative" in lowered:
         return "BDR"
+    if any(fragment in lowered for fragment in INVALID_ROLE_FRAGMENTS):
+        return "Unknown"
 
     stripped = ROLE_NOISE_TOKENS.sub(" ", cleaned)
     stripped = clean_text(stripped).strip("-:|,;")
+    if not stripped:
+        return "Unknown"
+    stripped_words = stripped.split()
+    if len(stripped_words) > 6:
+        return "Unknown"
     return stripped or "Unknown"
 
 
@@ -1448,13 +1509,15 @@ def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> t
     normalized = clean_text(subject)
     normalized = re.sub(r"^(?:fwd?:|re:)\s*", "", normalized, flags=re.IGNORECASE)
     normalized = normalized.replace("–", "-").replace("—", "-")
-    prefix_match = re.match(r"^\[(?P<prefix>[^\]]+)\]\s*(?P<body>.+)$", normalized)
+    prefix_match = re.match(r"^\[(?P<prefix>[^\]]+)\]\s*(?P<body>.*)$", normalized)
     if not prefix_match:
         return None
     if prefix_match.group("prefix").strip().lower() != "hiring@":
         return None
     body = clean_text(prefix_match.group("body"))
     fallback_name = clean_text(fallback_candidate_name)
+    if not body and fallback_name:
+        return "Unknown", fallback_name
 
     match = re.match(r"^\s*(?P<left>.+?)\s*-\s*(?P<right>.+?)\s*$", body)
     if match:
@@ -1472,11 +1535,11 @@ def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> t
 
         if not candidate_name:
             candidate_name = fallback_name
-        if role != "Unknown" and candidate_name:
+        if candidate_name:
             return role, candidate_name
 
     role = canonicalize_truewind_role(body)
-    if role == "Unknown" or not fallback_name:
+    if not fallback_name:
         return None
     return role, fallback_name
 
@@ -2409,6 +2472,40 @@ def parse_candidate_from_message(message: dict[str, Any]) -> tuple[str, str, str
     return candidate_name, candidate_email, subject
 
 
+def email_domain(value: str) -> str:
+    email = normalize_email(value)
+    if "@" not in email:
+        return ""
+    return email.rsplit("@", 1)[-1].strip()
+
+
+def subject_has_hiring_prefix(subject: str) -> bool:
+    return "[hiring@]" in clean_text(subject).lower()
+
+
+def select_application_message_from_thread(
+    thread: dict[str, Any],
+    *,
+    internal_domains: set[str],
+) -> dict[str, Any] | None:
+    messages = sorted_thread_messages(thread)
+    if not messages:
+        return None
+
+    fallback_external: dict[str, Any] | None = None
+    for message in messages:
+        headers = header_map(message)
+        candidate_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        if email_domain(candidate_email) in internal_domains:
+            continue
+        if fallback_external is None:
+            fallback_external = message
+        if subject_has_hiring_prefix(headers.get("subject", "")):
+            return message
+
+    return fallback_external or messages[0]
+
+
 def ingest_cmd(_args: argparse.Namespace) -> None:
     config = load_config()
     notion = NotionClient(config.notion_token, config.notion_database_id)
@@ -2449,14 +2546,37 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     slack_post_failures = 0
     thread_first_entered_cache: dict[str, str] = {}
     created_candidates: list[dict[str, str]] = []
+    processed_threads: set[str] = set()
+    internal_domains = {email_domain(config.from_email)}
+    if config.hiring_alias:
+        internal_domains.add(email_domain(config.hiring_alias))
+    internal_domains.discard("")
 
     for item in messages:
-        message_id = item.get("id", "")
-        if not message_id:
+        thread_id = item.get("threadId", "")
+        if not thread_id or thread_id in processed_threads:
+            continue
+        processed_threads.add(thread_id)
+
+        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        thread_messages = sorted_thread_messages(thread)
+        if not thread_messages:
+            skipped += 1
             continue
 
-        message = gmail_service.users().messages().get(userId="me", id=message_id, format="full").execute()
-        candidate_name, candidate_email, subject = parse_candidate_from_message(message)
+        application_message = select_application_message_from_thread(
+            thread, internal_domains=internal_domains
+        )
+        if application_message is None:
+            skipped += 1
+            continue
+
+        candidate_name, candidate_email, subject = parse_candidate_from_message(application_message)
+        candidate_domain = email_domain(candidate_email)
+        if candidate_domain in internal_domains:
+            skipped += 1
+            continue
+
         parsed_subject = parse_required_subject(subject, candidate_name)
         if not parsed_subject:
             skipped += 1
@@ -2472,24 +2592,32 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             skipped += 1
             continue
 
-        resume_part = extract_primary_resume_part(message)
-        if not resume_part:
+        resume_reference = extract_primary_resume_part_from_thread(thread)
+        resume_part: dict[str, Any] | None = None
+        attachment_message_id = ""
+        if resume_reference:
+            attachment_message_id, resume_part = resume_reference
+
+        resume_link = extract_resume_link_from_thread(thread)
+        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
+
+        filename = (resume_part.get("filename") or "resume").strip() if resume_part else "resume"
+        raw = b""
+        resume_text = ""
+        if resume_part and attachment_message_id:
+            raw = gmail_message_attachment_bytes(gmail_service, attachment_message_id, resume_part)
+            resume_text = extract_resume_text(filename, raw)
+        elif not resume_link and role == "Unknown":
+            # If there is no resume content and no role signal, this is likely a non-applicant thread.
             skipped += 1
             continue
 
-        filename = (resume_part.get("filename") or "resume").strip()
-        raw = gmail_message_attachment_bytes(gmail_service, message_id, resume_part)
-        resume_text = extract_resume_text(filename, raw)
-        snippet = message.get("snippet", "")
-        message_body_text = extract_message_body_text(message)
+        snippet = application_message.get("snippet", "")
+        message_body_text = thread_body_text
 
         stage = classify_career_stage(resume_text or snippet)
         resume_title, resume_company = infer_current_title_and_company_from_resume(resume_text, snippet)
         location = classify_location(resume_text, snippet)
-        thread_id = message.get("threadId", "")
-        if not thread_id:
-            skipped += 1
-            continue
 
         existing_page = find_existing_candidate_page(
             notion, database_schema, prop_map, thread_id
@@ -2559,12 +2687,17 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""
         current_title = resume_title_value or linkedin_title or existing_current_title or "Unknown"
         company = resume_company_value or linkedin_company or existing_company or "Unknown"
-        resume_url = existing_resume_url or upload_resume_to_drive(
-            drive_service, filename, raw, config.drive_folder_id
-        )
+        resume_url = existing_resume_url
+        if not resume_url:
+            if raw:
+                resume_url = upload_resume_to_drive(drive_service, filename, raw, config.drive_folder_id)
+            elif resume_link:
+                resume_url = resume_link
         computed_first_entered = thread_first_entered_cache.get(thread_id, "")
         if not computed_first_entered:
-            first_dt = thread_first_message_datetime(gmail_service, thread_id) or message_internal_datetime(message)
+            first_dt = thread_first_message_datetime(gmail_service, thread_id) or message_internal_datetime(
+                application_message
+            )
             computed_first_entered = iso(first_dt) if first_dt else ""
             thread_first_entered_cache[thread_id] = computed_first_entered
         date_first_entered = existing_date_first_entered or computed_first_entered
