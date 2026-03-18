@@ -1519,7 +1519,11 @@ NON_US_KEYWORDS = {
 
 ROLE_CANONICAL = {
     "bdr": "BDR",
+    "sdr": "BDR",
+    "founding sdr": "BDR",
     "growth generalist": "Growth Generalist",
+    "growth associate": "Growth Generalist",
+    "gtm associate": "Growth Generalist",
 }
 
 ROLE_NOISE_TOKENS = re.compile(
@@ -1552,7 +1556,11 @@ def canonicalize_truewind_role(raw_value: str) -> str:
         return ROLE_CANONICAL[lowered]
     if "generalist" in lowered:
         return "Growth Generalist"
+    if "growth associate" in lowered or "gtm associate" in lowered:
+        return "Growth Generalist"
     if "bdr" in lowered or "business development representative" in lowered:
+        return "BDR"
+    if "sdr" in lowered:
         return "BDR"
     if any(fragment in lowered for fragment in INVALID_ROLE_FRAGMENTS):
         return "Unknown"
