@@ -1627,6 +1627,31 @@ def list_label_messages(gmail_service, label_id: str, query: str, max_messages: 
     return messages
 
 
+def list_threads_matching_query(gmail_service, query: str, max_threads: int = 50) -> list[dict[str, Any]]:
+    threads: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while len(threads) < max_threads:
+        response = (
+            gmail_service.users()
+            .threads()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=min(100, max_threads - len(threads)),
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        batch = response.get("threads", [])
+        if not batch:
+            break
+        threads.extend(batch)
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return threads
+
+
 def extract_last_thread_message_headers(gmail_service, thread_id: str) -> tuple[str, str, str]:
     thread = (
         gmail_service.users()
@@ -1795,6 +1820,24 @@ def candidate_replied_since(
     return False
 
 
+def candidate_replied_since_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    candidate_email: str,
+    since: datetime,
+) -> bool:
+    for thread_id in thread_ids:
+        if candidate_replied_since(
+            gmail_service,
+            thread_id=thread_id,
+            candidate_email=candidate_email,
+            since=since,
+        ):
+            return True
+    return False
+
+
 def sender_sent_since(
     gmail_service,
     *,
@@ -1839,6 +1882,26 @@ def sender_sent_since(
                 continue
 
         return True
+    return False
+
+
+def sender_sent_since_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    sender_email: str,
+    since: datetime,
+    to_email: str = "",
+) -> bool:
+    for thread_id in thread_ids:
+        if sender_sent_since(
+            gmail_service,
+            thread_id=thread_id,
+            sender_email=sender_email,
+            since=since,
+            to_email=to_email,
+        ):
+            return True
     return False
 
 
@@ -1919,6 +1982,26 @@ def thread_latest_assignment_sent_at(
     return latest
 
 
+def thread_latest_assignment_sent_at_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    sender_email: str,
+    keywords: set[str],
+) -> datetime | None:
+    latest: datetime | None = None
+    for thread_id in thread_ids:
+        sent_at = thread_latest_assignment_sent_at(
+            gmail_service,
+            thread_id=thread_id,
+            sender_email=sender_email,
+            keywords=keywords,
+        )
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
+    return latest
+
+
 def thread_latest_manual_rejection_sent_at(
     gmail_service,
     *,
@@ -1963,6 +2046,26 @@ def thread_latest_manual_rejection_sent_at(
         if sent_at and (latest is None or sent_at > latest):
             latest = sent_at
 
+    return latest
+
+
+def thread_latest_manual_rejection_sent_at_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    sender_email: str,
+    candidate_email: str,
+) -> datetime | None:
+    latest: datetime | None = None
+    for thread_id in thread_ids:
+        sent_at = thread_latest_manual_rejection_sent_at(
+            gmail_service,
+            thread_id=thread_id,
+            sender_email=sender_email,
+            candidate_email=candidate_email,
+        )
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
     return latest
 
 
@@ -2016,6 +2119,28 @@ def thread_latest_sent_matching_patterns(
     return latest
 
 
+def thread_latest_sent_matching_patterns_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    sender_email: str,
+    candidate_email: str,
+    patterns: list[re.Pattern[str]],
+) -> datetime | None:
+    latest: datetime | None = None
+    for thread_id in thread_ids:
+        sent_at = thread_latest_sent_matching_patterns(
+            gmail_service,
+            thread_id=thread_id,
+            sender_email=sender_email,
+            candidate_email=candidate_email,
+            patterns=patterns,
+        )
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
+    return latest
+
+
 def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     if not label_id:
         return False
@@ -2026,6 +2151,13 @@ def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     for message in thread.get("messages", []):
         labels = set(message.get("labelIds", []) or [])
         if label_id in labels:
+            return True
+    return False
+
+
+def any_thread_has_label(gmail_service, *, thread_ids: list[str], label_id: str) -> bool:
+    for thread_id in thread_ids:
+        if thread_has_label(gmail_service, thread_id=thread_id, label_id=label_id):
             return True
     return False
 
@@ -2048,6 +2180,132 @@ def remove_labels_from_thread(gmail_service, *, thread_id: str, label_ids: list[
     except Exception:
         return False
     return True
+
+
+def remove_labels_from_threads(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    label_ids: list[str],
+) -> tuple[int, int]:
+    normalized_labels = [label_id for label_id in label_ids if label_id]
+    if not normalized_labels:
+        return 0, 0
+
+    removed = 0
+    failures = 0
+    for thread_id in dict.fromkeys(thread_ids):
+        if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=normalized_labels):
+            removed += 1
+        else:
+            failures += 1
+    return removed, failures
+
+
+def thread_latest_message_datetime(thread: dict[str, Any]) -> datetime | None:
+    messages = sorted_thread_messages(thread)
+    if not messages:
+        return None
+    return message_internal_datetime(messages[-1])
+
+
+def thread_involves_candidate_and_internal(
+    thread: dict[str, Any],
+    *,
+    candidate_email: str,
+    internal_domains: set[str],
+) -> bool:
+    candidate_email = normalize_email(candidate_email)
+    saw_candidate = False
+    saw_internal = False
+    for message in thread.get("messages", []) or []:
+        headers = header_map(message)
+        if subject_has_hiring_prefix(headers.get("subject", "")):
+            saw_internal = True
+
+        for header_name in ("from", "to", "cc", "bcc"):
+            raw_value = headers.get(header_name, "")
+            if not raw_value:
+                continue
+            tokens = raw_value.split(",") if header_name != "from" else [raw_value]
+            for token in tokens:
+                address = normalize_email(parseaddr(token)[1])
+                if not address:
+                    continue
+                if address == candidate_email:
+                    saw_candidate = True
+                if email_domain(address) in internal_domains:
+                    saw_internal = True
+        if saw_candidate and saw_internal:
+            return True
+    return False
+
+
+def candidate_related_thread_ids(
+    gmail_service,
+    *,
+    candidate_email: str,
+    primary_thread_id: str,
+    internal_domains: set[str],
+    max_threads: int = 25,
+) -> list[str]:
+    related_ids: set[str] = set()
+    if primary_thread_id:
+        related_ids.add(primary_thread_id)
+
+    candidate_email = normalize_email(candidate_email)
+    if not candidate_email:
+        return list(related_ids)
+
+    query = f'"{candidate_email}"'
+    for item in list_threads_matching_query(gmail_service, query, max_threads=max_threads):
+        thread_id = str(item.get("id", "") or "").strip()
+        if not thread_id or thread_id in related_ids:
+            continue
+        try:
+            thread = (
+                gmail_service.users()
+                .threads()
+                .get(
+                    userId="me",
+                    id=thread_id,
+                    format="metadata",
+                    metadataHeaders=["From", "To", "Cc", "Bcc", "Subject"],
+                )
+                .execute()
+            )
+        except Exception:
+            continue
+        if thread_involves_candidate_and_internal(
+            thread,
+            candidate_email=candidate_email,
+            internal_domains=internal_domains,
+        ):
+            related_ids.add(thread_id)
+
+    return list(related_ids)
+
+
+def preferred_reply_thread_id(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    fallback_thread_id: str,
+) -> str:
+    latest_thread_id = fallback_thread_id
+    latest_dt: datetime | None = None
+
+    for thread_id in dict.fromkeys(thread_ids):
+        try:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="minimal").execute()
+        except Exception:
+            continue
+        thread_dt = thread_latest_message_datetime(thread)
+        if thread_dt and (latest_dt is None or thread_dt > latest_dt):
+            latest_dt = thread_dt
+            latest_thread_id = thread_id
+
+    return latest_thread_id or fallback_thread_id
 
 
 def find_next_available_slot(config: Config, calendar_service, start_anchor: datetime) -> datetime | None:
@@ -2935,6 +3193,10 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             pipeline_label_id = gmail_label_id(gmail_service, config.pipeline_label_name)
         except Exception:
             pipeline_label_id = ""
+    internal_domains = {email_domain(config.from_email)}
+    if config.hiring_alias:
+        internal_domains.add(email_domain(config.hiring_alias))
+    internal_domains.discard("")
 
     for page in pages:
         page_props = page.get("properties", {})
@@ -2945,10 +3207,25 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
         if not candidate_email or not thread_id:
             continue
+        related_thread_ids = candidate_related_thread_ids(
+            gmail_service,
+            candidate_email=candidate_email,
+            primary_thread_id=thread_id,
+            internal_domains=internal_domains,
+        )
+        reply_thread_id = preferred_reply_thread_id(
+            gmail_service,
+            thread_ids=related_thread_ids,
+            fallback_thread_id=thread_id,
+        )
 
         update_payload: dict[str, Any] = {}
         in_pipeline = False
-        if pipeline_label_id and thread_has_label(gmail_service, thread_id=thread_id, label_id=pipeline_label_id):
+        if pipeline_label_id and any_thread_has_label(
+            gmail_service,
+            thread_ids=related_thread_ids,
+            label_id=pipeline_label_id,
+        ):
             in_pipeline = True
             if current_status != "in process" and prop.status in properties_schema:
                 in_process_marked += 1
@@ -2959,9 +3236,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         manual_reject_sent_at: datetime | None = None
         if current_status != "rejected" and not in_pipeline:
-            manual_reject_sent_at = thread_latest_manual_rejection_sent_at(
+            manual_reject_sent_at = thread_latest_manual_rejection_sent_at_any_thread(
                 gmail_service,
-                thread_id=thread_id,
+                thread_ids=related_thread_ids,
                 sender_email=config.from_email,
                 candidate_email=candidate_email,
             )
@@ -2984,14 +3261,13 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 archive_labels = [hiring_label_id]
                 if pipeline_label_id:
                     archive_labels.append(pipeline_label_id)
-                if remove_labels_from_thread(
+                archived_count, archive_failures = remove_labels_from_threads(
                     gmail_service,
-                    thread_id=thread_id,
+                    thread_ids=related_thread_ids,
                     label_ids=archive_labels,
-                ):
-                    reject_threads_archived += 1
-                else:
-                    reject_archive_failures += 1
+                )
+                reject_threads_archived += archived_count
+                reject_archive_failures += archive_failures
 
         if manual_reject_sent_at:
             if update_payload:
@@ -3000,9 +3276,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         sent_archive_labels = [hiring_label_id] if hiring_label_id else []
         if current_status == "proceed drafted":
-            proceed_sent_at = thread_latest_sent_matching_patterns(
+            proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
                 gmail_service,
-                thread_id=thread_id,
+                thread_ids=related_thread_ids,
                 sender_email=config.from_email,
                 candidate_email=candidate_email,
                 patterns=[PROCEED_SENT_RE],
@@ -3010,33 +3286,39 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             if proceed_sent_at:
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "In Process")
-                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=sent_archive_labels):
-                    sent_draft_threads_archived += 1
-                else:
-                    sent_draft_archive_failures += 1
+                archived_count, archive_failures = remove_labels_from_threads(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    label_ids=sent_archive_labels,
+                )
+                sent_draft_threads_archived += archived_count
+                sent_draft_archive_failures += archive_failures
                 if update_payload:
                     notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
                 continue
 
         if current_status == "scheduling":
-            scheduling_sent_at = thread_latest_sent_matching_patterns(
+            scheduling_sent_at = thread_latest_sent_matching_patterns_any_thread(
                 gmail_service,
-                thread_id=thread_id,
+                thread_ids=related_thread_ids,
                 sender_email=config.from_email,
                 candidate_email=candidate_email,
                 patterns=[SCHEDULING_SENT_RE],
             )
             if scheduling_sent_at:
-                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=sent_archive_labels):
-                    sent_draft_threads_archived += 1
-                else:
-                    sent_draft_archive_failures += 1
+                archived_count, archive_failures = remove_labels_from_threads(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    label_ids=sent_archive_labels,
+                )
+                sent_draft_threads_archived += archived_count
+                sent_draft_archive_failures += archive_failures
                 continue
 
         if current_status == "no response":
-            no_response_sent_at = thread_latest_sent_matching_patterns(
+            no_response_sent_at = thread_latest_sent_matching_patterns_any_thread(
                 gmail_service,
-                thread_id=thread_id,
+                thread_ids=related_thread_ids,
                 sender_email=config.from_email,
                 candidate_email=candidate_email,
                 patterns=[NO_RESPONSE_SENT_RE],
@@ -3049,28 +3331,31 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
                 if prop.decision in properties_schema:
                     update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
-                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=closeout_labels):
-                    sent_draft_threads_archived += 1
-                else:
-                    sent_draft_archive_failures += 1
+                archived_count, archive_failures = remove_labels_from_threads(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    label_ids=closeout_labels,
+                )
+                sent_draft_threads_archived += archived_count
+                sent_draft_archive_failures += archive_failures
                 if update_payload:
                     notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
                 continue
 
         if decision not in {"proceed", "reject"}:
             if current_status == "awaiting decision":
-                assignment_sent_at = thread_latest_assignment_sent_at(
+                assignment_sent_at = thread_latest_assignment_sent_at_any_thread(
                     gmail_service,
-                    thread_id=thread_id,
+                    thread_ids=related_thread_ids,
                     sender_email=config.from_email,
                     keywords=config.assignment_keywords,
                 )
                 if assignment_sent_at:
                     wait_delta = now_local(config.timezone_name).astimezone(timezone.utc) - assignment_sent_at
                     if wait_delta >= timedelta(days=config.no_response_wait_days):
-                        if not candidate_replied_since(
+                        if not candidate_replied_since_any_thread(
                             gmail_service,
-                            thread_id=thread_id,
+                            thread_ids=related_thread_ids,
                             candidate_email=candidate_email,
                             since=assignment_sent_at,
                         ):
@@ -3083,7 +3368,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 gmail_service,
                                 sender_email=config.from_email,
                                 to_email=candidate_email,
-                                thread_id=thread_id,
+                                thread_id=reply_thread_id,
                                 body_text=body,
                             )
                             no_response_drafts += 1
@@ -3118,7 +3403,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     gmail_service,
                     sender_email=config.from_email,
                     to_email=candidate_email,
-                    thread_id=thread_id,
+                    thread_id=reply_thread_id,
                     body_text=config.proceed_template,
                 )
                 proceed_drafts += 1
@@ -3140,9 +3425,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
             anchor = decision_time or now
             if not scheduling_draft_id and not proposed_slot_raw:
-                if candidate_replied_since(
+                if candidate_replied_since_any_thread(
                     gmail_service,
-                    thread_id=thread_id,
+                    thread_ids=related_thread_ids,
                     candidate_email=candidate_email,
                     since=anchor,
                 ):
@@ -3154,7 +3439,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             gmail_service,
                             sender_email=config.from_email,
                             to_email=candidate_email,
-                            thread_id=thread_id,
+                            thread_id=reply_thread_id,
                             body_text=schedule_body,
                         )
                         scheduling_drafts += 1
@@ -3199,7 +3484,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     gmail_service,
                     sender_email=config.from_email,
                     to_email=candidate_email,
-                    thread_id=thread_id,
+                    thread_id=reply_thread_id,
                     body_text=config.reject_template,
                 )
                 reject_drafts += 1
@@ -3217,9 +3502,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 sent_anchor = status_lookback_anchor
                 if decision_time and decision_time > sent_anchor:
                     sent_anchor = decision_time
-                if sent_anchor and sender_sent_since(
+                if sent_anchor and sender_sent_since_any_thread(
                     gmail_service,
-                    thread_id=thread_id,
+                    thread_ids=related_thread_ids,
                     sender_email=config.from_email,
                     since=sent_anchor,
                     to_email=candidate_email,
@@ -3232,14 +3517,13 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     archive_labels = [hiring_label_id]
                     if pipeline_label_id:
                         archive_labels.append(pipeline_label_id)
-                    if remove_labels_from_thread(
+                    archived_count, archive_failures = remove_labels_from_threads(
                         gmail_service,
-                        thread_id=thread_id,
+                        thread_ids=related_thread_ids,
                         label_ids=archive_labels,
-                    ):
-                        reject_threads_archived += 1
-                    else:
-                        reject_archive_failures += 1
+                    )
+                    reject_threads_archived += archived_count
+                    reject_archive_failures += archive_failures
 
         if update_payload:
             notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
@@ -3256,16 +3540,19 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         if (
             hiring_label_id
             and effective_status != "scheduling"
-            and thread_has_label(gmail_service, thread_id=thread_id, label_id=hiring_label_id)
-        ):
-            if remove_labels_from_thread(
+            and any_thread_has_label(
                 gmail_service,
-                thread_id=thread_id,
+                thread_ids=related_thread_ids,
+                label_id=hiring_label_id,
+            )
+        ):
+            archived_count, archive_failures = remove_labels_from_threads(
+                gmail_service,
+                thread_ids=related_thread_ids,
                 label_ids=[hiring_label_id],
-            ):
-                non_scheduling_threads_archived += 1
-            else:
-                non_scheduling_archive_failures += 1
+            )
+            non_scheduling_threads_archived += archived_count
+            non_scheduling_archive_failures += archive_failures
 
     print(f"Proceed drafts created: {proceed_drafts}")
     print(f"Reject schedules initialized: {reject_scheduled}")
