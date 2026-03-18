@@ -75,18 +75,31 @@ SCHEDULING_SENT_RE = re.compile(
 NO_RESPONSE_SENT_RE = re.compile(
     r"(?i)\bhaven't heard back from you in a while\b|\bclose the loop on this process\b"
 )
-MANUAL_REJECTION_RE = re.compile(
-    r"(?i)("
-    r"won[’']?t\s+be\s+moving\s+forward"
-    r"|will\s+not\s+be\s+moving\s+forward"
-    r"|not\s+be\s+moving\s+forward\s+with\s+your\s+application"
-    r"|haven[’']?t\s+received\s+your\s+submission"
-    r"|we\s+haven[’']?t\s+received\s+your\s+submission"
-    r"|closing\s+out\s+this\s+process"
-    r"|strong\s+pool\s+of\s+applicants"
-    r"|keep\s+checking\s+our\s+careers?\s+page"
-    r")"
-)
+REJECT_HARD_PATTERNS = [
+    re.compile(r"(?i)\bwon[’']?t\s+be\s+moving\s+forward\b"),
+    re.compile(r"(?i)\bwill\s+not\s+be\s+moving\s+forward\b"),
+    re.compile(r"(?i)\bnot\s+be\s+moving\s+forward\s+with\s+your\s+application\b"),
+    re.compile(r"(?i)\bwe\s+won[’']?t\s+be\s+proceeding\b"),
+    re.compile(r"(?i)\bwe\s+will\s+not\s+be\s+proceeding\b"),
+    re.compile(r"(?i)\bno\s+longer\s+moving\s+forward\b"),
+    re.compile(r"(?i)\bmove(?:d)?\s+forward\s+with\s+other\s+(?:candidates|applicants)\b"),
+    re.compile(r"(?i)\bmoving\s+ahead\s+with\s+other\s+(?:candidates|applicants)\b"),
+    re.compile(r"(?i)\bclosing\s+out\s+this\s+process\b.*\bsubmission\b"),
+    re.compile(r"(?i)\bhaven[’']?t\s+received\s+your\s+submission\b"),
+    re.compile(r"(?i)\bwe\s+haven[’']?t\s+received\s+your\s+submission\b"),
+]
+REJECT_SUPPORT_PATTERNS = [
+    re.compile(r"(?i)\bstrong\s+pool\s+of\s+applicants\b"),
+    re.compile(r"(?i)\bcareful\s+consideration\b"),
+    re.compile(r"(?i)\bkeep\s+checking\s+our\s+careers?\s+page\b"),
+    re.compile(r"(?i)\bglad\s+to\s+see\s+your\s+application\s+again\b"),
+    re.compile(r"(?i)\bapplication\s+again\s+in\s+the\s+future\b"),
+    re.compile(r"(?i)\bapplication\b.*\bat\s+this\s+time\b"),
+]
+REJECT_EXCLUSION_PATTERNS = [
+    NO_RESPONSE_SENT_RE,
+    re.compile(r"(?i)\bas\s+you\s+figure\s+out\s+your\s+next\s+steps\b"),
+]
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
@@ -1847,6 +1860,25 @@ def render_no_response_template(template: str, first_name: str) -> str:
     return body
 
 
+def message_implies_rejection(haystack: str) -> bool:
+    text = clean_text(haystack)
+    if not text:
+        return False
+
+    for pattern in REJECT_EXCLUSION_PATTERNS:
+        if pattern.search(text):
+            return False
+
+    hard_hits = sum(1 for pattern in REJECT_HARD_PATTERNS if pattern.search(text))
+    support_hits = sum(1 for pattern in REJECT_SUPPORT_PATTERNS if pattern.search(text))
+
+    if hard_hits >= 1:
+        return True
+    if support_hits >= 2:
+        return True
+    return False
+
+
 def thread_latest_assignment_sent_at(
     gmail_service,
     *,
@@ -1922,7 +1954,7 @@ def thread_latest_manual_rejection_sent_at(
         snippet = clean_text(message.get("snippet", ""))
         body = clean_text(extract_message_body_text(message))
         haystack = f"{subject}\n{snippet}\n{body}"
-        if not MANUAL_REJECTION_RE.search(haystack):
+        if not message_implies_rejection(haystack):
             continue
 
         sent_at = message_internal_datetime(message)
