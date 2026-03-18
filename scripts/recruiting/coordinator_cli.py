@@ -3408,7 +3408,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 )
             if proceed_sent_at:
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "In Process")
+                    next_status = "In CustomGPT Process" if uses_bdr_assignment else "In Process"
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], next_status)
                 archived_count, archive_failures = remove_labels_from_threads(
                     gmail_service,
                     thread_ids=related_thread_ids,
