@@ -485,6 +485,9 @@ class NotionClient:
     def get_database(self) -> dict[str, Any]:
         return self._request("GET", f"/databases/{self._database_id}")
 
+    def update_database(self, properties: dict[str, Any]) -> dict[str, Any]:
+        return self._request("PATCH", f"/databases/{self._database_id}", {"properties": properties})
+
     def query_pages(self, payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         body = payload.copy() if payload else {}
         pages: list[dict[str, Any]] = []
@@ -611,6 +614,13 @@ def notion_prop_value(prop: dict[str, Any]) -> str:
     if prop_type == "select":
         selected = prop.get("select")
         return (selected or {}).get("name", "").strip() if selected else ""
+    if prop_type == "multi_select":
+        values = [
+            (item.get("name") or "").strip()
+            for item in prop.get("multi_select", []) or []
+            if (item.get("name") or "").strip()
+        ]
+        return ", ".join(values)
     if prop_type == "status":
         selected = prop.get("status")
         return (selected or {}).get("name", "").strip() if selected else ""
@@ -652,6 +662,14 @@ def build_notion_value(prop_schema: dict[str, Any], value: Any) -> dict[str, Any
     if prop_type == "select":
         text = str(value).strip()
         return {"select": {"name": text}} if text else {"select": None}
+    if prop_type == "multi_select":
+        if isinstance(value, str):
+            values = [item.strip() for item in value.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple, set)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            values = [str(value).strip()] if str(value).strip() else []
+        return {"multi_select": [{"name": item} for item in values]}
     if prop_type == "status":
         text = str(value).strip()
         return {"status": {"name": text}} if text else {"status": None}
@@ -1528,10 +1546,7 @@ def canonicalize_truewind_role(raw_value: str) -> str:
     stripped = clean_text(stripped).strip("-:|,;")
     if not stripped:
         return "Unknown"
-    stripped_words = stripped.split()
-    if len(stripped_words) > 6:
-        return "Unknown"
-    return stripped or "Unknown"
+    return "Unknown"
 
 
 def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> tuple[str, str] | None:
@@ -2247,6 +2262,7 @@ def candidate_related_thread_ids(
     candidate_email: str,
     primary_thread_id: str,
     internal_domains: set[str],
+    hiring_label_id: str,
     max_threads: int = 25,
 ) -> list[str]:
     related_ids: set[str] = set()
@@ -2261,6 +2277,8 @@ def candidate_related_thread_ids(
     for item in list_threads_matching_query(gmail_service, query, max_threads=max_threads):
         thread_id = str(item.get("id", "") or "").strip()
         if not thread_id or thread_id in related_ids:
+            continue
+        if hiring_label_id and not thread_has_label(gmail_service, thread_id=thread_id, label_id=hiring_label_id):
             continue
         try:
             thread = (
@@ -2679,6 +2697,50 @@ def require_notion_property(
     return properties[prop_name]
 
 
+ROLE_OPTIONS = ("BDR", "Growth Generalist")
+
+
+def notion_prop_values(prop: dict[str, Any]) -> list[str]:
+    prop_type = prop.get("type")
+    if prop_type == "multi_select":
+        return [
+            (item.get("name") or "").strip()
+            for item in prop.get("multi_select", []) or []
+            if (item.get("name") or "").strip()
+        ]
+    value = notion_prop_value(prop)
+    return [value] if value else []
+
+
+def ensure_role_property_schema(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> dict[str, Any]:
+    properties_schema = database_schema.get("properties", {})
+    role_name = prop_map.role
+    role_schema = properties_schema.get(role_name)
+    if not role_schema:
+        return database_schema
+
+    role_type = role_schema.get("type")
+    option_payload = [{"name": name} for name in ROLE_OPTIONS]
+    if role_type == "multi_select":
+        existing = {
+            (item.get("name") or "").strip()
+            for item in (role_schema.get("multi_select", {}) or {}).get("options", []) or []
+            if (item.get("name") or "").strip()
+        }
+        if set(ROLE_OPTIONS).issubset(existing):
+            return database_schema
+        return notion.update_database({role_name: {"multi_select": {"options": option_payload}}})
+
+    if role_type in {"select", "rich_text"}:
+        return notion.update_database({role_name: {"multi_select": {"options": option_payload}}})
+
+    return database_schema
+
+
 def resolve_title_property_name(properties_schema: dict[str, Any], preferred: str) -> str:
     if preferred in properties_schema and properties_schema[preferred].get("type") == "title":
         return preferred
@@ -2739,11 +2801,23 @@ def thread_filter(prop_name: str, prop_schema: dict[str, Any], thread_id: str) -
     return None
 
 
+def email_filter(prop_name: str, prop_schema: dict[str, Any], candidate_email: str) -> dict[str, Any] | None:
+    prop_type = prop_schema.get("type")
+    if prop_type == "email":
+        return {"property": prop_name, "email": {"equals": candidate_email}}
+    if prop_type == "rich_text":
+        return {"property": prop_name, "rich_text": {"equals": candidate_email}}
+    if prop_type == "title":
+        return {"property": prop_name, "title": {"equals": candidate_email}}
+    return None
+
+
 def find_existing_candidate_page(
     notion: NotionClient,
     database_schema: dict[str, Any],
     prop_map: NotionPropertyMap,
     gmail_thread_id: str,
+    candidate_email: str = "",
 ) -> dict[str, Any] | None:
     thread_schema = require_notion_property(database_schema, prop_map.gmail_thread_id)
     filter_payload = thread_filter(prop_map.gmail_thread_id, thread_schema, gmail_thread_id)
@@ -2752,9 +2826,20 @@ def find_existing_candidate_page(
         if matches:
             return matches[0]
 
+    normalized_email = normalize_email(candidate_email)
+    if normalized_email:
+        email_schema = require_notion_property(database_schema, prop_map.email)
+        email_payload = email_filter(prop_map.email, email_schema, normalized_email)
+        if email_payload:
+            matches = notion.query_pages({"filter": email_payload, "page_size": 1})
+            if matches:
+                return matches[0]
+
     for existing in notion.query_pages({"page_size": 100}):
         props = existing.get("properties", {})
         if notion_prop_value(props.get(prop_map.gmail_thread_id, {})) == gmail_thread_id:
+            return existing
+        if normalized_email and normalize_email(notion_prop_value(props.get(prop_map.email, {}))) == normalized_email:
             return existing
     return None
 
@@ -2782,13 +2867,20 @@ def upsert_candidate_page(
     properties_schema = database_schema.get("properties", {})
     title_prop_name = resolve_title_property_name(properties_schema, prop_map.candidate_name)
     page: dict[str, Any] | None = existing_page or find_existing_candidate_page(
-        notion, database_schema, prop_map, gmail_thread_id
+        notion, database_schema, prop_map, gmail_thread_id, candidate_email
     )
+
+    role_values: list[str] = [role] if role in ROLE_OPTIONS else []
+    if page and prop_map.role in properties_schema:
+        existing_roles = [
+            item for item in notion_prop_values(page.get("properties", {}).get(prop_map.role, {})) if item in ROLE_OPTIONS
+        ]
+        role_values = list(dict.fromkeys([*existing_roles, *role_values]))
 
     base_values: dict[str, Any] = {
         title_prop_name: candidate_name,
         prop_map.email: candidate_email,
-        prop_map.role: role,
+        prop_map.role: role_values or role,
         prop_map.resume_url: resume_url,
         prop_map.career_stage: career_stage,
         prop_map.linkedin_url: linkedin_url,
@@ -2878,6 +2970,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     config = load_config()
     notion = NotionClient(config.notion_token, config.notion_database_id)
     database_schema = notion.get_database()
+    prop_map = resolve_property_map(config.property_map, database_schema)
+    database_schema = ensure_role_property_schema(notion, database_schema, prop_map)
     prop_map = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
@@ -2988,7 +3082,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         location = classify_location(resume_text, snippet)
 
         existing_page = find_existing_candidate_page(
-            notion, database_schema, prop_map, thread_id
+            notion, database_schema, prop_map, thread_id, candidate_email
         )
         existing_resume_url = ""
         existing_linkedin_url = ""
@@ -3142,6 +3236,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     database_schema = notion.get_database()
     properties_schema = database_schema.get("properties", {})
     prop = resolve_property_map(config.property_map, database_schema)
+    database_schema = ensure_role_property_schema(notion, database_schema, prop)
+    properties_schema = database_schema.get("properties", {})
+    prop = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
         api_name="gmail",
@@ -3212,6 +3309,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             candidate_email=candidate_email,
             primary_thread_id=thread_id,
             internal_domains=internal_domains,
+            hiring_label_id=hiring_label_id,
         )
         reply_thread_id = preferred_reply_thread_id(
             gmail_service,
