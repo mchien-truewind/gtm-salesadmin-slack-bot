@@ -52,6 +52,17 @@ RESUME_LINK_FILE_HINTS = (".pdf", ".doc", ".docx", ".rtf", ".txt")
 RESUME_LINK_RE = re.compile(r"https?://[^\s<>\")']+", flags=re.IGNORECASE)
 
 DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. When are you free for a 20-minute intro call?"
+DEFAULT_BDR_PROCEED_TEMPLATE = (
+    "Thanks for the submission. We'd love to get to know you a little better.\n\n"
+    "As part of the next step in the process, please complete the following within the next 48 hours:\n"
+    "1. Go to this roleplay link: https://chatgpt.com/g/g-698d0a0186288191bc1b95c61e3e36ed-truewind-bdr-roleplay\n"
+    "2. Engage in a full cold call conversation with the GPT as if it were a real prospect.\n"
+    "3. Share the link of the full chat transcript and email it back to us.\n\n"
+    "We're looking to evaluate tone, structure, objection handling, and overall conversational flow.\n\n"
+    "Looking forward to reviewing it.\n\n"
+    "Thanks,\n"
+    "Mercedes"
+)
 DEFAULT_REJECT_TEMPLATE = (
     "Thank you for your submission. We had an incredibly strong pool of applicants, and after careful "
     "consideration, we won't be moving forward with your application at this time.\n\n"
@@ -2712,6 +2723,10 @@ def notion_prop_values(prop: dict[str, Any]) -> list[str]:
     return [value] if value else []
 
 
+def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
+    return set(notion_prop_values(page_props.get(prop_map.role, {})))
+
+
 def ensure_role_property_schema(
     notion: NotionClient,
     database_schema: dict[str, Any],
@@ -3299,6 +3314,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         page_props = page.get("properties", {})
         decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
         current_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
+        candidate_roles = page_role_values(page_props, prop)
+        uses_bdr_assignment = "BDR" in candidate_roles
 
         candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
         thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
@@ -3374,13 +3391,21 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         sent_archive_labels = [hiring_label_id] if hiring_label_id else []
         if current_status == "proceed drafted":
-            proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
-                gmail_service,
-                thread_ids=related_thread_ids,
-                sender_email=config.from_email,
-                candidate_email=candidate_email,
-                patterns=[PROCEED_SENT_RE],
-            )
+            if uses_bdr_assignment:
+                proceed_sent_at = thread_latest_assignment_sent_at_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    sender_email=config.from_email,
+                    keywords=config.assignment_keywords,
+                )
+            else:
+                proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    sender_email=config.from_email,
+                    candidate_email=candidate_email,
+                    patterns=[PROCEED_SENT_RE],
+                )
             if proceed_sent_at:
                 if prop.status in properties_schema:
                     update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "In Process")
@@ -3497,12 +3522,13 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
             if not proceed_draft_id:
+                proceed_body = DEFAULT_BDR_PROCEED_TEMPLATE if uses_bdr_assignment else config.proceed_template
                 draft_id = create_reply_draft(
                     gmail_service,
                     sender_email=config.from_email,
                     to_email=candidate_email,
                     thread_id=reply_thread_id,
-                    body_text=config.proceed_template,
+                    body_text=proceed_body,
                 )
                 proceed_drafts += 1
                 if prop.proceed_draft_id in properties_schema:
@@ -3522,7 +3548,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             scheduling_draft_id = notion_prop_value(page_props.get(prop.scheduling_draft_id, {})).strip()
             proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
             anchor = decision_time or now
-            if not scheduling_draft_id and not proposed_slot_raw:
+            if not uses_bdr_assignment and not scheduling_draft_id and not proposed_slot_raw:
                 if candidate_replied_since_any_thread(
                     gmail_service,
                     thread_ids=related_thread_ids,
