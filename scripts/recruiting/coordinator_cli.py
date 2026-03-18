@@ -2904,6 +2904,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     reject_archive_failures = 0
     sent_draft_threads_archived = 0
     sent_draft_archive_failures = 0
+    non_scheduling_threads_archived = 0
+    non_scheduling_archive_failures = 0
     in_process_marked = 0
     no_response_drafts = 0
     scheduling_drafts = 0
@@ -3072,7 +3074,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
-            continue
+                continue
 
         decision_time_raw = notion_prop_value(page_props.get(prop.decision_time, {})).strip()
         decision_time = parse_iso_datetime(decision_time_raw, config.timezone_name)
@@ -3211,6 +3213,29 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         if update_payload:
             notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
 
+        effective_status = current_status
+        status_update = update_payload.get(prop.status)
+        if isinstance(status_update, dict):
+            status_payload = status_update.get("status")
+            if isinstance(status_payload, dict):
+                status_name = clean_text(status_payload.get("name", ""))
+                if status_name:
+                    effective_status = status_name.lower()
+
+        if (
+            hiring_label_id
+            and effective_status != "scheduling"
+            and thread_has_label(gmail_service, thread_id=thread_id, label_id=hiring_label_id)
+        ):
+            if remove_labels_from_thread(
+                gmail_service,
+                thread_id=thread_id,
+                label_ids=[hiring_label_id],
+            ):
+                non_scheduling_threads_archived += 1
+            else:
+                non_scheduling_archive_failures += 1
+
     print(f"Proceed drafts created: {proceed_drafts}")
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
@@ -3220,6 +3245,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Rejected thread archive failures: {reject_archive_failures}")
     print(f"Sent draft threads auto-archived: {sent_draft_threads_archived}")
     print(f"Sent draft thread archive failures: {sent_draft_archive_failures}")
+    print(f"Non-scheduling ATS threads archived from hiring label: {non_scheduling_threads_archived}")
+    print(f"Non-scheduling ATS thread archive failures: {non_scheduling_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
     print(f"No response drafts created: {no_response_drafts}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
