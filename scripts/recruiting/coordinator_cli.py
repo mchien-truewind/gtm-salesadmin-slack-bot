@@ -368,12 +368,17 @@ def load_config() -> Config:
     )
 
     timezone_name = os.getenv("RECRUITING_SCHEDULING_TIMEZONE", "America/Los_Angeles").strip()
+    require_attachment = parse_env_bool("RECRUITING_REQUIRE_ATTACHMENT", False)
+    gmail_query_raw = os.getenv("RECRUITING_GMAIL_QUERY", 'subject:"[hiring@]"').strip()
+    if not require_attachment:
+        gmail_query_raw = re.sub(r"(?i)\bhas:attachment\b", "", gmail_query_raw)
+    gmail_query = clean_text(gmail_query_raw) or 'subject:"[hiring@]"'
 
     return Config(
         notion_token=notion_token,
         notion_database_id=notion_db,
         gmail_label_name=os.getenv("RECRUITING_GMAIL_LABEL", "hiring@").strip(),
-        gmail_query=os.getenv("RECRUITING_GMAIL_QUERY", 'subject:"[hiring@]"').strip(),
+        gmail_query=gmail_query,
         gmail_max_messages=parse_env_int("RECRUITING_GMAIL_MAX_MESSAGES", 50),
         hiring_alias=os.getenv("RECRUITING_HIRING_ALIAS", "").strip().lower(),
         from_email=from_email,
