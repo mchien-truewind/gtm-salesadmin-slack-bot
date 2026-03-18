@@ -68,6 +68,13 @@ DEFAULT_NO_RESPONSE_TEMPLATE = (
     "Thanks\n"
     "Mercedes"
 )
+PROCEED_SENT_RE = re.compile(r"(?i)\bwhen are you free for a 20-minute intro call\b")
+SCHEDULING_SENT_RE = re.compile(
+    r"(?i)\bthanks for the quick reply\b.*\b20-minute intro call on\b|\b20-minute intro call on\b"
+)
+NO_RESPONSE_SENT_RE = re.compile(
+    r"(?i)\bhaven't heard back from you in a while\b|\bclose the loop on this process\b"
+)
 MANUAL_REJECTION_RE = re.compile(
     r"(?i)("
     r"won[’']?t\s+be\s+moving\s+forward"
@@ -1922,6 +1929,56 @@ def thread_latest_manual_rejection_sent_at(
     return latest
 
 
+def thread_latest_sent_matching_patterns(
+    gmail_service,
+    *,
+    thread_id: str,
+    sender_email: str,
+    candidate_email: str,
+    patterns: list[re.Pattern[str]],
+) -> datetime | None:
+    if not patterns:
+        return None
+    try:
+        thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception:
+        return None
+
+    sender_email = normalize_email(sender_email)
+    candidate_email = normalize_email(candidate_email)
+    latest: datetime | None = None
+
+    for message in thread.get("messages", []):
+        headers = header_map(message)
+        from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        label_ids = set(message.get("labelIds", []) or [])
+        sent_labeled = "SENT" in label_ids
+        if from_email != sender_email and not sent_labeled:
+            continue
+
+        recipients: set[str] = set()
+        for header_name in ("to", "cc", "bcc"):
+            for token in headers.get(header_name, "").split(","):
+                parsed = normalize_email(parseaddr(token)[1])
+                if parsed:
+                    recipients.add(parsed)
+        if recipients and candidate_email not in recipients:
+            continue
+
+        subject = clean_text(headers.get("subject", ""))
+        snippet = clean_text(message.get("snippet", ""))
+        body = clean_text(extract_message_body_text(message))
+        haystack = f"{subject}\n{snippet}\n{body}"
+        if not any(pattern.search(haystack) for pattern in patterns):
+            continue
+
+        sent_at = message_internal_datetime(message)
+        if sent_at and (latest is None or sent_at > latest):
+            latest = sent_at
+
+    return latest
+
+
 def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     if not label_id:
         return False
@@ -2810,6 +2867,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     manual_reject_marked = 0
     reject_threads_archived = 0
     reject_archive_failures = 0
+    sent_draft_threads_archived = 0
+    sent_draft_archive_failures = 0
     in_process_marked = 0
     no_response_drafts = 0
     scheduling_drafts = 0
@@ -2888,6 +2947,59 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
             continue
+
+        sent_archive_labels = [hiring_label_id] if hiring_label_id else []
+        if current_status == "proceed drafted":
+            proceed_sent_at = thread_latest_sent_matching_patterns(
+                gmail_service,
+                thread_id=thread_id,
+                sender_email=config.from_email,
+                candidate_email=candidate_email,
+                patterns=[PROCEED_SENT_RE],
+            )
+            if proceed_sent_at:
+                if prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "In Process")
+                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=sent_archive_labels):
+                    sent_draft_threads_archived += 1
+                else:
+                    sent_draft_archive_failures += 1
+                if update_payload:
+                    notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+                continue
+
+        if current_status == "scheduling":
+            scheduling_sent_at = thread_latest_sent_matching_patterns(
+                gmail_service,
+                thread_id=thread_id,
+                sender_email=config.from_email,
+                candidate_email=candidate_email,
+                patterns=[SCHEDULING_SENT_RE],
+            )
+            if scheduling_sent_at:
+                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=sent_archive_labels):
+                    sent_draft_threads_archived += 1
+                else:
+                    sent_draft_archive_failures += 1
+                continue
+
+        if current_status == "no response":
+            no_response_sent_at = thread_latest_sent_matching_patterns(
+                gmail_service,
+                thread_id=thread_id,
+                sender_email=config.from_email,
+                candidate_email=candidate_email,
+                patterns=[NO_RESPONSE_SENT_RE],
+            )
+            closeout_labels = list(sent_archive_labels)
+            if pipeline_label_id:
+                closeout_labels.append(pipeline_label_id)
+            if no_response_sent_at:
+                if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=closeout_labels):
+                    sent_draft_threads_archived += 1
+                else:
+                    sent_draft_archive_failures += 1
+                continue
 
         if decision not in {"proceed", "reject"}:
             if current_status == "awaiting decision":
@@ -3071,6 +3183,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Manual rejection sends auto-marked: {manual_reject_marked}")
     print(f"Rejected threads archived from ATS labels: {reject_threads_archived}")
     print(f"Rejected thread archive failures: {reject_archive_failures}")
+    print(f"Sent draft threads auto-archived: {sent_draft_threads_archived}")
+    print(f"Sent draft thread archive failures: {sent_draft_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
     print(f"No response drafts created: {no_response_drafts}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
