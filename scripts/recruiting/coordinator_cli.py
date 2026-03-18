@@ -62,10 +62,9 @@ DEFAULT_SCHEDULING_TEMPLATE = (
     "Thanks for the quick reply. Are you available for a 20-minute intro call on {slot_label}?"
 )
 DEFAULT_NO_RESPONSE_TEMPLATE = (
-    "Hi {first_name},\n\n"
-    "Haven't heard back from you in a while. We're going to close the loop on this process as you figure out your next steps.\n\n"
-    "We are growing quickly and we'll be glad to see your application again for another role in the future.\n\n"
-    "Thanks\n"
+    "We haven't heard back from you and we're closing this process.\n\n"
+    "We're growing quickly, though, and new roles open up often. Please keep checking our careers page "
+    "for future opportunities. We'd be glad to see your application again in the future.\n\n"
     "Mercedes"
 )
 PROCEED_SENT_RE = re.compile(r"(?i)\bwhen are you free for a 20-minute intro call\b")
@@ -73,7 +72,7 @@ SCHEDULING_SENT_RE = re.compile(
     r"(?i)\bthanks for the quick reply\b.*\b20-minute intro call on\b|\b20-minute intro call on\b"
 )
 NO_RESPONSE_SENT_RE = re.compile(
-    r"(?i)\bhaven't heard back from you in a while\b|\bclose the loop on this process\b"
+    r"(?i)\bhaven't heard back from you\b.*\bclosing this process\b|\bclose the loop on this process\b"
 )
 REJECT_HARD_PATTERNS = [
     re.compile(r"(?i)\bwon[’']?t\s+be\s+moving\s+forward\b"),
@@ -87,6 +86,7 @@ REJECT_HARD_PATTERNS = [
     re.compile(r"(?i)\bclosing\s+out\s+this\s+process\b.*\bsubmission\b"),
     re.compile(r"(?i)\bhaven[’']?t\s+received\s+your\s+submission\b"),
     re.compile(r"(?i)\bwe\s+haven[’']?t\s+received\s+your\s+submission\b"),
+    re.compile(r"(?i)\bhaven[’']?t\s+heard\s+back\s+from\s+you\b.*\bclosing\s+this\s+process\b"),
 ]
 REJECT_SUPPORT_PATTERNS = [
     re.compile(r"(?i)\bstrong\s+pool\s+of\s+applicants\b"),
@@ -97,13 +97,15 @@ REJECT_SUPPORT_PATTERNS = [
     re.compile(r"(?i)\bapplication\b.*\bat\s+this\s+time\b"),
 ]
 REJECT_EXCLUSION_PATTERNS = [
-    NO_RESPONSE_SENT_RE,
     re.compile(r"(?i)\bas\s+you\s+figure\s+out\s+your\s+next\s+steps\b"),
 ]
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
-DEFAULT_ASSIGNMENT_KEYWORDS = "assignment,case study,take-home,take home,exercise,project"
+DEFAULT_ASSIGNMENT_KEYWORDS = (
+    "assignment,case study,take-home,take home,exercise,project,"
+    "roleplay,role play,chat transcript,complete the following,next step in the process,within the next 48 hours"
+)
 
 _DOCLING_CONVERTER: Any | None = None
 _DOCLING_CHECKED = False
@@ -1824,7 +1826,7 @@ def sender_sent_since(
         }
         from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
         # Prefer SENT-labeled thread messages, and fallback to explicit from-email match.
-        if not sent_labeled and from_email != sender_email:
+        if not sent_labeled and not sender_matches_outbound_scope(from_email, sender_email):
             continue
 
         if to_email:
@@ -1900,7 +1902,7 @@ def thread_latest_assignment_sent_at(
     for message in thread.get("messages", []):
         headers = header_map(message)
         from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
-        if from_email != sender_email:
+        if not sender_matches_outbound_scope(from_email, sender_email):
             continue
 
         subject = clean_text(headers.get("subject", "")).lower()
@@ -1938,7 +1940,7 @@ def thread_latest_manual_rejection_sent_at(
         from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
         label_ids = set(message.get("labelIds", []) or [])
         sent_labeled = "SENT" in label_ids
-        if from_email != sender_email and not sent_labeled:
+        if not sender_matches_outbound_scope(from_email, sender_email) and not sent_labeled:
             continue
 
         recipients: set[str] = set()
@@ -1988,7 +1990,7 @@ def thread_latest_sent_matching_patterns(
         from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
         label_ids = set(message.get("labelIds", []) or [])
         sent_labeled = "SENT" in label_ids
-        if from_email != sender_email and not sent_labeled:
+        if not sender_matches_outbound_scope(from_email, sender_email) and not sent_labeled:
             continue
 
         recipients: set[str] = set()
@@ -2576,6 +2578,17 @@ def email_domain(value: str) -> str:
     return email.rsplit("@", 1)[-1].strip()
 
 
+def sender_matches_outbound_scope(from_email: str, sender_email: str) -> bool:
+    normalized_from = normalize_email(from_email)
+    normalized_sender = normalize_email(sender_email)
+    if not normalized_from or not normalized_sender:
+        return False
+    if normalized_from == normalized_sender:
+        return True
+    sender_domain = email_domain(normalized_sender)
+    return bool(sender_domain) and email_domain(normalized_from) == sender_domain
+
+
 def subject_has_hiring_prefix(subject: str) -> bool:
     return "[hiring@]" in clean_text(subject).lower()
 
@@ -3032,10 +3045,16 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             if pipeline_label_id:
                 closeout_labels.append(pipeline_label_id)
             if no_response_sent_at:
+                if prop.status in properties_schema:
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+                if prop.decision in properties_schema:
+                    update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
                 if remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=closeout_labels):
                     sent_draft_threads_archived += 1
                 else:
                     sent_draft_archive_failures += 1
+                if update_payload:
+                    notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
                 continue
 
         if decision not in {"proceed", "reject"}:
@@ -3060,7 +3079,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 candidate_email,
                             )
                             body = render_no_response_template(config.no_response_template, first_name)
-                            create_reply_draft(
+                            draft_id = create_reply_draft(
                                 gmail_service,
                                 sender_email=config.from_email,
                                 to_email=candidate_email,
@@ -3068,13 +3087,25 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                                 body_text=body,
                             )
                             no_response_drafts += 1
+                            if prop.reject_draft_id in properties_schema:
+                                update_payload[prop.reject_draft_id] = build_notion_value(
+                                    properties_schema[prop.reject_draft_id], draft_id
+                                )
+                            if prop.decision in properties_schema:
+                                update_payload[prop.decision] = build_notion_value(
+                                    properties_schema[prop.decision], "Reject"
+                                )
+                            if prop.decision_time in properties_schema:
+                                update_payload[prop.decision_time] = build_notion_value(
+                                    properties_schema[prop.decision_time], iso(now_local(config.timezone_name))
+                                )
                             if prop.status in properties_schema:
                                 update_payload[prop.status] = build_notion_value(
-                                    properties_schema[prop.status], "No response"
+                                    properties_schema[prop.status], "Reject Drafted"
                                 )
             if update_payload:
                 notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
-                continue
+            continue
 
         decision_time_raw = notion_prop_value(page_props.get(prop.decision_time, {})).strip()
         decision_time = parse_iso_datetime(decision_time_raw, config.timezone_name)
