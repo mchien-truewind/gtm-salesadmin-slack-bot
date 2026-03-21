@@ -168,6 +168,10 @@ async function readAiRequest(endpoint, retried = false) {
   if (!readAiTokens) return { error: 'Read AI not configured' };
   const url = `https://api.read.ai/v1${endpoint}`;
   try {
+    // Always refresh token before making a request to avoid stale token issues
+    if (!retried) {
+      await refreshReadAiToken();
+    }
     const result = await httpRequest(url, {
       method: 'GET',
       headers: {
@@ -175,13 +179,15 @@ async function readAiRequest(endpoint, retried = false) {
         'Accept': 'application/json',
       },
     });
-    // If unauthorized, try refreshing token once
-    if (result.error === 'request_unauthorized' && !retried) {
+    console.log(`Read AI ${endpoint}: ${typeof result === 'object' ? JSON.stringify(result).slice(0, 200) : result}`);
+    // If unauthorized, try refreshing token once more
+    if ((result.error === 'request_unauthorized' || result.error_description) && !retried) {
       const newToken = await refreshReadAiToken();
       if (newToken) return readAiRequest(endpoint, true);
     }
     return result;
   } catch (err) {
+    console.error(`Read AI request error: ${err.message}`);
     return { error: err.message };
   }
 }
