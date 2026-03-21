@@ -645,11 +645,18 @@ app.event('message', async ({ event, say }) => {
 });
 
 (async () => {
+  // Refresh Read AI token on startup so we always have a valid one
+  if (readAiTokens && readAiOauthState) {
+    const token = await refreshReadAiToken();
+    console.log(`  Read AI: ${token ? 'ready (token refreshed)' : 'refresh FAILED'}`);
+  } else {
+    console.log(`  Read AI: NOT CONFIGURED`);
+  }
+
   await app.start();
   console.log('Slack bot is running in socket mode');
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
-  console.log(`  Read AI: ${readAiTokens ? 'ready' : 'NOT CONFIGURED'}`);
 
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
