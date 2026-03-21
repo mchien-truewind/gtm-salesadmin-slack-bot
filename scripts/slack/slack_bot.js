@@ -37,7 +37,6 @@ const oauth2Client = new google.auth.OAuth2(
   'http://localhost'
 );
 oauth2Client.setCredentials({
-  access_token: tokenData.token,
   refresh_token: tokenData.refresh_token,
 });
 const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
