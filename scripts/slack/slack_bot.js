@@ -390,13 +390,14 @@ async function executeTool(name, input) {
       const res = await readAiRequest(`/meetings?limit=${limit}`);
       if (res.error) return `Error: ${res.error}`;
       // Normalize response -- Read AI may return { items: [...] } or { meetings: [...] } or an array
-      const meetings = res.items || res.meetings || (Array.isArray(res) ? res : []);
+      const meetings = res.data || res.items || res.meetings || (Array.isArray(res) ? res : []);
       return JSON.stringify(meetings.map(m => ({
         id: m.id,
         title: m.title || m.name,
-        date: m.start_time || m.date || m.created_at,
+        date: m.start_time_ms ? new Date(m.start_time_ms).toISOString() : (m.start_time || m.date || m.created_at),
         participants: m.participants || m.attendees,
-        duration_minutes: m.duration_minutes || m.duration,
+        report_url: m.report_url,
+        platform: m.platform,
       })));
     }
     if (name === 'readai_get_meeting') {
