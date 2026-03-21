@@ -117,9 +117,51 @@ async function httpRequest(url, options = {}) {
   });
 }
 
+const TOKEN_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
+const TOKEN_SHEET_RANGE = '_bot_config!B2'; // Cell with the refresh token
+
+async function loadRefreshTokenFromSheet() {
+  try {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: TOKEN_SHEET_ID,
+      range: TOKEN_SHEET_RANGE,
+    });
+    const token = res.data.values?.[0]?.[0];
+    if (token) {
+      console.log('Loaded Read AI refresh token from Google Sheet');
+      return token;
+    }
+  } catch (err) {
+    console.error('Failed to load refresh token from sheet:', err.message);
+  }
+  return null;
+}
+
+async function saveRefreshTokenToSheet(token) {
+  try {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: TOKEN_SHEET_ID,
+      range: TOKEN_SHEET_RANGE,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[token]] },
+    });
+    console.log('Saved Read AI refresh token to Google Sheet');
+  } catch (err) {
+    console.error('Failed to save refresh token to sheet:', err.message);
+  }
+}
+
 async function refreshReadAiToken() {
-  if (!readAiTokens || !readAiOauthState) return null;
-  const refreshToken = readAiTokens.refresh_token;
+  if (!readAiOauthState) return null;
+
+  // Try in-memory token first, then sheet, then env var
+  let refreshToken = readAiTokens?.refresh_token;
+  if (!refreshToken) {
+    refreshToken = await loadRefreshTokenFromSheet();
+  }
+  if (!refreshToken) {
+    refreshToken = process.env.READ_AI_REFRESH_TOKEN;
+  }
   if (!refreshToken) return null;
 
   const clientId = readAiOauthState.client_id;
@@ -147,11 +189,16 @@ async function refreshReadAiToken() {
     });
 
     if (payload.access_token) {
+      if (!readAiTokens) readAiTokens = {};
       readAiTokens.access_token = payload.access_token;
-      if (payload.refresh_token) readAiTokens.refresh_token = payload.refresh_token;
-      // Persist locally if possible
-      if (fs.existsSync(path.dirname(readAiTokensPath))) {
-        fs.writeFileSync(readAiTokensPath, JSON.stringify(readAiTokens, null, 2));
+      if (payload.refresh_token) {
+        readAiTokens.refresh_token = payload.refresh_token;
+        // Persist to Google Sheet so it survives Railway redeploys
+        await saveRefreshTokenToSheet(payload.refresh_token);
+        // Also persist locally if possible
+        if (fs.existsSync(path.dirname(readAiTokensPath))) {
+          fs.writeFileSync(readAiTokensPath, JSON.stringify(readAiTokens, null, 2));
+        }
       }
       console.log('Read AI token refreshed');
       return payload.access_token;
@@ -165,13 +212,12 @@ async function refreshReadAiToken() {
 }
 
 async function readAiRequest(endpoint, retried = false) {
-  if (!readAiTokens) return { error: 'Read AI not configured' };
+  if (!readAiTokens && !readAiOauthState) return { error: 'Read AI not configured' };
   const url = `https://api.read.ai/v1${endpoint}`;
   try {
     // Always refresh token before making a request to avoid stale token issues
-    if (!retried) {
-      await refreshReadAiToken();
-    }
+    await refreshReadAiToken();
+    if (!readAiTokens?.access_token) return { error: 'Failed to get Read AI access token' };
     const result = await httpRequest(url, {
       method: 'GET',
       headers: {
