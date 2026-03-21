@@ -658,6 +658,14 @@ app.event('message', async ({ event, say }) => {
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
 
+  // Refresh Read AI token every 5 minutes to keep it alive
+  if (readAiTokens && readAiOauthState) {
+    setInterval(async () => {
+      const token = await refreshReadAiToken();
+      if (token) console.log('Read AI token auto-refreshed');
+    }, 5 * 60 * 1000);
+  }
+
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
