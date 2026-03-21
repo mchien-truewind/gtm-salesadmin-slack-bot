@@ -649,4 +649,13 @@ app.event('message', async ({ event, say }) => {
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
   console.log(`  Read AI: ${readAiTokens ? 'ready' : 'NOT CONFIGURED'}`);
+
+  // Health check server for Railway (needs a port to know the service is alive)
+  const PORT = process.env.PORT || 3000;
+  http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('ok');
+  }).listen(PORT, () => {
+    console.log(`  Health check on port ${PORT}`);
+  });
 })();
