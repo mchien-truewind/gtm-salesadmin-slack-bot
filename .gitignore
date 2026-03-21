@@ -21,3 +21,15 @@ secrets/*.json
 # Python cache
 __pycache__/
 *.pyc
+
+# Node
+node_modules/
+
+# CSV exports
+*.csv
+
+# MCP config (contains tokens)
+.mcp.json
+
+# Playwright
+.playwright-mcp/
