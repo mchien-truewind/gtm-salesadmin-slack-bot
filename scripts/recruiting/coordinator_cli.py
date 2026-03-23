@@ -121,6 +121,7 @@ DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
     "roleplay,role play,chat transcript,complete the following,next step in the process,within the next 48 hours"
 )
+AUTO_ARCHIVE_SENDER_EMAILS = {"drew.katnik@cybercoders.com"}
 
 _DOCLING_CONVERTER: Any | None = None
 _DOCLING_CHECKED = False
@@ -705,6 +706,10 @@ def build_notion_value(prop_schema: dict[str, Any], value: Any) -> dict[str, Any
 
 def normalize_email(value: str) -> str:
     return value.strip().lower()
+
+
+def should_auto_archive_sender(sender_email: str) -> bool:
+    return normalize_email(sender_email) in AUTO_ARCHIVE_SENDER_EMAILS
 
 
 def header_map(message: dict[str, Any]) -> dict[str, str]:
@@ -1569,7 +1574,7 @@ def canonicalize_truewind_role(raw_value: str) -> str:
     stripped = clean_text(stripped).strip("-:|,;")
     if not stripped:
         return "Unknown"
-    return "Unknown"
+    return "Other"
 
 
 def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> tuple[str, str] | None:
@@ -2829,7 +2834,7 @@ def require_notion_property(
     return properties[prop_name]
 
 
-ROLE_OPTIONS = ("BDR", "Growth Generalist")
+ROLE_OPTIONS = ("BDR", "Growth Generalist", "Other")
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process")
 
 
@@ -3204,6 +3209,12 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         if candidate_domain in internal_domains:
             skipped += 1
             continue
+        if should_auto_archive_sender(candidate_email):
+            remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=[label_id])
+            skipped += 1
+            continue
+
+        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
         parsed_subject = parse_required_subject(subject, candidate_name)
         if not parsed_subject:
@@ -3212,6 +3223,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             continue
         role, subject_candidate_name = parsed_subject
         candidate_name = subject_candidate_name
+        if role == "Unknown":
+            role = canonicalize_truewind_role(thread_body_text)
 
         if not candidate_email:
             skipped += 1
@@ -3227,7 +3240,6 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             attachment_message_id, resume_part = resume_reference
 
         resume_link = extract_resume_link_from_thread(thread)
-        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
         filename = (resume_part.get("filename") or "resume").strip() if resume_part else "resume"
         raw = b""
