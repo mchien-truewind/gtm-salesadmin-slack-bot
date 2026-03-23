@@ -3,10 +3,10 @@ name: Daily Lead Progress
 on:
   schedule:
     # Two UTC schedules for DST handling.
-    # Daily report for local Monday-Saturday at ~6 PM PT.
-    # (UTC Tue-Sun because local PT date is previous day for 01/02 UTC.)
-    - cron: "7 1 * * 0,2-6"
-    - cron: "7 2 * * 0,2-6"
+    # Daily report for local Sunday-Saturday at ~6 PM PT.
+    # (UTC runs are daily; local PT date can be previous day for 01/02 UTC.)
+    - cron: "7 1 * * *"
+    - cron: "7 2 * * *"
     # Weekly report for local Sunday at ~11:59 PM PT (UTC Monday).
     - cron: "57 6 * * 1"
     - cron: "57 7 * * 1"
@@ -62,7 +62,7 @@ jobs:
           fi
 
           case "${INPUT_SCHEDULE}" in
-            "7 1 * * 0,2-6"|"7 2 * * 0,2-6")
+            "7 1 * * *"|"7 2 * * *")
               echo "should_run=true" >> "$GITHUB_OUTPUT"
               echo "report_mode=daily" >> "$GITHUB_OUTPUT"
               ;;
