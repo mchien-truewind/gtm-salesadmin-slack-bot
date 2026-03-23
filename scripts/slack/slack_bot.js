@@ -838,21 +838,20 @@ app.event('message', async ({ event, say }) => {
 // ============================================================
 // Daily Discovery Call Digest
 // ============================================================
-const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'C066P0YFF6Z'; // #slack-testing default
+const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'C08GM9QL7QC'; // #gtm-general
 
 async function runDiscoveryDigest(channelOverride) {
   const channel = channelOverride || DISCOVERY_DIGEST_CHANNEL;
   console.log('Running discovery call digest...');
 
-  // Get yesterday's date range in PT
+  // Get today's date range in PT (runs at 4 PM, so today's calls are done)
   const now = new Date();
-  const ptOffset = -7; // PDT; adjust to -8 for PST if needed
+  const ptOffset = -8; // PST
   const ptNow = new Date(now.getTime() + ptOffset * 3600 * 1000);
-  const yesterday = new Date(ptNow);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const startOfDay = new Date(Date.UTC(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate(), -ptOffset, 0, 0));
-  const endOfDay = new Date(Date.UTC(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate() + 1, -ptOffset, 0, 0));
-  const dateLabel = yesterday.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+  const today = new Date(ptNow);
+  const startOfDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), -ptOffset, 0, 0));
+  const endOfDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1, -ptOffset, 0, 0));
+  const dateLabel = today.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
 
   try {
     // 1. Query HubSpot meetings where body contains "intro" and start time = yesterday
@@ -899,19 +898,19 @@ async function runDiscoveryDigest(channelOverride) {
 
     // 4. Fetch Read.ai meetings for the same day using date filter
     await refreshReadAiToken();
-    let readAiYesterday = [];
+    let readAiToday = [];
     if (readAiTokens?.access_token) {
-      const dateStr = yesterday.toISOString().slice(0, 10);
-      const nextDateStr = new Date(yesterday.getTime() + 86400000).toISOString().slice(0, 10);
+      const dateStr = today.toISOString().slice(0, 10);
+      const nextDateStr = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
       const rRes = await readAiRequest(`/meetings?limit=10&start_date=${dateStr}&end_date=${nextDateStr}`);
-      readAiYesterday = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
+      readAiToday = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
     }
 
     // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
     const matchedReadAiIds = new Set();
     for (const meeting of scheduled) {
       const hsStart = new Date(meeting.properties.hs_meeting_start_time).getTime();
-      const matched = readAiYesterday.find(rm => {
+      const matched = readAiToday.find(rm => {
         const rmStart = rm.start_time_ms || 0;
         return Math.abs(rmStart - hsStart) < 30 * 60 * 1000;
       });
@@ -939,7 +938,7 @@ async function runDiscoveryDigest(channelOverride) {
       'follow up', 'follow-up', 'proposal', 'review', 'onboarding',
       'kickoff', 'kick-off', 'training', 'internal', 'weekly', 'daily',
     ];
-    const unmatched = readAiYesterday.filter(rm => !matchedReadAiIds.has(rm.id));
+    const unmatched = readAiToday.filter(rm => !matchedReadAiIds.has(rm.id));
     for (const rm of unmatched) {
       const title = (rm.title || rm.name || '').toLowerCase();
       // Skip if title matches internal patterns
@@ -1117,14 +1116,18 @@ QUOTE: "..." -- [Speaker Name]`,
   }
 }
 
-// Schedule daily at 9 AM PT (16:00 UTC during PDT, 17:00 during PST)
+// Schedule weekdays at 4 PM PST (00:00 UTC next day during PST, 23:00 UTC during PDT)
 function scheduleDiscoveryDigest() {
-  const TARGET_HOUR_UTC = 16; // 9 AM PDT
+  const TARGET_HOUR_UTC = 0; // 4 PM PST = 00:00 UTC next day
   function msUntilNext() {
     const now = new Date();
     const next = new Date(now);
     next.setUTCHours(TARGET_HOUR_UTC, 0, 0, 0);
     if (next <= now) next.setDate(next.getDate() + 1);
+    // Skip weekends (0=Sun, 6=Sat) -- digest runs Mon-Fri for today's calls
+    while (next.getUTCDay() === 0 || next.getUTCDay() === 6) {
+      next.setDate(next.getDate() + 1);
+    }
     return next - now;
   }
   function run() {
