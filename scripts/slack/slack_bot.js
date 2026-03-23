@@ -835,6 +835,324 @@ app.event('message', async ({ event, say }) => {
   await handleMessage(event.text, threadTs, event.channel, isThread, say);
 });
 
+// ============================================================
+// Daily Discovery Call Digest
+// ============================================================
+const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'C066P0YFF6Z'; // #slack-testing default
+
+async function runDiscoveryDigest(channelOverride) {
+  const channel = channelOverride || DISCOVERY_DIGEST_CHANNEL;
+  console.log('Running discovery call digest...');
+
+  // Get yesterday's date range in PT
+  const now = new Date();
+  const ptOffset = -7; // PDT; adjust to -8 for PST if needed
+  const ptNow = new Date(now.getTime() + ptOffset * 3600 * 1000);
+  const yesterday = new Date(ptNow);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const startOfDay = new Date(Date.UTC(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate(), -ptOffset, 0, 0));
+  const endOfDay = new Date(Date.UTC(yesterday.getUTCFullYear(), yesterday.getUTCMonth(), yesterday.getUTCDate() + 1, -ptOffset, 0, 0));
+  const dateLabel = yesterday.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+
+  try {
+    // 1. Query HubSpot meetings where body contains "intro" and start time = yesterday
+    const meetingsRes = await hubspotRequest('/crm/v3/objects/meetings/search', 'POST', {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'hs_meeting_body', operator: 'CONTAINS_TOKEN', value: 'intro' },
+          { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: startOfDay.toISOString() },
+          { propertyName: 'hs_meeting_start_time', operator: 'LT', value: endOfDay.toISOString() },
+        ],
+      }],
+      properties: ['hs_meeting_title', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hs_meeting_body'],
+      limit: 50,
+    });
+
+    const meetings = meetingsRes.results || [];
+
+    // 2. Split into canceled vs scheduled
+    const canceled = meetings.filter(m => (m.properties.hs_meeting_title || '').startsWith('Canceled:'));
+    const scheduled = meetings.filter(m => !(m.properties.hs_meeting_title || '').startsWith('Canceled:'));
+
+    // 3. Get associated contacts for each scheduled meeting
+    for (const meeting of scheduled) {
+      try {
+        const assocRes = await hubspotRequest(`/crm/v4/objects/meetings/${meeting.id}/associations/contacts`);
+        const contactIds = (assocRes.results || []).map(r => r.toObjectId);
+        meeting._contactIds = contactIds;
+
+        if (contactIds.length > 0) {
+          const contacts = [];
+          for (const cid of contactIds.slice(0, 5)) {
+            const c = await hubspotRequest(`/crm/v3/objects/contacts/${cid}?properties=firstname,lastname,email,company,jobtitle`);
+            if (c.id) contacts.push(c.properties);
+          }
+          meeting._contacts = contacts;
+          meeting._externalContacts = contacts.filter(c => c.email && !c.email.endsWith('@trytruewind.com'));
+        }
+      } catch (err) {
+        console.error(`Failed to get contacts for meeting ${meeting.id}:`, err.message);
+        meeting._contacts = [];
+        meeting._externalContacts = [];
+      }
+    }
+
+    // 4. Fetch Read.ai meetings for the same day
+    await refreshReadAiToken();
+    let readAiMeetings = [];
+    if (readAiTokens?.access_token) {
+      // Paginate to get enough meetings to cover the day
+      let cursor = null;
+      for (let page = 0; page < 5; page++) {
+        const endpoint = cursor ? `/meetings?limit=10&cursor=${cursor}` : '/meetings?limit=10';
+        const rRes = await readAiRequest(endpoint);
+        const items = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
+        if (items.length === 0) break;
+        readAiMeetings.push(...items);
+        // Stop if we've gone past yesterday
+        const lastItem = items[items.length - 1];
+        const lastStart = lastItem.start_time_ms || 0;
+        if (lastStart && lastStart < startOfDay.getTime()) break;
+        cursor = rRes.next_cursor || rRes.cursor || rRes.next || rRes.next_page_token;
+        if (!cursor) break;
+      }
+    }
+
+    // Filter Read.ai meetings to yesterday's date range
+    const readAiYesterday = readAiMeetings.filter(rm => {
+      const rmStart = rm.start_time_ms || 0;
+      return rmStart >= startOfDay.getTime() && rmStart < endOfDay.getTime();
+    });
+
+    // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
+    const matchedReadAiIds = new Set();
+    for (const meeting of scheduled) {
+      const hsStart = new Date(meeting.properties.hs_meeting_start_time).getTime();
+      const matched = readAiYesterday.find(rm => {
+        const rmStart = rm.start_time_ms || 0;
+        return Math.abs(rmStart - hsStart) < 30 * 60 * 1000;
+      });
+      if (matched) {
+        meeting._readAiId = matched.id;
+        meeting._readAiUrl = matched.report_url || `https://app.read.ai/analytics/meetings/${matched.id}`;
+        matchedReadAiIds.add(matched.id);
+        try {
+          const params = new URLSearchParams([['expand[]', 'summary'], ['expand[]', 'transcript']]);
+          const detail = await readAiRequest(`/meetings/${matched.id}?${params}`);
+          if (!detail.error) {
+            meeting._summary = typeof detail.summary === 'object' ? detail.summary.overview : detail.summary;
+            meeting._transcript = detail.transcript;
+          }
+        } catch (err) {
+          console.error(`Failed to fetch Read.ai detail for ${matched.id}:`, err.message);
+        }
+      }
+    }
+
+    // 5. Read.ai fallback: find discovery calls not booked through Calendly
+    const EXCLUDE_PATTERNS = [
+      'retro', 'role play', 'check in', 'check-in', 'standup', 'stand-up',
+      'sync', '1:1', 'team', 'sprint', 'metrics', 'demo', 'all hands',
+      'follow up', 'follow-up', 'proposal', 'review', 'onboarding',
+      'kickoff', 'kick-off', 'training', 'internal', 'weekly', 'daily',
+    ];
+    const unmatched = readAiYesterday.filter(rm => !matchedReadAiIds.has(rm.id));
+    for (const rm of unmatched) {
+      const title = (rm.title || rm.name || '').toLowerCase();
+      // Skip if title matches internal patterns
+      if (EXCLUDE_PATTERNS.some(pat => title.includes(pat))) continue;
+      // Check participants for external emails
+      const participants = rm.participants || rm.attendees || [];
+      const emails = participants.map(p => (p.email || '')).filter(Boolean);
+      const hasExternal = emails.some(e => e && !e.endsWith('@trytruewind.com'));
+      if (!hasExternal) continue;
+
+      // This is likely a discovery call missed by HubSpot -- add it as a scheduled meeting
+      const externalParticipants = participants.filter(p => p.email && !p.email.endsWith('@trytruewind.com'));
+      const fallbackMeeting = {
+        id: `readai_${rm.id}`,
+        properties: {
+          hs_meeting_title: rm.title || rm.name || 'Unknown',
+          hs_meeting_start_time: rm.start_time_ms ? new Date(rm.start_time_ms).toISOString() : '',
+        },
+        _readAiId: rm.id,
+        _readAiUrl: rm.report_url || `https://app.read.ai/analytics/meetings/${rm.id}`,
+        _contacts: [],
+        _externalContacts: [],
+        _fromFallback: true,
+      };
+
+      // Try to resolve external participants from HubSpot
+      for (const p of externalParticipants.slice(0, 3)) {
+        if (!p.email) continue;
+        try {
+          const searchRes = await hubspotRequest('/crm/v3/objects/contacts/search', 'POST', {
+            filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: p.email }] }],
+            properties: ['firstname', 'lastname', 'email', 'company', 'jobtitle'],
+            limit: 1,
+          });
+          if (searchRes.results?.length > 0) {
+            fallbackMeeting._externalContacts.push(searchRes.results[0].properties);
+          } else {
+            // Use Read.ai participant info as fallback
+            fallbackMeeting._externalContacts.push({
+              firstname: p.name || '', lastname: '', email: p.email,
+              company: '', jobtitle: '',
+            });
+          }
+        } catch (err) {
+          fallbackMeeting._externalContacts.push({
+            firstname: p.name || '', lastname: '', email: p.email,
+            company: '', jobtitle: '',
+          });
+        }
+      }
+
+      // Fetch transcript
+      try {
+        const params = new URLSearchParams([['expand[]', 'summary'], ['expand[]', 'transcript']]);
+        const detail = await readAiRequest(`/meetings/${rm.id}?${params}`);
+        if (!detail.error) {
+          fallbackMeeting._summary = typeof detail.summary === 'object' ? detail.summary.overview : detail.summary;
+          fallbackMeeting._transcript = detail.transcript;
+        }
+      } catch (err) {
+        console.error(`Failed to fetch Read.ai fallback detail for ${rm.id}:`, err.message);
+      }
+
+      scheduled.push(fallbackMeeting);
+    }
+
+    // 6. Determine no-shows: no Read.ai match, OR Read.ai match but no transcript/summary
+    const hasContent = (m) => m._readAiId && (m._summary || (m._transcript && (m._transcript.turns?.length > 0 || typeof m._transcript === 'string')));
+    const completed = scheduled.filter(m => hasContent(m));
+    const noShows = scheduled.filter(m => !hasContent(m));
+
+    if (scheduled.length === 0 && canceled.length === 0) {
+      await app.client.chat.postMessage({
+        token: process.env.SLACK_BOT_TOKEN,
+        channel,
+        text: `*Discovery Call Digest -- ${dateLabel}*\n\nNo discovery calls were scheduled yesterday.`,
+      });
+      console.log('No discovery calls yesterday.');
+      return;
+    }
+
+    // 6. Use Claude to extract takeaways and quotes from completed calls
+    for (const meeting of completed) {
+      if (!meeting._transcript) continue;
+      const transcript = meeting._transcript;
+      let transcriptText = '';
+      if (transcript && transcript.turns) {
+        transcriptText = transcript.turns.slice(0, 100).map(t =>
+          `${t.speaker?.name || '?'}: ${t.text}`
+        ).join('\n');
+      } else if (typeof transcript === 'string') {
+        transcriptText = transcript.slice(0, 5000);
+      }
+      if (!transcriptText && meeting._summary) {
+        transcriptText = meeting._summary;
+      }
+      if (!transcriptText) continue;
+
+      try {
+        const claudeRes = await anthropic.messages.create({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 500,
+          system: `You extract key takeaways and pain point quotes from sales discovery call transcripts. Be concise. Never use em dashes.`,
+          messages: [{
+            role: 'user',
+            content: `Extract from this discovery call transcript:
+1. One-line takeaway (what the prospect needs/their situation)
+2. One direct quote that illustrates their pain point (exact words from the transcript, with the speaker's name)
+
+Transcript:
+${transcriptText.slice(0, 4000)}
+
+Reply in this exact format:
+TAKEAWAY: ...
+QUOTE: "..." -- [Speaker Name]`,
+          }],
+        });
+        const text = claudeRes.content.find(b => b.type === 'text')?.text || '';
+        const takeawayMatch = text.match(/TAKEAWAY:\s*(.+)/);
+        const quoteMatch = text.match(/QUOTE:\s*(.+)/);
+        meeting._takeaway = takeawayMatch ? takeawayMatch[1].trim() : null;
+        meeting._quote = quoteMatch ? quoteMatch[1].trim() : null;
+      } catch (err) {
+        console.error(`Claude extraction failed for meeting ${meeting.id}:`, err.message);
+      }
+    }
+
+    // 7. Format and post
+    let msg = `*Discovery Call Digest -- ${dateLabel}*\n\n`;
+    msg += `Scheduled: ${scheduled.length + canceled.length}\n`;
+    msg += `Completed: ${completed.length}\n`;
+    msg += `No-shows: ${noShows.length}`;
+    if (noShows.length > 0) {
+      const noShowNames = noShows.map(m => {
+        const ext = (m._externalContacts || [])[0];
+        const name = ext ? `${ext.firstname || ''} ${ext.lastname || ''}`.trim() : (m.properties.hs_meeting_title || 'Unknown');
+        const co = ext?.company || '';
+        return co ? `${name} (${co})` : name;
+      });
+      msg += ` -- ${noShowNames.join(', ')}`;
+    }
+    msg += `\nCanceled: ${canceled.length}`;
+    if (canceled.length > 0) {
+      const cancelNames = canceled.map(m => (m.properties.hs_meeting_title || '').replace('Canceled: ', '').replace(' and Sarah Elix', ''));
+      msg += ` -- ${cancelNames.join(', ')}`;
+    }
+    msg += '\n';
+
+    for (const meeting of completed) {
+      const ext = (meeting._externalContacts || [])[0];
+      const name = ext ? `${ext.firstname || ''} ${ext.lastname || ''}`.trim() : 'Unknown';
+      const title = ext?.jobtitle || '';
+      const company = ext?.company || '';
+      const header = [name, title, company].filter(Boolean).join(' | ');
+
+      msg += `\n---\n*${header}*\n`;
+      if (meeting._takeaway) msg += `Takeaway: ${meeting._takeaway}\n`;
+      if (meeting._quote) msg += `Pain quote: ${meeting._quote}\n`;
+      if (meeting._readAiUrl) msg += `Transcript: ${meeting._readAiUrl}\n`;
+    }
+
+    await app.client.chat.postMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel,
+      text: msg,
+    });
+    console.log('Discovery digest posted.');
+  } catch (err) {
+    console.error('Discovery digest error:', err.message);
+    await app.client.chat.postMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel,
+      text: `Discovery digest failed: ${err.message}`,
+    });
+  }
+}
+
+// Schedule daily at 9 AM PT (16:00 UTC during PDT, 17:00 during PST)
+function scheduleDiscoveryDigest() {
+  const TARGET_HOUR_UTC = 16; // 9 AM PDT
+  function msUntilNext() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setUTCHours(TARGET_HOUR_UTC, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+  function run() {
+    runDiscoveryDigest();
+    setTimeout(run, msUntilNext());
+  }
+  setTimeout(run, msUntilNext());
+  const nextRun = new Date(Date.now() + msUntilNext());
+  console.log(`  Discovery digest scheduled, next run: ${nextRun.toISOString()}`);
+}
+
 (async () => {
   await app.start();
   console.log('Slack bot is running in socket mode');
@@ -842,12 +1160,26 @@ app.event('message', async ({ event, say }) => {
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
   console.log(`  Read AI: ${readAiTokens ? 'ready (will refresh on first request)' : 'NOT CONFIGURED'}`);
 
+  // Schedule daily discovery digest
+  scheduleDiscoveryDigest();
+
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
+    if (req.url === '/run-digest') {
+      runDiscoveryDigest();
+      res.writeHead(200);
+      res.end('Digest triggered');
+      return;
+    }
     res.writeHead(200);
     res.end('ok');
   }).listen(PORT, () => {
     console.log(`  Health check on port ${PORT}`);
   });
+
+  // Allow manual trigger via CLI: node slack_bot.js --run-digest
+  if (process.argv.includes('--run-digest')) {
+    await runDiscoveryDigest();
+  }
 })();
