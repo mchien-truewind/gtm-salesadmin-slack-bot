@@ -154,15 +154,16 @@ async function saveRefreshTokenToSheet(token) {
 async function refreshReadAiToken() {
   if (!readAiOauthState) return null;
 
-  // Try in-memory token first, then sheet, then env var
-  let refreshToken = readAiTokens?.refresh_token;
+  // Try sheet first (most up-to-date), then in-memory, then env var
+  let refreshToken = await loadRefreshTokenFromSheet();
   if (!refreshToken) {
-    refreshToken = await loadRefreshTokenFromSheet();
+    refreshToken = readAiTokens?.refresh_token;
   }
   if (!refreshToken) {
     refreshToken = process.env.READ_AI_REFRESH_TOKEN;
   }
   if (!refreshToken) return null;
+  console.log('Using refresh token:', refreshToken.slice(0, 20) + '...');
 
   const clientId = readAiOauthState.client_id;
   const clientSecret = readAiOauthState.client_secret;
