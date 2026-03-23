@@ -897,32 +897,15 @@ async function runDiscoveryDigest(channelOverride) {
       }
     }
 
-    // 4. Fetch Read.ai meetings for the same day
+    // 4. Fetch Read.ai meetings for the same day using date filter
     await refreshReadAiToken();
-    let readAiMeetings = [];
+    let readAiYesterday = [];
     if (readAiTokens?.access_token) {
-      // Paginate to get enough meetings to cover the day
-      let cursor = null;
-      for (let page = 0; page < 5; page++) {
-        const endpoint = cursor ? `/meetings?limit=10&cursor=${cursor}` : '/meetings?limit=10';
-        const rRes = await readAiRequest(endpoint);
-        const items = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
-        if (items.length === 0) break;
-        readAiMeetings.push(...items);
-        // Stop if we've gone past yesterday
-        const lastItem = items[items.length - 1];
-        const lastStart = lastItem.start_time_ms || 0;
-        if (lastStart && lastStart < startOfDay.getTime()) break;
-        cursor = rRes.next_cursor || rRes.cursor || rRes.next || rRes.next_page_token;
-        if (!cursor) break;
-      }
+      const dateStr = yesterday.toISOString().slice(0, 10);
+      const nextDateStr = new Date(yesterday.getTime() + 86400000).toISOString().slice(0, 10);
+      const rRes = await readAiRequest(`/meetings?limit=10&start_date=${dateStr}&end_date=${nextDateStr}`);
+      readAiYesterday = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
     }
-
-    // Filter Read.ai meetings to yesterday's date range
-    const readAiYesterday = readAiMeetings.filter(rm => {
-      const rmStart = rm.start_time_ms || 0;
-      return rmStart >= startOfDay.getTime() && rmStart < endOfDay.getTime();
-    });
 
     // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
     const matchedReadAiIds = new Set();
