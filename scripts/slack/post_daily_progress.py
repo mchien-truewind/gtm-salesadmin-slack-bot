@@ -148,15 +148,18 @@ def pick_report_mode(now_local: datetime, force_mode: str) -> str:
 
 
 def defer_reason(now_local: datetime, mode: str) -> str:
-    # Never post before end-of-day windows.
-    if mode == "daily" and now_local.hour < 17:
-        return "daily post deferred until 5 PM local time"
-    # Weekly summary should only post late Sunday night local time.
+    # Daily posts are allowed Monday-Saturday after 5 PM local time.
+    if mode == "daily":
+        if now_local.weekday() == 6:
+            return "daily post deferred on Sunday so weekly mode can run"
+        if now_local.hour < 17:
+            return "daily post deferred until 5 PM local time"
+    # Weekly summary should only post on Sunday after 5 PM local time.
     if mode == "weekly":
         if now_local.weekday() != 6:
             return "weekly post deferred because local day is not Sunday"
-        if now_local.hour < 23:
-            return "weekly post deferred until 11 PM local time"
+        if now_local.hour < 17:
+            return "weekly post deferred until 5 PM local time"
     return ""
 
 

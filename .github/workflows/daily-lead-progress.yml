@@ -64,7 +64,7 @@ jobs:
           case "${INPUT_SCHEDULE}" in
             "7 1 * * *"|"7 2 * * *")
               echo "should_run=true" >> "$GITHUB_OUTPUT"
-              echo "report_mode=daily" >> "$GITHUB_OUTPUT"
+              echo "report_mode=" >> "$GITHUB_OUTPUT"
               ;;
             "57 6 * * 1"|"57 7 * * 1")
               echo "should_run=true" >> "$GITHUB_OUTPUT"

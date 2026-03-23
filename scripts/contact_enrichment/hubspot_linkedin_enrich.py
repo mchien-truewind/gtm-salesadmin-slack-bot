@@ -25,10 +25,14 @@ from urllib import error, parse, request
 
 
 def load_env_defaults() -> None:
-    for candidate in (Path(".env.local"), Path(".env")):
+    import re
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    for candidate in (repo_root / ".env.local", repo_root / ".env", Path(".env.local"), Path(".env")):
         if not candidate.exists():
             continue
-        for raw in candidate.read_text(encoding="utf-8").splitlines():
+        raw_text = candidate.read_text(encoding="utf-8")
+        raw_text = re.sub(r"\n=", "=", raw_text)  # merge continuation lines
+        for raw in raw_text.splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -38,6 +42,7 @@ def load_env_defaults() -> None:
                 continue
             value = value.strip().strip('"').strip("'")
             os.environ[key] = value
+        break
 
 
 # ---------------------------------------------------------------------------

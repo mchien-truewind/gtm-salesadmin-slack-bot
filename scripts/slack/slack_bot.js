@@ -356,6 +356,103 @@ const TOOLS = [
       properties: {},
     },
   },
+  // --- HubSpot write tools ---
+  {
+    name: 'hubspot_create_contact',
+    description: 'Create a new contact in HubSpot. Returns the new contact ID and properties.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Contact email address (required)' },
+        firstname: { type: 'string', description: 'First name' },
+        lastname: { type: 'string', description: 'Last name' },
+        company: { type: 'string', description: 'Company name' },
+        jobtitle: { type: 'string', description: 'Job title' },
+        phone: { type: 'string', description: 'Phone number' },
+        properties: {
+          type: 'object',
+          description: 'Additional properties as key-value pairs (e.g. lifecyclestage, contact_type, hubspot_owner_id, linkedin___profile, lead_source, enterprise_smb_industry)',
+        },
+      },
+      required: ['email'],
+    },
+  },
+  {
+    name: 'hubspot_update_contact',
+    description: 'Update an existing HubSpot contact by ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string', description: 'The contact ID to update' },
+        properties: {
+          type: 'object',
+          description: 'Properties to update as key-value pairs',
+        },
+      },
+      required: ['contact_id', 'properties'],
+    },
+  },
+  {
+    name: 'hubspot_create_deal',
+    description: 'Create a new deal in HubSpot. Active Pipeline ID is 105321581. Stages: MQL=1307720553, SQL=190380582, Full Product Demo=190380583, POC=190380586, Proposal=190380584, Won=1166230571, Closed/Lost=190380587.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        dealname: { type: 'string', description: 'Deal name' },
+        pipeline: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581)' },
+        dealstage: { type: 'string', description: 'Stage ID' },
+        amount: { type: 'number', description: 'Deal amount' },
+        properties: {
+          type: 'object',
+          description: 'Additional properties (e.g. hubspot_owner_id, closedate)',
+        },
+      },
+      required: ['dealname', 'dealstage'],
+    },
+  },
+  {
+    name: 'hubspot_update_deal',
+    description: 'Update an existing HubSpot deal by ID.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'The deal ID to update' },
+        properties: {
+          type: 'object',
+          description: 'Properties to update as key-value pairs',
+        },
+      },
+      required: ['deal_id', 'properties'],
+    },
+  },
+  {
+    name: 'hubspot_create_association',
+    description: 'Associate two HubSpot records. Common type IDs: contact_to_company=279, deal_to_contact=3, deal_to_company=341, contact_to_deal=4.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from_type: { type: 'string', description: 'Source object type (contacts, companies, deals)' },
+        from_id: { type: 'string', description: 'Source object ID' },
+        to_type: { type: 'string', description: 'Target object type (contacts, companies, deals)' },
+        to_id: { type: 'string', description: 'Target object ID' },
+        association_type_id: { type: 'number', description: 'Association type ID (e.g. 279 for contact_to_company)' },
+      },
+      required: ['from_type', 'from_id', 'to_type', 'to_id', 'association_type_id'],
+    },
+  },
+  {
+    name: 'hubspot_get_associations',
+    description: 'Get associations for a HubSpot record (e.g. find all deals for a contact).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from_type: { type: 'string', description: 'Source object type (contacts, companies, deals)' },
+        from_id: { type: 'string', description: 'Source object ID' },
+        to_type: { type: 'string', description: 'Target object type (contacts, companies, deals)' },
+      },
+      required: ['from_type', 'from_id', 'to_type'],
+    },
+  },
   // --- Read AI tools ---
   {
     name: 'readai_list_meetings',
@@ -434,6 +531,46 @@ async function executeTool(name, input) {
       const res = await hubspotRequest('/crm/v3/owners/?limit=100');
       const owners = (res.results || []).map(o => ({ id: o.id, email: o.email, firstName: o.firstName, lastName: o.lastName }));
       return JSON.stringify(owners);
+    }
+
+    // --- HubSpot write ---
+    if (name === 'hubspot_create_contact') {
+      const props = { email: input.email };
+      if (input.firstname) props.firstname = input.firstname;
+      if (input.lastname) props.lastname = input.lastname;
+      if (input.company) props.company = input.company;
+      if (input.jobtitle) props.jobtitle = input.jobtitle;
+      if (input.phone) props.phone = input.phone;
+      if (input.properties) Object.assign(props, input.properties);
+      const res = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: props });
+      return JSON.stringify({ id: res.id, url: `https://app.hubspot.com/contacts/43974586/record/0-1/${res.id}`, ...res.properties });
+    }
+    if (name === 'hubspot_update_contact') {
+      const res = await hubspotRequest(`/crm/v3/objects/contacts/${input.contact_id}`, 'PATCH', { properties: input.properties });
+      return JSON.stringify({ id: res.id, ...res.properties });
+    }
+    if (name === 'hubspot_create_deal') {
+      const props = { dealname: input.dealname, dealstage: input.dealstage, pipeline: input.pipeline || '105321581' };
+      if (input.amount) props.amount = String(input.amount);
+      if (input.properties) Object.assign(props, input.properties);
+      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: props });
+      return JSON.stringify({ id: res.id, url: `https://app.hubspot.com/contacts/43974586/record/0-3/${res.id}`, ...res.properties });
+    }
+    if (name === 'hubspot_update_deal') {
+      const res = await hubspotRequest(`/crm/v3/objects/deals/${input.deal_id}`, 'PATCH', { properties: input.properties });
+      return JSON.stringify({ id: res.id, ...res.properties });
+    }
+    if (name === 'hubspot_create_association') {
+      const res = await hubspotRequest(
+        `/crm/v4/objects/${input.from_type}/${input.from_id}/associations/${input.to_type}/${input.to_id}`,
+        'PUT',
+        [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: input.association_type_id }]
+      );
+      return JSON.stringify(res);
+    }
+    if (name === 'hubspot_get_associations') {
+      const res = await hubspotRequest(`/crm/v4/objects/${input.from_type}/${input.from_id}/associations/${input.to_type}`);
+      return JSON.stringify(res.results || []);
     }
 
     // --- Read AI ---

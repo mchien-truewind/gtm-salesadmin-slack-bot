@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import sys
 from difflib import SequenceMatcher
 from collections import Counter
 from dataclasses import dataclass
@@ -232,10 +233,15 @@ NO_REPLY_NOTIFICATION_DOMAINS = {
 
 FORCE_ARCHIVE_SENDERS = {
     "drew.katnik@cybercoders.com",
+    "lavneesh@google.com",
 }
 
 ALWAYS_REPLY_SENDERS = {
     "mbaske@linkedin.com",
+}
+
+FORCE_CONFERENCE_SENDERS = {
+    "sagesponsorship@sage.com",
 }
 
 TRANSACTIONAL_SUBJECT_KEYWORDS = [
@@ -424,6 +430,32 @@ def save_credentials(path: Path, creds: Any) -> None:
     path.write_text(creds.to_json(), encoding="utf-8")
 
 
+class CredentialRefreshNetworkError(RuntimeError):
+    """Raised when token refresh fails due to transient network/DNS issues."""
+
+
+def is_likely_network_error(exc: Exception) -> bool:
+    cursor: Exception | None = exc
+    markers = (
+        "servernotfounderror",
+        "name or service not known",
+        "nodename nor servname provided",
+        "temporary failure in name resolution",
+        "failed to establish a new connection",
+        "network is unreachable",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+    )
+    while cursor is not None:
+        blob = f"{type(cursor).__name__} {cursor}".lower()
+        if any(marker in blob for marker in markers):
+            return True
+        next_exc = cursor.__cause__ or cursor.__context__
+        cursor = next_exc if isinstance(next_exc, Exception) else None
+    return False
+
+
 def load_google_credentials(token_path: Path, scopes: list[str]):
     if not token_path.exists():
         return None
@@ -435,7 +467,11 @@ def load_google_credentials(token_path: Path, scopes: list[str]):
         try:
             creds.refresh(Request())
             save_credentials(token_path, creds)
-        except Exception:
+        except Exception as exc:
+            if is_likely_network_error(exc):
+                raise CredentialRefreshNetworkError(
+                    "Unable to refresh Gmail OAuth token due to transient network/DNS failure."
+                ) from exc
             return None
     if not creds.valid:
         return None
@@ -447,14 +483,43 @@ def run_auth_flow(credentials_path: Path, token_path: Path, scopes: list[str]):
         raise FileNotFoundError(f"Credentials file not found: {credentials_path}")
     _, _, InstalledAppFlow, _ = require_google_dependencies()
     flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), scopes)
-    creds = flow.run_local_server(port=0)
+    auth_kwargs = {
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+    }
+    try:
+        creds = flow.run_local_server(port=0, **auth_kwargs)
+    except (PermissionError, OSError) as exc:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "OAuth local callback server could not start. Run `gmail_inbox_triage.py auth` in a local interactive shell to re-auth."
+            ) from exc
+        if not hasattr(flow, "run_console"):
+            raise RuntimeError(
+                "OAuth local callback server could not start, and console fallback is unavailable in this google-auth-oauthlib version."
+            ) from exc
+        print("OAuth local callback server unavailable; falling back to console auth.")
+        creds = flow.run_console(**auth_kwargs)
     save_credentials(token_path, creds)
     return creds
 
 
 def ensure_gmail_service(credentials_path: Path, token_path: Path):
-    creds = load_google_credentials(token_path, SCOPES)
+    try:
+        creds = load_google_credentials(token_path, SCOPES)
+    except CredentialRefreshNetworkError as exc:
+        raise RuntimeError(
+            "Gmail token refresh failed due to network/DNS issues while validating OAuth credentials. "
+            "Retry when connectivity to gmail.googleapis.com is healthy."
+        ) from exc
     if not creds:
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                "No valid Gmail OAuth token available for non-interactive execution. "
+                "Re-auth once in an interactive shell with: "
+                f"`gmail_inbox_triage.py auth --credentials-file \"{credentials_path}\" --token-file \"{token_path}\"`"
+            )
         creds = run_auth_flow(credentials_path, token_path, SCOPES)
     _, _, _, build = require_google_dependencies()
     return build("gmail", "v1", credentials=creds)
@@ -789,6 +854,12 @@ def message_text(message: dict[str, Any]) -> str:
 
 
 def conference_thread_reason(thread: dict[str, Any], my_email: str) -> str | None:
+    inbound = latest_inbound_message(thread, my_email)
+    if inbound:
+        inbound_sender = normalize_email(header_map(inbound).get("from", ""))
+        if inbound_sender in FORCE_CONFERENCE_SENDERS:
+            return f"force-conference-sender:{inbound_sender}"
+
     messages = sorted_thread_messages(thread)
     haystack_chunks: list[str] = []
     for message in messages:
