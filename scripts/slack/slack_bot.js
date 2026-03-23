@@ -664,7 +664,9 @@ You have access to Read AI meeting transcripts. You can list recent meetings and
 ## General behavior
 - Keep responses short and direct
 - You receive full thread history. Use it to understand context.
-- The Slack metadata (channel_id, thread_ts, thread_date) is appended to the last message.`;
+- The Slack metadata (channel_id, thread_ts, thread_date) is appended to the last message.
+- NEVER lie or fabricate results. If a tool call fails, show the actual error message. If you cannot do something, say exactly why (e.g. missing scope, token expired, tool not available). Do NOT say "done" or "created" unless you received a successful response with an ID back from the API.
+- If a HubSpot record was just created and search can't find it, explain that HubSpot search indexing has a delay and provide the direct record ID/URL instead of claiming it doesn't exist.`;
 }
 
 // ============================================================
