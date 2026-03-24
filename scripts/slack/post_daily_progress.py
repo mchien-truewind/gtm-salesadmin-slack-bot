@@ -51,9 +51,9 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
     def pick(key: str, default: str = "") -> str:
         return os.getenv(key) or env_local.get(key) or env_file.get(key) or default
 
-    token = pick("SLACK_USER_TOKEN") or pick("SLACK_BOT_TOKEN")
+    token = pick("SLACK_BOT_TOKEN") or pick("SLACK_USER_TOKEN")
     if not token:
-        raise RuntimeError("Missing SLACK_USER_TOKEN (or SLACK_BOT_TOKEN) in env/.env.local/.env")
+        raise RuntimeError("Missing SLACK_BOT_TOKEN (or SLACK_USER_TOKEN) in env/.env.local/.env")
 
     target_override = args.target_channel.strip() if args.target_channel else ""
     return {
@@ -114,8 +114,17 @@ def resolve_public_channels(token: str, names: Iterable[str]) -> Dict[str, str]:
             return found
 
 
-def count_contains_phrase(token: str, channel_id: str, phrase: str, oldest: float, latest: float) -> int:
-    total = 0
+def collect_matching_timestamps(
+    token: str,
+    channel_id: str,
+    phrase: str,
+    oldest: float,
+    latest: float,
+    exclude_patterns: Iterable[str] = (),
+) -> list[float]:
+    """Return timestamps of messages matching phrase (excluding filtered patterns)."""
+    timestamps: list[float] = []
+    skip_patterns = [p.lower() for p in exclude_patterns]
     cursor = ""
     while True:
         payload = slack_api(
@@ -132,11 +141,16 @@ def count_contains_phrase(token: str, channel_id: str, phrase: str, oldest: floa
             use_get=True,
         )
         for msg in payload.get("messages", []):
-            if phrase in (msg.get("text") or ""):
-                total += 1
+            text = msg.get("text") or ""
+            if phrase not in text:
+                continue
+            text_lower = text.lower()
+            if any(p in text_lower for p in skip_patterns):
+                continue
+            timestamps.append(float(msg.get("ts", "0")))
         cursor = (payload.get("response_metadata") or {}).get("next_cursor", "")
         if not cursor:
-            return total
+            return timestamps
 
 
 def pick_report_mode(now_local: datetime, force_mode: str) -> str:
@@ -262,27 +276,26 @@ def compute_counts(config: Dict[str, str]) -> Tuple[datetime, int, int, int, int
     days_since_sunday = (now_local.weekday() + 1) % 7
     start_week_local = start_today_local - timedelta(days=days_since_sunday)
 
-    def count_for_window(start_local: datetime) -> Tuple[int, int]:
-        oldest = start_local.astimezone(timezone.utc).timestamp()
-        latest = now_local.astimezone(timezone.utc).timestamp()
-        inbound = count_contains_phrase(
-            token,
-            channels[config["inbound_channel"]],
-            config["inbound_phrase"],
-            oldest,
-            latest,
-        )
-        outbound = count_contains_phrase(
-            token,
-            channels[config["outbound_channel"]],
-            config["outbound_phrase"],
-            oldest,
-            latest,
-        )
-        return inbound, outbound
+    week_oldest = start_week_local.astimezone(timezone.utc).timestamp()
+    today_oldest = start_today_local.astimezone(timezone.utc).timestamp()
+    latest = now_local.astimezone(timezone.utc).timestamp()
 
-    today_inbound, today_outbound = count_for_window(start_today_local)
-    week_inbound, week_outbound = count_for_window(start_week_local)
+    # Fetch the full week window once per channel, then split into today vs week.
+    inbound_ts = collect_matching_timestamps(
+        token, channels[config["inbound_channel"]],
+        config["inbound_phrase"], week_oldest, latest,
+        exclude_patterns=["truewind", "test"],
+    )
+    outbound_ts = collect_matching_timestamps(
+        token, channels[config["outbound_channel"]],
+        config["outbound_phrase"], week_oldest, latest,
+    )
+
+    week_inbound = len(inbound_ts)
+    week_outbound = len(outbound_ts)
+    today_inbound = sum(1 for ts in inbound_ts if ts >= today_oldest)
+    today_outbound = sum(1 for ts in outbound_ts if ts >= today_oldest)
+
     target_channel_id = channels[config["target_channel"]]
     return now_local, today_inbound, today_outbound, week_inbound, week_outbound, target_channel_id
 
