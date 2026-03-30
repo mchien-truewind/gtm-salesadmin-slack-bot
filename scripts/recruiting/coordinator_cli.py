@@ -52,6 +52,17 @@ RESUME_LINK_FILE_HINTS = (".pdf", ".doc", ".docx", ".rtf", ".txt")
 RESUME_LINK_RE = re.compile(r"https?://[^\s<>\")']+", flags=re.IGNORECASE)
 
 DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. When are you free for a 20-minute intro call?"
+DEFAULT_BDR_PROCEED_TEMPLATE = (
+    "Thanks for the submission. We'd love to get to know you a little better.\n\n"
+    "As part of the next step in the process, please complete the following within the next 48 hours:\n"
+    "1. Go to this roleplay link: https://chatgpt.com/g/g-698d0a0186288191bc1b95c61e3e36ed-truewind-bdr-roleplay\n"
+    "2. Engage in a full cold call conversation with the GPT as if it were a real prospect.\n"
+    "3. Share the link of the full chat transcript and email it back to us.\n\n"
+    "We're looking to evaluate tone, structure, objection handling, and overall conversational flow.\n\n"
+    "Looking forward to reviewing it.\n\n"
+    "Thanks,\n"
+    "Mercedes"
+)
 DEFAULT_REJECT_TEMPLATE = (
     "Thank you for your submission. We had an incredibly strong pool of applicants, and after careful "
     "consideration, we won't be moving forward with your application at this time.\n\n"
@@ -60,6 +71,10 @@ DEFAULT_REJECT_TEMPLATE = (
 )
 DEFAULT_SCHEDULING_TEMPLATE = (
     "Thanks for the quick reply. Are you available for a 20-minute intro call on {slot_label}?"
+)
+DEFAULT_SCHEDULING_CONFIRM_TEMPLATE = (
+    "Thanks for confirming. You're booked for a 20-minute intro call on {slot_label}. "
+    "Calendar invite with the Google Meet link is on the way."
 )
 DEFAULT_NO_RESPONSE_TEMPLATE = (
     "We haven't heard back from you and we're closing this process.\n\n"
@@ -106,6 +121,7 @@ DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
     "roleplay,role play,chat transcript,complete the following,next step in the process,within the next 48 hours"
 )
+AUTO_ARCHIVE_SENDER_EMAILS = {"drew.katnik@cybercoders.com"}
 
 _DOCLING_CONVERTER: Any | None = None
 _DOCLING_CHECKED = False
@@ -690,6 +706,10 @@ def build_notion_value(prop_schema: dict[str, Any], value: Any) -> dict[str, Any
 
 def normalize_email(value: str) -> str:
     return value.strip().lower()
+
+
+def should_auto_archive_sender(sender_email: str) -> bool:
+    return normalize_email(sender_email) in AUTO_ARCHIVE_SENDER_EMAILS
 
 
 def header_map(message: dict[str, Any]) -> dict[str, str]:
@@ -1504,7 +1524,11 @@ NON_US_KEYWORDS = {
 
 ROLE_CANONICAL = {
     "bdr": "BDR",
+    "sdr": "BDR",
+    "founding sdr": "BDR",
     "growth generalist": "Growth Generalist",
+    "growth associate": "Growth Generalist",
+    "gtm associate": "Growth Generalist",
 }
 
 ROLE_NOISE_TOKENS = re.compile(
@@ -1537,7 +1561,11 @@ def canonicalize_truewind_role(raw_value: str) -> str:
         return ROLE_CANONICAL[lowered]
     if "generalist" in lowered:
         return "Growth Generalist"
+    if "growth associate" in lowered or "gtm associate" in lowered:
+        return "Growth Generalist"
     if "bdr" in lowered or "business development representative" in lowered:
+        return "BDR"
+    if "sdr" in lowered:
         return "BDR"
     if any(fragment in lowered for fragment in INVALID_ROLE_FRAGMENTS):
         return "Unknown"
@@ -1546,7 +1574,7 @@ def canonicalize_truewind_role(raw_value: str) -> str:
     stripped = clean_text(stripped).strip("-:|,;")
     if not stripped:
         return "Unknown"
-    return "Unknown"
+    return "Other"
 
 
 def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> tuple[str, str] | None:
@@ -2156,6 +2184,115 @@ def thread_latest_sent_matching_patterns_any_thread(
     return latest
 
 
+def latest_candidate_message_since_any_thread(
+    gmail_service,
+    *,
+    thread_ids: list[str],
+    candidate_email: str,
+    since: datetime,
+) -> tuple[datetime | None, str]:
+    candidate_email = normalize_email(candidate_email)
+    latest_dt: datetime | None = None
+    latest_text = ""
+
+    for thread_id in thread_ids:
+        try:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        except Exception:
+            continue
+        for message in thread.get("messages", []):
+            sent_at = message_internal_datetime(message)
+            if not sent_at or sent_at <= since.astimezone(timezone.utc):
+                continue
+            headers = header_map(message)
+            from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+            if from_email != candidate_email:
+                continue
+            body = clean_text(extract_message_body_text(message))
+            snippet = clean_text(message.get("snippet", ""))
+            subject = clean_text(headers.get("subject", ""))
+            text = "\n".join(part for part in [subject, snippet, body] if part).strip()
+            if latest_dt is None or sent_at > latest_dt:
+                latest_dt = sent_at
+                latest_text = text
+
+    return latest_dt, latest_text
+
+
+SCHEDULING_DECLINE_RE = re.compile(
+    r"(?i)\b(not interested|no longer interested|withdraw|withdrawing|decline|declining|pass|won't be able to)\b"
+)
+SCHEDULING_POSITIVE_RE = re.compile(
+    r"(?i)\b(yes|yep|yeah|sounds good|works for me|that works|happy to chat|happy to talk|would love to chat|interested|available|free)\b"
+)
+
+
+def classify_scheduling_readiness_reply(reply_text: str) -> str:
+    text = clean_text(reply_text)
+    if not text:
+        return "ambiguous"
+    if SCHEDULING_DECLINE_RE.search(text):
+        return "decline"
+    if SCHEDULING_POSITIVE_RE.search(text):
+        return "ready"
+    return "ambiguous"
+
+
+def classify_scheduling_confirmation_reply(reply_text: str) -> str:
+    text = clean_text(reply_text)
+    if not text:
+        return "ambiguous"
+    if SCHEDULING_DECLINE_RE.search(text):
+        return "decline"
+    if SCHEDULING_POSITIVE_RE.search(text):
+        return "confirm"
+    return "ambiguous"
+
+
+def calendar_event_id_for_thread(thread_id: str) -> str:
+    cleaned = re.sub(r"[^a-f0-9]", "", thread_id.lower())
+    return f"r{cleaned}"[:128] if cleaned else f"r{int(datetime.now(timezone.utc).timestamp())}"
+
+
+def create_calendar_invite_for_candidate(
+    calendar_service,
+    *,
+    config: Config,
+    candidate_name: str,
+    candidate_email: str,
+    start_at: datetime,
+    thread_id: str,
+) -> dict[str, Any]:
+    end_at = start_at + timedelta(minutes=config.slot_minutes)
+    event_id = calendar_event_id_for_thread(thread_id)
+    body = {
+        "id": event_id,
+        "summary": f"Truewind Intro Call - {candidate_name or candidate_email}",
+        "start": {"dateTime": start_at.astimezone(timezone.utc).isoformat()},
+        "end": {"dateTime": end_at.astimezone(timezone.utc).isoformat()},
+        "attendees": [{"email": candidate_email}],
+        "conferenceData": {
+            "createRequest": {
+                "requestId": event_id,
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+    try:
+        return (
+            calendar_service.events()
+            .insert(
+                calendarId=config.calendar_id,
+                body=body,
+                conferenceDataVersion=1,
+                sendUpdates="all",
+            )
+            .execute()
+        )
+    except Exception:
+        return calendar_service.events().get(calendarId=config.calendar_id, eventId=event_id).execute()
+
+
 def thread_has_label(gmail_service, *, thread_id: str, label_id: str) -> bool:
     if not label_id:
         return False
@@ -2446,6 +2583,21 @@ def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_recent_slack_posted_threads(config: Config, client: SlackClient, channel_id: str) -> set[str]:
+    oldest_ts = (datetime.now(timezone.utc) - timedelta(days=config.slack_history_lookback_days)).timestamp()
+    try:
+        messages = client.list_channel_messages(channel_id, oldest_ts)
+    except Exception:
+        return set()
+
+    thread_ids: set[str] = set()
+    for message in messages:
+        thread_id = extract_thread_id_from_slack_message(message.get("text", ""))
+        if thread_id:
+            thread_ids.add(thread_id)
+    return thread_ids
+
+
 def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
     if not candidates or not slack_enabled(config):
         return 0, 0
@@ -2457,6 +2609,10 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
         return 0, len(candidates)
+    history_posted_threads = load_recent_slack_posted_threads(config, client, channel_id)
+    if history_posted_threads.difference(posted_threads):
+        posted_threads.update(history_posted_threads)
+        state_changed = True
     posted = 0
     failed = 0
     mention_user_id = config.slack_mention_user_id
@@ -2697,7 +2853,8 @@ def require_notion_property(
     return properties[prop_name]
 
 
-ROLE_OPTIONS = ("BDR", "Growth Generalist")
+ROLE_OPTIONS = ("BDR", "Growth Generalist", "Other")
+STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process")
 
 
 def notion_prop_values(prop: dict[str, Any]) -> list[str]:
@@ -2710,6 +2867,10 @@ def notion_prop_values(prop: dict[str, Any]) -> list[str]:
         ]
     value = notion_prop_value(prop)
     return [value] if value else []
+
+
+def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
+    return set(notion_prop_values(page_props.get(prop_map.role, {})))
 
 
 def ensure_role_property_schema(
@@ -2739,6 +2900,34 @@ def ensure_role_property_schema(
         return notion.update_database({role_name: {"multi_select": {"options": option_payload}}})
 
     return database_schema
+
+
+def ensure_status_property_schema(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> dict[str, Any]:
+    properties_schema = database_schema.get("properties", {})
+    status_name = prop_map.status
+    status_schema = properties_schema.get(status_name)
+    if not status_schema or status_schema.get("type") != "select":
+        return database_schema
+
+    existing = [
+        {
+            "name": (item.get("name") or "").strip(),
+            "color": item.get("color", "default") or "default",
+        }
+        for item in (status_schema.get("select", {}) or {}).get("options", []) or []
+        if (item.get("name") or "").strip()
+    ]
+    existing_names = {item["name"] for item in existing}
+    missing = [name for name in STATUS_OPTIONS if name not in existing_names]
+    if not missing:
+        return database_schema
+
+    updated_options = existing + [{"name": name, "color": "default"} for name in missing]
+    return notion.update_database({status_name: {"select": {"options": updated_options}}})
 
 
 def resolve_title_property_name(properties_schema: dict[str, Any], preferred: str) -> str:
@@ -2972,6 +3161,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     database_schema = notion.get_database()
     prop_map = resolve_property_map(config.property_map, database_schema)
     database_schema = ensure_role_property_schema(notion, database_schema, prop_map)
+    database_schema = ensure_status_property_schema(notion, database_schema, prop_map)
     prop_map = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
@@ -3038,6 +3228,12 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         if candidate_domain in internal_domains:
             skipped += 1
             continue
+        if should_auto_archive_sender(candidate_email):
+            remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=[label_id])
+            skipped += 1
+            continue
+
+        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
         parsed_subject = parse_required_subject(subject, candidate_name)
         if not parsed_subject:
@@ -3046,6 +3242,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             continue
         role, subject_candidate_name = parsed_subject
         candidate_name = subject_candidate_name
+        if role == "Unknown":
+            role = canonicalize_truewind_role(thread_body_text)
 
         if not candidate_email:
             skipped += 1
@@ -3061,7 +3259,6 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             attachment_message_id, resume_part = resume_reference
 
         resume_link = extract_resume_link_from_thread(thread)
-        thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
         filename = (resume_part.get("filename") or "resume").strip() if resume_part else "resume"
         raw = b""
@@ -3237,6 +3434,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     properties_schema = database_schema.get("properties", {})
     prop = resolve_property_map(config.property_map, database_schema)
     database_schema = ensure_role_property_schema(notion, database_schema, prop)
+    database_schema = ensure_status_property_schema(notion, database_schema, prop)
     properties_schema = database_schema.get("properties", {})
     prop = resolve_property_map(config.property_map, database_schema)
 
@@ -3299,6 +3497,9 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         page_props = page.get("properties", {})
         decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
         current_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
+        candidate_roles = page_role_values(page_props, prop)
+        uses_bdr_assignment = "BDR" in candidate_roles
+        candidate_name = notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "Candidate"
 
         candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
         thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
@@ -3374,16 +3575,25 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         sent_archive_labels = [hiring_label_id] if hiring_label_id else []
         if current_status == "proceed drafted":
-            proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
-                gmail_service,
-                thread_ids=related_thread_ids,
-                sender_email=config.from_email,
-                candidate_email=candidate_email,
-                patterns=[PROCEED_SENT_RE],
-            )
+            if uses_bdr_assignment:
+                proceed_sent_at = thread_latest_assignment_sent_at_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    sender_email=config.from_email,
+                    keywords=config.assignment_keywords,
+                )
+            else:
+                proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    sender_email=config.from_email,
+                    candidate_email=candidate_email,
+                    patterns=[PROCEED_SENT_RE],
+                )
             if proceed_sent_at:
                 if prop.status in properties_schema:
-                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "In Process")
+                    next_status = "In CustomGPT Process" if uses_bdr_assignment else "In Process"
+                    update_payload[prop.status] = build_notion_value(properties_schema[prop.status], next_status)
                 archived_count, archive_failures = remove_labels_from_threads(
                     gmail_service,
                     thread_ids=related_thread_ids,
@@ -3396,6 +3606,62 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 continue
 
         if current_status == "scheduling":
+            proceed_sent_at = thread_latest_sent_matching_patterns_any_thread(
+                gmail_service,
+                thread_ids=related_thread_ids,
+                sender_email=config.from_email,
+                candidate_email=candidate_email,
+                patterns=[PROCEED_SENT_RE],
+            )
+            if proceed_sent_at:
+                reply_dt, reply_text = latest_candidate_message_since_any_thread(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    candidate_email=candidate_email,
+                    since=proceed_sent_at,
+                )
+                if reply_dt:
+                    reply_state = classify_scheduling_readiness_reply(reply_text)
+                    if reply_state == "ready":
+                        scheduling_draft_id = notion_prop_value(page_props.get(prop.scheduling_draft_id, {})).strip()
+                        proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
+                        if not scheduling_draft_id and not proposed_slot_raw:
+                            slot = find_next_available_slot(
+                                config, calendar_service, start_anchor=now_local(config.timezone_name)
+                            )
+                            if slot:
+                                slot_label = slot.strftime("%A, %b %d at %-I:%M %p %Z")
+                                schedule_body = config.scheduling_template.format(slot_label=slot_label)
+                                draft_id = create_reply_draft(
+                                    gmail_service,
+                                    sender_email=config.from_email,
+                                    to_email=candidate_email,
+                                    thread_id=reply_thread_id,
+                                    body_text=schedule_body,
+                                )
+                                scheduling_drafts += 1
+                                if prop.scheduling_draft_id in properties_schema:
+                                    update_payload[prop.scheduling_draft_id] = build_notion_value(
+                                        properties_schema[prop.scheduling_draft_id], draft_id
+                                    )
+                                if prop.proposed_slot in properties_schema:
+                                    update_payload[prop.proposed_slot] = build_notion_value(
+                                        properties_schema[prop.proposed_slot], iso(slot)
+                                    )
+                                if prop.status in properties_schema:
+                                    update_payload[prop.status] = build_notion_value(
+                                        properties_schema[prop.status], "Scheduling Sent"
+                                    )
+                    elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], "Needs Attention"
+                        )
+
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+            continue
+
+        if current_status == "scheduling sent":
             scheduling_sent_at = thread_latest_sent_matching_patterns_any_thread(
                 gmail_service,
                 thread_ids=related_thread_ids,
@@ -3404,14 +3670,57 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 patterns=[SCHEDULING_SENT_RE],
             )
             if scheduling_sent_at:
-                archived_count, archive_failures = remove_labels_from_threads(
+                reply_dt, reply_text = latest_candidate_message_since_any_thread(
                     gmail_service,
                     thread_ids=related_thread_ids,
-                    label_ids=sent_archive_labels,
+                    candidate_email=candidate_email,
+                    since=scheduling_sent_at,
                 )
-                sent_draft_threads_archived += archived_count
-                sent_draft_archive_failures += archive_failures
-                continue
+                if reply_dt:
+                    reply_state = classify_scheduling_confirmation_reply(reply_text)
+                    if reply_state == "confirm":
+                        proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
+                        proposed_slot = parse_iso_datetime(proposed_slot_raw, config.timezone_name)
+                        if proposed_slot:
+                            event = create_calendar_invite_for_candidate(
+                                calendar_service,
+                                config=config,
+                                candidate_name=candidate_name,
+                                candidate_email=candidate_email,
+                                start_at=proposed_slot,
+                                thread_id=thread_id,
+                            )
+                            slot_label = proposed_slot.astimezone(ZoneInfo(config.timezone_name)).strftime(
+                                "%A, %b %d at %-I:%M %p %Z"
+                            )
+                            confirm_body = DEFAULT_SCHEDULING_CONFIRM_TEMPLATE.format(slot_label=slot_label)
+                            draft_id = create_reply_draft(
+                                gmail_service,
+                                sender_email=config.from_email,
+                                to_email=candidate_email,
+                                thread_id=reply_thread_id,
+                                body_text=confirm_body,
+                            )
+                            if prop.scheduling_draft_id in properties_schema:
+                                update_payload[prop.scheduling_draft_id] = build_notion_value(
+                                    properties_schema[prop.scheduling_draft_id], draft_id
+                                )
+                            if prop.status in properties_schema:
+                                update_payload[prop.status] = build_notion_value(
+                                    properties_schema[prop.status], "Interview Scheduled"
+                                )
+                            if prop.proposed_slot in properties_schema:
+                                update_payload[prop.proposed_slot] = build_notion_value(
+                                    properties_schema[prop.proposed_slot], iso(proposed_slot)
+                                )
+                    elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], "Needs Attention"
+                        )
+
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+            continue
 
         if current_status == "no response":
             no_response_sent_at = thread_latest_sent_matching_patterns_any_thread(
@@ -3497,12 +3806,13 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
             if not proceed_draft_id:
+                proceed_body = DEFAULT_BDR_PROCEED_TEMPLATE if uses_bdr_assignment else config.proceed_template
                 draft_id = create_reply_draft(
                     gmail_service,
                     sender_email=config.from_email,
                     to_email=candidate_email,
                     thread_id=reply_thread_id,
-                    body_text=config.proceed_template,
+                    body_text=proceed_body,
                 )
                 proceed_drafts += 1
                 if prop.proceed_draft_id in properties_schema:
@@ -3522,37 +3832,23 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             scheduling_draft_id = notion_prop_value(page_props.get(prop.scheduling_draft_id, {})).strip()
             proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
             anchor = decision_time or now
-            if not scheduling_draft_id and not proposed_slot_raw:
-                if candidate_replied_since_any_thread(
+            if not uses_bdr_assignment:
+                reply_dt, reply_text = latest_candidate_message_since_any_thread(
                     gmail_service,
                     thread_ids=related_thread_ids,
                     candidate_email=candidate_email,
                     since=anchor,
-                ):
-                    slot = find_next_available_slot(config, calendar_service, start_anchor=now)
-                    if slot:
-                        slot_label = slot.strftime("%A, %b %d at %-I:%M %p %Z")
-                        schedule_body = config.scheduling_template.format(slot_label=slot_label)
-                        draft_id = create_reply_draft(
-                            gmail_service,
-                            sender_email=config.from_email,
-                            to_email=candidate_email,
-                            thread_id=reply_thread_id,
-                            body_text=schedule_body,
+                )
+                if reply_dt:
+                    reply_state = classify_scheduling_readiness_reply(reply_text)
+                    if reply_state == "ready" and prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], "Scheduling"
                         )
-                        scheduling_drafts += 1
-                        if prop.scheduling_draft_id in properties_schema:
-                            update_payload[prop.scheduling_draft_id] = build_notion_value(
-                                properties_schema[prop.scheduling_draft_id], draft_id
-                            )
-                        if prop.proposed_slot in properties_schema:
-                            update_payload[prop.proposed_slot] = build_notion_value(
-                                properties_schema[prop.proposed_slot], iso(slot)
-                            )
-                        if prop.status in properties_schema:
-                            update_payload[prop.status] = build_notion_value(
-                                properties_schema[prop.status], "Scheduling"
-                            )
+                    elif reply_state in {"decline", "ambiguous"} and prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], "Needs Attention"
+                        )
 
         if decision == "reject":
             reject_draft_id = notion_prop_value(page_props.get(prop.reject_draft_id, {})).strip()
@@ -3637,7 +3933,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         if (
             hiring_label_id
-            and effective_status != "scheduling"
+            and effective_status not in {"scheduling", "scheduling sent"}
             and any_thread_has_label(
                 gmail_service,
                 thread_ids=related_thread_ids,
