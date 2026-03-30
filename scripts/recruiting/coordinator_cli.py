@@ -2583,6 +2583,21 @@ def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_recent_slack_posted_threads(config: Config, client: SlackClient, channel_id: str) -> set[str]:
+    oldest_ts = (datetime.now(timezone.utc) - timedelta(days=config.slack_history_lookback_days)).timestamp()
+    try:
+        messages = client.list_channel_messages(channel_id, oldest_ts)
+    except Exception:
+        return set()
+
+    thread_ids: set[str] = set()
+    for message in messages:
+        thread_id = extract_thread_id_from_slack_message(message.get("text", ""))
+        if thread_id:
+            thread_ids.add(thread_id)
+    return thread_ids
+
+
 def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
     if not candidates or not slack_enabled(config):
         return 0, 0
@@ -2594,6 +2609,10 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
         return 0, len(candidates)
+    history_posted_threads = load_recent_slack_posted_threads(config, client, channel_id)
+    if history_posted_threads.difference(posted_threads):
+        posted_threads.update(history_posted_threads)
+        state_changed = True
     posted = 0
     failed = 0
     mention_user_id = config.slack_mention_user_id
