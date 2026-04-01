@@ -5,7 +5,7 @@ Default behavior:
 - Inbound count: messages in #leads containing "Booked Calendly Meeting"
 - Outbound count: messages in #gtm-outbound containing "New Meeting"
 - Target channel: #gtm-general
-- Week is Sunday-Saturday in report timezone.
+- Week resets on Monday in report timezone.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-channel", default=None, help="Slack channel name override")
     parser.add_argument("--dry-run", action="store_true", help="Print message only; do not post")
+    parser.add_argument("--force", action="store_true", help="Bypass the 6 PM local-time gate")
     return parser.parse_args()
 
 
@@ -65,7 +66,6 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
         "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "17.5"),
-        "force_mode": pick("LEAD_REPORT_FORCE_MODE", ""),
     }
 
 
@@ -153,27 +153,11 @@ def collect_matching_timestamps(
             return timestamps
 
 
-def pick_report_mode(now_local: datetime, force_mode: str) -> str:
-    mode = force_mode.strip().lower()
-    if mode in {"daily", "weekly"}:
-        return mode
-    # Default weekly summary on Sunday; daily on other days.
-    return "weekly" if now_local.weekday() == 6 else "daily"
-
-
-def defer_reason(now_local: datetime, mode: str) -> str:
-    # Daily posts are allowed Monday-Saturday after 5 PM local time.
-    if mode == "daily":
-        if now_local.weekday() == 6:
-            return "daily post deferred on Sunday so weekly mode can run"
-        if now_local.hour < 17:
-            return "daily post deferred until 5 PM local time"
-    # Weekly summary should only post on Sunday after 5 PM local time.
-    if mode == "weekly":
-        if now_local.weekday() != 6:
-            return "weekly post deferred because local day is not Sunday"
-        if now_local.hour < 17:
-            return "weekly post deferred until 5 PM local time"
+def defer_reason(now_local: datetime, force: bool) -> str:
+    if force:
+        return ""
+    if now_local.hour < 18:
+        return "daily post deferred until 6 PM local time"
     return ""
 
 
@@ -181,16 +165,12 @@ def date_label(now_local: datetime) -> str:
     return f"{now_local.month}/{now_local.day}/{now_local.strftime('%y')}"
 
 
-def already_posted(token: str, target_channel_id: str, now_local: datetime, mode: str) -> bool:
+def already_posted(token: str, target_channel_id: str, now_local: datetime) -> bool:
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    if mode == "weekly":
-        days_since_sunday = (now_local.weekday() + 1) % 7
-        start_local = start_local - timedelta(days=days_since_sunday)
     oldest = start_local.astimezone(timezone.utc).timestamp()
     latest = now_local.astimezone(timezone.utc).timestamp()
 
     daily_prefix = f"Today {date_label(now_local)}"
-    weekly_prefix = ":star2: Total Count for The Week"
 
     cursor = ""
     while True:
@@ -209,9 +189,7 @@ def already_posted(token: str, target_channel_id: str, now_local: datetime, mode
         )
         for msg in payload.get("messages", []):
             text = msg.get("text") or ""
-            if mode == "daily" and text.startswith(daily_prefix):
-                return True
-            if mode == "weekly" and text.startswith(weekly_prefix):
+            if text.startswith(daily_prefix):
                 return True
         cursor = (payload.get("response_metadata") or {}).get("next_cursor", "")
         if not cursor:
@@ -225,7 +203,6 @@ def build_message(
     week_inbound: int,
     week_outbound: int,
     weekly_goal: float,
-    mode: str,
 ) -> str:
     def fmt_num(value: float) -> str:
         text = f"{value:.2f}".rstrip("0").rstrip(".")
@@ -233,17 +210,6 @@ def build_message(
 
     week_total = week_inbound + week_outbound
     remaining = max(weekly_goal - week_total, 0.0)
-    if mode == "weekly":
-        return (
-            ":star2: Total Count for The Week\n"
-            f"Inbound: {week_inbound}\n"
-            f"Outbound: {week_outbound}\n"
-            f"Total: {week_total}\n"
-            "\n"
-            f"Weekly Goal: {fmt_num(weekly_goal)}\n"
-            f":star2: How many more do we need? {fmt_num(remaining)}"
-        )
-
     today_total = today_inbound + today_outbound
     return (
         f"Today {date_label(now_local)}\n"
@@ -273,8 +239,8 @@ def compute_counts(config: Dict[str, str]) -> Tuple[datetime, int, int, int, int
     report_tz = ZoneInfo(config["report_tz"])
     now_local = datetime.now(report_tz)
     start_today_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    days_since_sunday = (now_local.weekday() + 1) % 7
-    start_week_local = start_today_local - timedelta(days=days_since_sunday)
+    days_since_monday = now_local.weekday()
+    start_week_local = start_today_local - timedelta(days=days_since_monday)
 
     week_oldest = start_week_local.astimezone(timezone.utc).timestamp()
     today_oldest = start_today_local.astimezone(timezone.utc).timestamp()
@@ -318,12 +284,10 @@ def main() -> int:
         target_channel_id,
     ) = compute_counts(config)
 
-    mode = pick_report_mode(now_local, config["force_mode"])
-
-    reason = defer_reason(now_local, mode)
+    reason = defer_reason(now_local, args.force)
     if reason:
         print(
-            f"deferred mode={mode} reason={reason} local_time={now_local.isoformat()}"
+            f"deferred mode=daily reason={reason} local_time={now_local.isoformat()}"
         )
         return 0
 
@@ -334,16 +298,15 @@ def main() -> int:
         week_inbound,
         week_outbound,
         weekly_goal,
-        mode,
     )
 
     if args.dry_run:
         print(text)
         return 0
 
-    if already_posted(config["token"], target_channel_id, now_local, mode):
+    if already_posted(config["token"], target_channel_id, now_local):
         print(
-            f"skipped duplicate mode={mode} channel=#{config['target_channel']} "
+            f"skipped duplicate mode=daily channel=#{config['target_channel']} "
             f"local_time={now_local.isoformat()}"
         )
         return 0
@@ -357,7 +320,7 @@ def main() -> int:
     print(
         f"posted channel=#{config['target_channel']} "
         f"channel_id={target_channel_id} ts={payload.get('ts')} "
-        f"mode={mode} "
+        "mode=daily "
         f"today_inbound={today_inbound} today_outbound={today_outbound} "
         f"week_inbound={week_inbound} week_outbound={week_outbound} "
         f"local_time={now_local.isoformat()}"
