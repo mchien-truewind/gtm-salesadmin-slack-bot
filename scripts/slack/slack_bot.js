@@ -1139,6 +1139,286 @@ function scheduleDiscoveryDigest() {
   console.log(`  Discovery digest scheduled, next run: ${nextRun.toISOString()}`);
 }
 
+// ============================================================
+// Daily meetings-booked progress post
+// ============================================================
+const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
+const PROGRESS_INBOUND_CHANNEL = process.env.LEAD_REPORT_INBOUND_CHANNEL || 'leads';
+const PROGRESS_OUTBOUND_CHANNEL = process.env.LEAD_REPORT_OUTBOUND_CHANNEL || 'gtm-outbound';
+const PROGRESS_INBOUND_PHRASE = process.env.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting';
+const PROGRESS_OUTBOUND_PHRASE = process.env.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting';
+const PROGRESS_WEEKLY_GOAL = parseFloat(process.env.LEAD_REPORT_WEEKLY_GOAL || '17.5');
+const PROGRESS_EXCLUDE_PATTERNS = ['truewind', 'test'];
+const PROGRESS_TIMEZONE = 'America/Los_Angeles';
+const PROGRESS_TARGET_HOUR = 18;
+const PROGRESS_TARGET_MINUTE = 7;
+const PACIFIC_WEEKDAY_INDEX = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: PROGRESS_TIMEZONE,
+  weekday: 'short',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  hourCycle: 'h23',
+});
+
+async function resolveChannelId(name) {
+  let cursor;
+  do {
+    const res = await app.client.conversations.list({
+      token: process.env.SLACK_BOT_TOKEN,
+      exclude_archived: true,
+      types: 'public_channel',
+      limit: 1000,
+      cursor: cursor || undefined,
+    });
+    const ch = (res.channels || []).find(c => c.name === name);
+    if (ch) return ch.id;
+    cursor = res.response_metadata?.next_cursor;
+  } while (cursor);
+  return null;
+}
+
+async function collectMatchingTimestamps(channelId, phrase, oldest, latest, excludePatterns) {
+  const timestamps = [];
+  const skipLower = excludePatterns.map(p => p.toLowerCase());
+  let cursor;
+  do {
+    const res = await app.client.conversations.history({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: channelId,
+      oldest: String(oldest),
+      latest: String(latest),
+      inclusive: true,
+      limit: 200,
+      cursor: cursor || undefined,
+    });
+    for (const msg of res.messages || []) {
+      const text = msg.text || '';
+      if (!text.includes(phrase)) continue;
+      const lower = text.toLowerCase();
+      if (skipLower.some(p => lower.includes(p))) continue;
+      timestamps.push(parseFloat(msg.ts));
+    }
+    cursor = res.response_metadata?.next_cursor;
+  } while (cursor);
+  return timestamps;
+}
+
+function fmtNum(v) {
+  const s = v.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return s || '0';
+}
+
+function getPacificParts(date = new Date()) {
+  const parsed = {};
+  for (const part of PACIFIC_DATE_FORMATTER.formatToParts(date)) {
+    if (part.type !== 'literal') parsed[part.type] = part.value;
+  }
+  return {
+    year: Number(parsed.year),
+    month: Number(parsed.month),
+    day: Number(parsed.day),
+    hour: Number(parsed.hour),
+    minute: Number(parsed.minute),
+    second: Number(parsed.second),
+    weekdayIndex: PACIFIC_WEEKDAY_INDEX[parsed.weekday],
+  };
+}
+
+function shiftPacificDate(parts, dayDelta) {
+  const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  shifted.setUTCDate(shifted.getUTCDate() + dayDelta);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
+function pacificLocalToUtcDate(year, month, day, hour = 0, minute = 0, second = 0) {
+  for (const utcOffsetHours of [7, 8]) {
+    const candidate = new Date(Date.UTC(year, month - 1, day, hour + utcOffsetHours, minute, second));
+    const parts = getPacificParts(candidate);
+    if (
+      parts.year === year
+      && parts.month === month
+      && parts.day === day
+      && parts.hour === hour
+      && parts.minute === minute
+      && parts.second === second
+    ) {
+      return candidate;
+    }
+  }
+  throw new Error(`Unable to resolve Pacific local time ${year}-${month}-${day} ${hour}:${minute}:${second}`);
+}
+
+function formatPacificDateLabel(parts) {
+  return `${parts.month}/${parts.day}/${String(parts.year).slice(-2)}`;
+}
+
+function getDailyProgressWindow(now = new Date()) {
+  const nowPacific = getPacificParts(now);
+  const todayStartUtc = pacificLocalToUtcDate(nowPacific.year, nowPacific.month, nowPacific.day, 0, 0, 0);
+  const daysSinceMonday = (nowPacific.weekdayIndex + 6) % 7;
+  const weekStartDate = shiftPacificDate(nowPacific, -daysSinceMonday);
+  const weekStartUtc = pacificLocalToUtcDate(weekStartDate.year, weekStartDate.month, weekStartDate.day, 0, 0, 0);
+  const targetRunUtc = pacificLocalToUtcDate(
+    nowPacific.year,
+    nowPacific.month,
+    nowPacific.day,
+    PROGRESS_TARGET_HOUR,
+    PROGRESS_TARGET_MINUTE,
+    0,
+  );
+  return {
+    latest: now.getTime() / 1000,
+    now,
+    nowPacific,
+    targetRunUtc,
+    todayOldest: todayStartUtc.getTime() / 1000,
+    weekOldest: weekStartUtc.getTime() / 1000,
+  };
+}
+
+function getNextDailyProgressRun(referenceDate = new Date()) {
+  const currentPacific = getPacificParts(referenceDate);
+  let nextDate = {
+    year: currentPacific.year,
+    month: currentPacific.month,
+    day: currentPacific.day,
+  };
+  let nextRunUtc = pacificLocalToUtcDate(
+    nextDate.year,
+    nextDate.month,
+    nextDate.day,
+    PROGRESS_TARGET_HOUR,
+    PROGRESS_TARGET_MINUTE,
+    0,
+  );
+
+  if (nextRunUtc <= referenceDate) {
+    nextDate = shiftPacificDate(nextDate, 1);
+    nextRunUtc = pacificLocalToUtcDate(
+      nextDate.year,
+      nextDate.month,
+      nextDate.day,
+      PROGRESS_TARGET_HOUR,
+      PROGRESS_TARGET_MINUTE,
+      0,
+    );
+  }
+
+  return { nextDate, nextRunUtc };
+}
+
+async function runDailyProgress(channelOverride, options = {}) {
+  const force = Boolean(options.force);
+  const targetName = channelOverride || PROGRESS_TARGET_CHANNEL;
+  try {
+    const [inboundId, outboundId, targetId] = await Promise.all([
+      resolveChannelId(PROGRESS_INBOUND_CHANNEL),
+      resolveChannelId(PROGRESS_OUTBOUND_CHANNEL),
+      resolveChannelId(targetName),
+    ]);
+    if (!inboundId) throw new Error(`Channel not found: #${PROGRESS_INBOUND_CHANNEL}`);
+    if (!outboundId) throw new Error(`Channel not found: #${PROGRESS_OUTBOUND_CHANNEL}`);
+    if (!targetId) throw new Error(`Channel not found: #${targetName}`);
+
+    const { latest, now, nowPacific, targetRunUtc, todayOldest, weekOldest } = getDailyProgressWindow();
+    const dateLabel = formatPacificDateLabel(nowPacific);
+
+    if (!force && now < targetRunUtc) {
+      console.log(`Daily progress: deferred until ${targetRunUtc.toISOString()} for ${dateLabel} PT`);
+      return;
+    }
+
+    const [inboundTs, outboundTs] = await Promise.all([
+      collectMatchingTimestamps(inboundId, PROGRESS_INBOUND_PHRASE, weekOldest, latest, PROGRESS_EXCLUDE_PATTERNS),
+      collectMatchingTimestamps(outboundId, PROGRESS_OUTBOUND_PHRASE, weekOldest, latest, []),
+    ]);
+
+    const weekInbound = inboundTs.length;
+    const weekOutbound = outboundTs.length;
+    const todayInbound = inboundTs.filter(ts => ts >= todayOldest).length;
+    const todayOutbound = outboundTs.filter(ts => ts >= todayOldest).length;
+    const todayTotal = todayInbound + todayOutbound;
+    const weekTotal = weekInbound + weekOutbound;
+    const remaining = Math.max(PROGRESS_WEEKLY_GOAL - weekTotal, 0);
+
+    const dupCheck = await app.client.conversations.history({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: targetId,
+      oldest: String(todayOldest),
+      latest: String(latest),
+      inclusive: true,
+      limit: 50,
+    });
+    const prefix = `Today ${dateLabel}`;
+    const alreadyPosted = (dupCheck.messages || []).some(m => (m.text || '').startsWith(prefix));
+    if (alreadyPosted) {
+      console.log(`Daily progress: skipped duplicate for ${dateLabel} in #${targetName}`);
+      return;
+    }
+
+    const text = `Today ${dateLabel}\n`
+      + `Inbound: ${todayInbound}\n`
+      + `Outbound: ${todayOutbound}\n`
+      + `Total: ${todayTotal}\n`
+      + `\n\n`
+      + `This week so far\n`
+      + `Inbound: ${weekInbound}\n`
+      + `Outbound: ${weekOutbound}\n`
+      + `Total: ${weekTotal}\n`
+      + `\n`
+      + `Weekly Goal: ${fmtNum(PROGRESS_WEEKLY_GOAL)}\n`
+      + `:star2: How many more do we need? ${fmtNum(remaining)}`;
+
+    await app.client.chat.postMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: targetId,
+      text,
+    });
+    console.log(`Daily progress: posted to #${targetName} (today=${todayInbound}+${todayOutbound}, week=${weekInbound}+${weekOutbound})`);
+  } catch (err) {
+    console.error('Daily progress error:', err.message);
+  }
+}
+
+function scheduleDailyProgress() {
+  const scheduleNext = () => {
+    const { nextDate, nextRunUtc } = getNextDailyProgressRun();
+    const delayMs = Math.max(nextRunUtc.getTime() - Date.now(), 1000);
+    setTimeout(async () => {
+      await runDailyProgress();
+      scheduleNext();
+    }, delayMs);
+    console.log(
+      `  Daily progress scheduled, next run: ${nextRunUtc.toISOString()} `
+      + `(${nextDate.month}/${nextDate.day}/${String(nextDate.year).slice(-2)} `
+      + `${String(PROGRESS_TARGET_HOUR).padStart(2, '0')}:${String(PROGRESS_TARGET_MINUTE).padStart(2, '0')} PT)`,
+    );
+  };
+
+  runDailyProgress().catch(err => {
+    console.error('Daily progress startup check error:', err.message);
+  });
+  scheduleNext();
+}
+
 (async () => {
   await app.start();
   console.log('Slack bot is running in socket mode');
@@ -1149,6 +1429,9 @@ function scheduleDiscoveryDigest() {
   // Schedule daily discovery digest
   scheduleDiscoveryDigest();
 
+  // Schedule daily meetings-booked progress
+  scheduleDailyProgress();
+
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
@@ -1156,6 +1439,12 @@ function scheduleDiscoveryDigest() {
       runDiscoveryDigest();
       res.writeHead(200);
       res.end('Digest triggered');
+      return;
+    }
+    if (req.url === '/run-daily-progress') {
+      runDailyProgress(undefined, { force: true });
+      res.writeHead(200);
+      res.end('Daily progress triggered');
       return;
     }
     res.writeHead(200);

@@ -25,7 +25,7 @@ A bare-bones extraction of `agentic-os` focused on:
    ./.codex/scripts/codex-skills/sync_codex_skills.sh
    ```
 
-## Daily Lead Progress Slack Post (Local Fallback)
+## Daily Lead Progress Slack Post (Railway)
 
 1. Put your token in `.env.local`:
    ```sh
@@ -54,31 +54,8 @@ A bare-bones extraction of `agentic-os` focused on:
    launchctl kickstart -k gui/$(id -u)/com.agenticlite.daily-lead-progress
    ```
 
-## Daily Lead Progress on GitHub (Source Of Truth)
-
-This is the only scheduled daily-progress runner. The Railway Slack bot no longer schedules or posts daily progress.
-
-1. Add repository secret:
-   - `SLACK_USER_TOKEN` = your `xoxp-...` token
-   - Optional: `SLACK_BOT_TOKEN` if you want the workflow to prefer a bot token instead
-2. Optional repository variables (Settings -> Secrets and variables -> Actions -> Variables):
-   - `LEAD_REPORT_TARGET_CHANNEL` (default: `gtm-general`)
-   - `LEAD_REPORT_INBOUND_CHANNEL` (default: `leads`)
-   - `LEAD_REPORT_OUTBOUND_CHANNEL` (default: `gtm-outbound`)
-   - `LEAD_REPORT_INBOUND_PHRASE` (default: `Booked Calendly Meeting`)
-   - `LEAD_REPORT_OUTBOUND_PHRASE` (default: `New Meeting`)
-   - `LEAD_REPORT_WINDOW_HOURS` (default: `24`)
-   - `LEAD_REPORT_TIMEZONE` (default: `America/Los_Angeles`)
-3. Push these files to GitHub (default branch):
-   - `.github/workflows/daily-lead-progress.yml`
-   - `scripts/slack/post_daily_progress.py`
-4. Verify in Actions:
-   - Open **Actions -> Daily Lead Progress**
-   - Click **Run workflow**
-   - Optional input `target_channel=slack-testing` for a safe test
-
 Notes:
-- The report runs every day after 6 PM Pacific.
+- The Railway Slack bot posts the report every day after 6 PM Pacific.
 - The "This week so far" total includes Monday through end-of-day Sunday, then restarts on Monday.
 - It posts with the same message format used in local runs.
 
