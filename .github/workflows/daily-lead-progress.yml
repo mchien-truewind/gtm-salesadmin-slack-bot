@@ -23,6 +23,7 @@ jobs:
   post-progress:
     runs-on: ubuntu-latest
     env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
       LEAD_REPORT_TARGET_CHANNEL: ${{ vars.LEAD_REPORT_TARGET_CHANNEL }}
       LEAD_REPORT_INBOUND_CHANNEL: ${{ vars.LEAD_REPORT_INBOUND_CHANNEL }}
