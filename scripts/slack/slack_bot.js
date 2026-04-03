@@ -1149,6 +1149,30 @@ const PROGRESS_INBOUND_PHRASE = process.env.LEAD_REPORT_INBOUND_PHRASE || 'Booke
 const PROGRESS_OUTBOUND_PHRASE = process.env.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting';
 const PROGRESS_WEEKLY_GOAL = parseFloat(process.env.LEAD_REPORT_WEEKLY_GOAL || '17.5');
 const PROGRESS_EXCLUDE_PATTERNS = ['truewind', 'test'];
+const PROGRESS_TIMEZONE = 'America/Los_Angeles';
+const PROGRESS_TARGET_HOUR = 18;
+const PROGRESS_TARGET_MINUTE = 7;
+const PACIFIC_WEEKDAY_INDEX = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+const PACIFIC_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  timeZone: PROGRESS_TIMEZONE,
+  weekday: 'short',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+  hourCycle: 'h23',
+});
 
 async function resolveChannelId(name) {
   let cursor;
@@ -1198,7 +1222,111 @@ function fmtNum(v) {
   return s || '0';
 }
 
-async function runDailyProgress(channelOverride) {
+function getPacificParts(date = new Date()) {
+  const parsed = {};
+  for (const part of PACIFIC_DATE_FORMATTER.formatToParts(date)) {
+    if (part.type !== 'literal') parsed[part.type] = part.value;
+  }
+  return {
+    year: Number(parsed.year),
+    month: Number(parsed.month),
+    day: Number(parsed.day),
+    hour: Number(parsed.hour),
+    minute: Number(parsed.minute),
+    second: Number(parsed.second),
+    weekdayIndex: PACIFIC_WEEKDAY_INDEX[parsed.weekday],
+  };
+}
+
+function shiftPacificDate(parts, dayDelta) {
+  const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  shifted.setUTCDate(shifted.getUTCDate() + dayDelta);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
+function pacificLocalToUtcDate(year, month, day, hour = 0, minute = 0, second = 0) {
+  for (const utcOffsetHours of [7, 8]) {
+    const candidate = new Date(Date.UTC(year, month - 1, day, hour + utcOffsetHours, minute, second));
+    const parts = getPacificParts(candidate);
+    if (
+      parts.year === year
+      && parts.month === month
+      && parts.day === day
+      && parts.hour === hour
+      && parts.minute === minute
+      && parts.second === second
+    ) {
+      return candidate;
+    }
+  }
+  throw new Error(`Unable to resolve Pacific local time ${year}-${month}-${day} ${hour}:${minute}:${second}`);
+}
+
+function formatPacificDateLabel(parts) {
+  return `${parts.month}/${parts.day}/${String(parts.year).slice(-2)}`;
+}
+
+function getDailyProgressWindow(now = new Date()) {
+  const nowPacific = getPacificParts(now);
+  const todayStartUtc = pacificLocalToUtcDate(nowPacific.year, nowPacific.month, nowPacific.day, 0, 0, 0);
+  const daysSinceMonday = (nowPacific.weekdayIndex + 6) % 7;
+  const weekStartDate = shiftPacificDate(nowPacific, -daysSinceMonday);
+  const weekStartUtc = pacificLocalToUtcDate(weekStartDate.year, weekStartDate.month, weekStartDate.day, 0, 0, 0);
+  const targetRunUtc = pacificLocalToUtcDate(
+    nowPacific.year,
+    nowPacific.month,
+    nowPacific.day,
+    PROGRESS_TARGET_HOUR,
+    PROGRESS_TARGET_MINUTE,
+    0,
+  );
+  return {
+    latest: now.getTime() / 1000,
+    now,
+    nowPacific,
+    targetRunUtc,
+    todayOldest: todayStartUtc.getTime() / 1000,
+    weekOldest: weekStartUtc.getTime() / 1000,
+  };
+}
+
+function getNextDailyProgressRun(referenceDate = new Date()) {
+  const currentPacific = getPacificParts(referenceDate);
+  let nextDate = {
+    year: currentPacific.year,
+    month: currentPacific.month,
+    day: currentPacific.day,
+  };
+  let nextRunUtc = pacificLocalToUtcDate(
+    nextDate.year,
+    nextDate.month,
+    nextDate.day,
+    PROGRESS_TARGET_HOUR,
+    PROGRESS_TARGET_MINUTE,
+    0,
+  );
+
+  if (nextRunUtc <= referenceDate) {
+    nextDate = shiftPacificDate(nextDate, 1);
+    nextRunUtc = pacificLocalToUtcDate(
+      nextDate.year,
+      nextDate.month,
+      nextDate.day,
+      PROGRESS_TARGET_HOUR,
+      PROGRESS_TARGET_MINUTE,
+      0,
+    );
+  }
+
+  return { nextDate, nextRunUtc };
+}
+
+async function runDailyProgress(channelOverride, options = {}) {
+  const force = Boolean(options.force);
   const targetName = channelOverride || PROGRESS_TARGET_CHANNEL;
   try {
     const [inboundId, outboundId, targetId] = await Promise.all([
@@ -1210,27 +1338,14 @@ async function runDailyProgress(channelOverride) {
     if (!outboundId) throw new Error(`Channel not found: #${PROGRESS_OUTBOUND_CHANNEL}`);
     if (!targetId) throw new Error(`Channel not found: #${targetName}`);
 
-    const now = new Date();
-    // Convert to Pacific time
-    const pacificStr = now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
-    const nowPT = new Date(pacificStr);
-    const dayOfWeek = nowPT.getDay(); // 0=Sun
+    const { latest, now, nowPacific, targetRunUtc, todayOldest, weekOldest } = getDailyProgressWindow();
+    const dateLabel = formatPacificDateLabel(nowPacific);
 
-    // Start of today (Pacific midnight) in UTC epoch seconds
-    const todayMidnightPT = new Date(nowPT);
-    todayMidnightPT.setHours(0, 0, 0, 0);
-    const todayOffsetMs = now - nowPT; // rough UTC-PT offset
-    const todayOldest = (todayMidnightPT.getTime() + todayOffsetMs) / 1000;
+    if (!force && now < targetRunUtc) {
+      console.log(`Daily progress: deferred until ${targetRunUtc.toISOString()} for ${dateLabel} PT`);
+      return;
+    }
 
-    // Start of week (Sunday midnight Pacific)
-    const daysSinceSun = dayOfWeek; // Sun=0
-    const weekMidnightPT = new Date(todayMidnightPT);
-    weekMidnightPT.setDate(weekMidnightPT.getDate() - daysSinceSun);
-    const weekOldest = (weekMidnightPT.getTime() + todayOffsetMs) / 1000;
-
-    const latest = now.getTime() / 1000;
-
-    // Fetch week window once per channel
     const [inboundTs, outboundTs] = await Promise.all([
       collectMatchingTimestamps(inboundId, PROGRESS_INBOUND_PHRASE, weekOldest, latest, PROGRESS_EXCLUDE_PATTERNS),
       collectMatchingTimestamps(outboundId, PROGRESS_OUTBOUND_PHRASE, weekOldest, latest, []),
@@ -1244,12 +1359,6 @@ async function runDailyProgress(channelOverride) {
     const weekTotal = weekInbound + weekOutbound;
     const remaining = Math.max(PROGRESS_WEEKLY_GOAL - weekTotal, 0);
 
-    const month = nowPT.getMonth() + 1;
-    const day = nowPT.getDate();
-    const year = String(nowPT.getFullYear()).slice(2);
-    const dateLabel = `${month}/${day}/${year}`;
-
-    // Check for duplicate post today
     const dupCheck = await app.client.conversations.history({
       token: process.env.SLACK_BOT_TOKEN,
       channel: targetId,
@@ -1290,25 +1399,24 @@ async function runDailyProgress(channelOverride) {
 }
 
 function scheduleDailyProgress() {
-  const TARGET_HOUR_UTC = 1; // 5 PM PST = 01:00 UTC next day
-  function msUntilNext() {
-    const now = new Date();
-    const next = new Date(now);
-    next.setUTCHours(TARGET_HOUR_UTC, 7, 0, 0); // :07 past the hour to match old cron
-    if (next <= now) next.setDate(next.getDate() + 1);
-    // Skip Sunday (day 0) -- weekly mode not implemented here yet
-    while (next.getUTCDay() === 0) {
-      next.setDate(next.getDate() + 1);
-    }
-    return next - now;
-  }
-  function run() {
-    runDailyProgress();
-    setTimeout(run, msUntilNext());
-  }
-  setTimeout(run, msUntilNext());
-  const nextRun = new Date(Date.now() + msUntilNext());
-  console.log(`  Daily progress scheduled, next run: ${nextRun.toISOString()}`);
+  const scheduleNext = () => {
+    const { nextDate, nextRunUtc } = getNextDailyProgressRun();
+    const delayMs = Math.max(nextRunUtc.getTime() - Date.now(), 1000);
+    setTimeout(async () => {
+      await runDailyProgress();
+      scheduleNext();
+    }, delayMs);
+    console.log(
+      `  Daily progress scheduled, next run: ${nextRunUtc.toISOString()} `
+      + `(${nextDate.month}/${nextDate.day}/${String(nextDate.year).slice(-2)} `
+      + `${String(PROGRESS_TARGET_HOUR).padStart(2, '0')}:${String(PROGRESS_TARGET_MINUTE).padStart(2, '0')} PT)`,
+    );
+  };
+
+  runDailyProgress().catch(err => {
+    console.error('Daily progress startup check error:', err.message);
+  });
+  scheduleNext();
 }
 
 (async () => {
@@ -1334,7 +1442,7 @@ function scheduleDailyProgress() {
       return;
     }
     if (req.url === '/run-daily-progress') {
-      runDailyProgress();
+      runDailyProgress(undefined, { force: true });
       res.writeHead(200);
       res.end('Daily progress triggered');
       return;
