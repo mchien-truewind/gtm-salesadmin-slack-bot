@@ -1458,10 +1458,12 @@ function scheduleDailyProgress() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
-    if (req.url === '/run-digest') {
-      runDiscoveryDigest();
+    if (req.url.startsWith('/run-digest')) {
+      const qs = new URL(req.url, 'http://localhost').searchParams;
+      const channel = qs.get('channel') || undefined;
+      runDiscoveryDigest(channel);
       res.writeHead(200);
-      res.end('Digest triggered');
+      res.end(`Digest triggered${channel ? ` → #${channel}` : ''}`);
       return;
     }
     if (req.url === '/run-daily-progress') {
