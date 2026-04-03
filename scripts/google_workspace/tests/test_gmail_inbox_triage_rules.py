@@ -46,7 +46,7 @@ class InboxTriageRulesTest(unittest.TestCase):
         reason = triage.no_reply_notification_reason(msg, my_email="mercedes@trytruewind.com")
         self.assertIsNone(reason)
 
-    def test_promotional_question_goes_to_review_not_draft(self) -> None:
+    def test_promotional_automated_sender_skips_draft(self) -> None:
         msg = _message(
             sender="invite@emails.magicpatterns.com",
             subject="Magic Patterns Event Invite",
@@ -60,8 +60,8 @@ class InboxTriageRulesTest(unittest.TestCase):
             my_email="mercedes@trytruewind.com",
             min_draft_confidence=2,
         )
-        self.assertEqual(decision, "review")
-        self.assertIn("low-confidence", reason)
+        self.assertEqual(decision, "skip")
+        self.assertIn("automated-sender", reason)
 
     def test_human_direct_request_drafts(self) -> None:
         msg = _message(
@@ -95,7 +95,7 @@ class InboxTriageRulesTest(unittest.TestCase):
             min_draft_confidence=2,
         )
         self.assertEqual(decision, "skip")
-        self.assertIn("intent-not-actionable", reason)
+        self.assertIn("automated-sender", reason)
 
     def test_question_template_never_uses_parrot_line(self) -> None:
         body = triage.generate_reply_body(
@@ -136,6 +136,47 @@ class InboxTriageRulesTest(unittest.TestCase):
         msg = _message(sender="nishadwivedi@google.com", subject="Solicitor outreach", body="Let's connect")
         reason = triage.no_reply_notification_reason(msg, my_email="mercedes@trytruewind.com")
         self.assertIsNotNone(reason)
+
+    def test_notion_team_sender_blocked(self) -> None:
+        msg = _message(
+            sender="team@mail.notion.so",
+            subject="A page mentioned you",
+            body="Automated Notion notification",
+        )
+        reason = triage.no_reply_notification_reason(msg, my_email="mercedes@trytruewind.com")
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("team@mail.notion.so", reason)
+
+    def test_auto_submitted_header_blocked(self) -> None:
+        msg = _message(
+            sender="updates@example.com",
+            subject="System update",
+            body="This is an automated update.",
+            extra_headers={"Auto-Submitted": "auto-generated"},
+        )
+        reason = triage.no_reply_notification_reason(msg, my_email="mercedes@trytruewind.com")
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("auto-submitted-header", reason)
+
+    def test_list_unsubscribe_sender_skips_draft(self) -> None:
+        msg = _message(
+            sender="team@example.com",
+            subject="Newsletter question",
+            body="Would you like to attend our webinar?",
+            extra_headers={"List-Unsubscribe": "<mailto:unsubscribe@example.com>"},
+        )
+        decision, reason, _score = triage.evaluate_draft_decision(
+            inbound=msg,
+            latest_inbound_text=msg["snippet"],
+            previous_outbound_text="",
+            classification_info={"auto_score": 0, "marketing_score": 2},
+            my_email="mercedes@trytruewind.com",
+            min_draft_confidence=2,
+        )
+        self.assertEqual(decision, "skip")
+        self.assertIn("automated-sender", reason)
 
     def test_unsolicited_solicitation_archives(self) -> None:
         thread = _thread(
