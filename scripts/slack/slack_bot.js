@@ -896,14 +896,26 @@ async function runDiscoveryDigest(channelOverride) {
       }
     }
 
-    // 4. Fetch Read.ai meetings for the same day using date filter
+    // 4. Fetch ALL Read.ai meetings for the same day (paginate since API caps at 10/page)
+    //    Internal calls (syncs, standups, etc.) can fill a single page, so we must paginate
+    //    to ensure we don't miss actual discovery calls.
     await refreshReadAiToken();
     let readAiToday = [];
     if (readAiTokens?.access_token) {
       const dateStr = today.toISOString().slice(0, 10);
       const nextDateStr = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
-      const rRes = await readAiRequest(`/meetings?limit=10&start_date=${dateStr}&end_date=${nextDateStr}`);
-      readAiToday = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
+      let cursor = '';
+      const MAX_PAGES = 10; // safety cap: 10 pages x 10 results = 100 meetings/day max
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const params = new URLSearchParams({ limit: '10', start_date: dateStr, end_date: nextDateStr });
+        if (cursor) params.set('cursor', cursor);
+        const rRes = await readAiRequest(`/meetings?${params}`);
+        const items = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
+        readAiToday.push(...items);
+        cursor = rRes.next_cursor || rRes.cursor || rRes.next || rRes.next_page_token || '';
+        if (!cursor || items.length < 10) break;
+      }
+      console.log(`Read.ai: fetched ${readAiToday.length} meetings for ${dateStr}`);
     }
 
     // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
@@ -1129,6 +1141,17 @@ function scheduleDiscoveryDigest() {
       next.setDate(next.getDate() + 1);
     }
     return next - now;
+  }
+  // Check if today's run was missed (e.g. service restarted after target time).
+  // "Today" in PT: if it's past 4 PM PST on a weekday, run immediately.
+  const now = new Date();
+  const ptHour = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const ptDay = ptHour.getDay(); // 0=Sun, 6=Sat
+  const isWeekday = ptDay >= 1 && ptDay <= 5;
+  const isPastTarget = ptHour.getHours() >= 16; // 4 PM PT
+  if (isWeekday && isPastTarget) {
+    console.log(`  Discovery digest: missed today's run, triggering now`);
+    runDiscoveryDigest();
   }
   function run() {
     runDiscoveryDigest();
@@ -1435,10 +1458,12 @@ function scheduleDailyProgress() {
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
-    if (req.url === '/run-digest') {
-      runDiscoveryDigest();
+    if (req.url.startsWith('/run-digest')) {
+      const qs = new URL(req.url, 'http://localhost').searchParams;
+      const channel = qs.get('channel') || undefined;
+      runDiscoveryDigest(channel);
       res.writeHead(200);
-      res.end('Digest triggered');
+      res.end(`Digest triggered${channel ? ` → #${channel}` : ''}`);
       return;
     }
     if (req.url === '/run-daily-progress') {
