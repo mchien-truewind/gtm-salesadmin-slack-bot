@@ -210,6 +210,7 @@ NO_REPLY_EXACT_SENDERS = {
     "truewind.ai@calendar.luma-mail.com",
     "dse@eumail.docusign.net",
     "invite@emails.magicpatterns.com",
+    "team@mail.notion.so",
     "amarpreetkalsi@google.com",
     "nishadwivedi@google.com",
 }
@@ -683,18 +684,43 @@ def no_reply_notification_reason(message: dict[str, Any], *, my_email: str) -> s
     if direct_reason:
         return direct_reason
 
+    header_reason = automated_header_reason(headers, sender=sender)
+    if header_reason:
+        return header_reason
+
     sender_domain = email_domain(sender)
     local_part = email_local_part(sender)
+    precedence = headers.get("precedence", "").strip().lower()
 
     if any(token in local_part for token in NO_REPLY_LOCALPART_TOKENS):
         auto_submitted = headers.get("auto-submitted", "").strip().lower()
-        precedence = headers.get("precedence", "").strip().lower()
         if auto_submitted and auto_submitted != "no":
             return f"auto-submitted-role-mailbox:{sender}"
         if precedence in {"bulk", "list", "junk"}:
             return f"precedence-role-mailbox:{sender}"
         if headers.get("list-unsubscribe"):
             return f"unsubscribe-role-mailbox:{sender}"
+    return None
+
+
+def automated_header_reason(headers: dict[str, str], *, sender: str) -> str | None:
+    sender_label = sender or "<unknown>"
+    auto_submitted = headers.get("auto-submitted", "").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return f"auto-submitted-header:{sender_label}"
+
+    if headers.get("x-autoreply"):
+        return f"x-autoreply-header:{sender_label}"
+
+    if headers.get("x-auto-response-suppress"):
+        return f"x-auto-response-suppress-header:{sender_label}"
+
+    precedence = headers.get("precedence", "").strip().lower()
+    if precedence in {"bulk", "list", "junk"}:
+        return f"precedence-header:{precedence}:{sender_label}"
+
+    if headers.get("list-unsubscribe"):
+        return f"list-unsubscribe-header:{sender_label}"
     return None
 
 
@@ -1293,6 +1319,10 @@ def evaluate_draft_decision(
     my_email: str,
     min_draft_confidence: int,
 ) -> tuple[str, str, int]:
+    automated_reason = no_reply_notification_reason(inbound, my_email=my_email)
+    if automated_reason:
+        return "skip", f"automated-sender:{automated_reason}", 0
+
     intent = detect_reply_intent(latest_inbound_text, previous_outbound_text)
     if intent not in DRAFTABLE_INTENTS:
         return "skip", f"intent-not-actionable:{intent}", 0
