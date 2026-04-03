@@ -904,16 +904,18 @@ async function runDiscoveryDigest(channelOverride) {
     if (readAiTokens?.access_token) {
       const dateStr = today.toISOString().slice(0, 10);
       const nextDateStr = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
-      let cursor = '';
+      let startingAfter = '';
       const MAX_PAGES = 10; // safety cap: 10 pages x 10 results = 100 meetings/day max
       for (let page = 0; page < MAX_PAGES; page++) {
         const params = new URLSearchParams({ limit: '10', start_date: dateStr, end_date: nextDateStr });
-        if (cursor) params.set('cursor', cursor);
+        if (startingAfter) params.set('starting_after', startingAfter);
         const rRes = await readAiRequest(`/meetings?${params}`);
         const items = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
         readAiToday.push(...items);
-        cursor = rRes.next_cursor || rRes.cursor || rRes.next || rRes.next_page_token || '';
-        if (!cursor || items.length < 10) break;
+        // Stripe-style pagination: use last item ID as cursor when has_more is true
+        if (!rRes.has_more || items.length === 0) break;
+        startingAfter = items[items.length - 1].id || '';
+        if (!startingAfter) break;
       }
       console.log(`Read.ai: fetched ${readAiToday.length} meetings for ${dateStr}`);
     }
