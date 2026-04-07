@@ -838,7 +838,62 @@ app.event('message', async ({ event, say }) => {
 // ============================================================
 // Daily Discovery Call Digest
 // ============================================================
-const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'C08GM9QL7QC'; // #gtm-general
+const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'slack-testing'; // #slack-testing
+
+function normalizeDigestText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getDigestMeetingStartMs(meeting) {
+  const iso = meeting?.properties?.hs_meeting_start_time;
+  const parsed = iso ? new Date(iso).getTime() : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getPrimaryDigestContact(meeting) {
+  return (meeting?._externalContacts || [])[0] || (meeting?._contacts || [])[0] || null;
+}
+
+function getDigestContactKey(contact) {
+  if (!contact) return '';
+  const email = normalizeDigestText(contact.email);
+  if (email) return email;
+  const name = normalizeDigestText(`${contact.firstname || ''} ${contact.lastname || ''}`);
+  const company = normalizeDigestText(contact.company);
+  return [name, company].filter(Boolean).join('|');
+}
+
+function getDigestMeetingKey(meeting) {
+  if (meeting?._readAiId) return `readai:${meeting._readAiId}`;
+  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
+  const startMs = getDigestMeetingStartMs(meeting);
+  const contactKey = getDigestContactKey(getPrimaryDigestContact(meeting));
+  return `hubspot:${title}|${startMs}|${contactKey}`;
+}
+
+function dedupeDigestMeetings(meetings) {
+  const seen = new Set();
+  const deduped = [];
+  for (const meeting of meetings) {
+    const key = getDigestMeetingKey(meeting);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(meeting);
+  }
+  return deduped;
+}
+
+function dedupeReadAiMeetings(meetings) {
+  const seen = new Set();
+  const deduped = [];
+  for (const meeting of meetings) {
+    const key = meeting?.id || `${meeting?.report_url || ''}|${meeting?.start_time_ms || 0}|${meeting?.title || meeting?.name || ''}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(meeting);
+  }
+  return deduped;
+}
 
 async function runDiscoveryDigest(channelOverride) {
   const channel = channelOverride || DISCOVERY_DIGEST_CHANNEL;
@@ -917,17 +972,19 @@ async function runDiscoveryDigest(channelOverride) {
         startingAfter = items[items.length - 1].id || '';
         if (!startingAfter) break;
       }
+      readAiToday = dedupeReadAiMeetings(readAiToday);
       console.log(`Read.ai: fetched ${readAiToday.length} meetings for ${dateStr}`);
     }
 
     // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
     const matchedReadAiIds = new Set();
     for (const meeting of scheduled) {
-      const hsStart = new Date(meeting.properties.hs_meeting_start_time).getTime();
-      const matched = readAiToday.find(rm => {
-        const rmStart = rm.start_time_ms || 0;
-        return Math.abs(rmStart - hsStart) < 30 * 60 * 1000;
-      });
+      const hsStart = getDigestMeetingStartMs(meeting);
+      const matched = readAiToday
+        .filter(rm => !matchedReadAiIds.has(rm.id))
+        .map(rm => ({ rm, diff: Math.abs((rm.start_time_ms || 0) - hsStart) }))
+        .filter(item => item.diff < 30 * 60 * 1000)
+        .sort((a, b) => a.diff - b.diff)[0]?.rm;
       if (matched) {
         meeting._readAiId = matched.id;
         meeting._readAiUrl = matched.report_url || `https://app.read.ai/analytics/meetings/${matched.id}`;
@@ -1019,12 +1076,15 @@ async function runDiscoveryDigest(channelOverride) {
       scheduled.push(fallbackMeeting);
     }
 
+    const uniqueCanceled = dedupeDigestMeetings(canceled);
+    const uniqueScheduled = dedupeDigestMeetings(scheduled);
+
     // 6. Determine no-shows: no Read.ai match, OR Read.ai match but no transcript/summary
     const hasContent = (m) => m._readAiId && (m._summary || (m._transcript && (m._transcript.turns?.length > 0 || typeof m._transcript === 'string')));
-    const completed = scheduled.filter(m => hasContent(m));
-    const noShows = scheduled.filter(m => !hasContent(m));
+    const completed = uniqueScheduled.filter(m => hasContent(m));
+    const noShows = uniqueScheduled.filter(m => !hasContent(m));
 
-    if (scheduled.length === 0 && canceled.length === 0) {
+    if (uniqueScheduled.length === 0 && uniqueCanceled.length === 0) {
       await app.client.chat.postMessage({
         token: process.env.SLACK_BOT_TOKEN,
         channel,
@@ -1082,7 +1142,7 @@ QUOTE: "..." -- [Speaker Name]`,
 
     // 7. Format and post
     let msg = `*Discovery Call Digest -- ${dateLabel}*\n\n`;
-    msg += `Scheduled: ${scheduled.length + canceled.length}\n`;
+    msg += `Scheduled: ${uniqueScheduled.length + uniqueCanceled.length}\n`;
     msg += `Completed: ${completed.length}\n`;
     msg += `No-shows: ${noShows.length}`;
     if (noShows.length > 0) {
@@ -1094,9 +1154,9 @@ QUOTE: "..." -- [Speaker Name]`,
       });
       msg += ` -- ${noShowNames.join(', ')}`;
     }
-    msg += `\nCanceled: ${canceled.length}`;
-    if (canceled.length > 0) {
-      const cancelNames = canceled.map(m => (m.properties.hs_meeting_title || '').replace('Canceled: ', '').replace(' and Sarah Elix', ''));
+    msg += `\nCanceled: ${uniqueCanceled.length}`;
+    if (uniqueCanceled.length > 0) {
+      const cancelNames = uniqueCanceled.map(m => (m.properties.hs_meeting_title || '').replace('Canceled: ', '').replace(' and Sarah Elix', ''));
       msg += ` -- ${cancelNames.join(', ')}`;
     }
     msg += '\n';
