@@ -116,6 +116,7 @@ REJECT_EXCLUSION_PATTERNS = [
 ]
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
+FORWARD_THREAD_MARKER_PREFIX = "ATS_FORWARD_THREAD_ID:"
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
 DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
@@ -177,8 +178,10 @@ class Config:
     slack_history_lookback_days: int
     slack_proceed_reactions: set[str]
     slack_reject_reactions: set[str]
+    slack_forward_reactions: set[str]
     slack_allow_decision_override: bool
     slack_state_file: Path
+    forward_to_email: str
     property_map: NotionPropertyMap
     drive_folder_id: str
     timezone_name: str
@@ -455,10 +458,14 @@ def load_config() -> Config:
         slack_reject_reactions=parse_csv_set(
             os.getenv("RECRUITING_SLACK_REJECT_REACTIONS", ""), default="x"
         ),
+        slack_forward_reactions=parse_csv_set(
+            os.getenv("RECRUITING_SLACK_FORWARD_REACTIONS", ""), default="arrow_right"
+        ),
         slack_allow_decision_override=parse_env_bool("RECRUITING_SLACK_ALLOW_DECISION_OVERRIDE", False),
         slack_state_file=Path(
             os.getenv("RECRUITING_SLACK_STATE_FILE", "outputs/recruiting/slack_review_posts.json")
         ).expanduser(),
+        forward_to_email=normalize_email(os.getenv("RECRUITING_FORWARD_TO_EMAIL", "tenn@trytruewind.com")),
         property_map=property_map,
         drive_folder_id=get_env_first("GOOGLE_DRIVE_FOLDER_ID", "GOOGLE_DRIVE_FOLDER_ATS"),
         timezone_name=timezone_name,
@@ -1792,6 +1799,105 @@ def create_reply_draft(
     return created.get("id", "")
 
 
+def thread_forward_already_sent(
+    gmail_service,
+    *,
+    sender_email: str,
+    recipient_email: str,
+    thread_id: str,
+) -> bool:
+    marker = forward_thread_marker(thread_id)
+    query = f'in:sent to:{recipient_email} "{marker}"'
+    try:
+        response = gmail_service.users().messages().list(userId="me", q=query, maxResults=10).execute()
+    except Exception:
+        return False
+
+    for item in response.get("messages", []) or []:
+        try:
+            message = (
+                gmail_service.users()
+                .messages()
+                .get(userId="me", id=item.get("id", ""), format="metadata", metadataHeaders=["From"])
+                .execute()
+            )
+        except Exception:
+            continue
+        headers = header_map(message)
+        from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        if sender_matches_outbound_scope(from_email, sender_email):
+            return True
+    return False
+
+
+def forward_candidate_thread_to_recipient(
+    gmail_service,
+    *,
+    sender_email: str,
+    recipient_email: str,
+    thread_id: str,
+    candidate_name: str,
+    candidate_email: str,
+    role: str,
+    notion_url: str = "",
+    resume_url: str = "",
+    internal_domains: set[str],
+) -> str:
+    thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    application_message = select_application_message_from_thread(thread, internal_domains=internal_domains)
+    if application_message is None:
+        raise ValueError(f"Could not find application message for thread {thread_id}")
+
+    headers = header_map(application_message)
+    original_subject = clean_text(headers.get("subject", "")) or "Application"
+    original_from = headers.get("from", "").strip()
+    original_body = extract_message_body_text(application_message).strip()
+    snippet = clean_text(application_message.get("snippet", ""))
+    marker = forward_thread_marker(thread_id)
+
+    forward_subject = original_subject if original_subject.lower().startswith("fwd:") else f"Fwd: {original_subject}"
+    body_lines = [
+        marker,
+        f"Candidate: {candidate_name}",
+        f"Candidate Email: {candidate_email}",
+        f"Role @ Truewind: {role}",
+    ]
+    if notion_url:
+        body_lines.append(f"Notion ATS: {notion_url}")
+    if resume_url:
+        body_lines.append(f"Resume: {resume_url}")
+    body_lines.extend(
+        [
+            "",
+            f"Original message from {original_from}:",
+            "",
+            original_body or snippet or "(no message body captured)",
+        ]
+    )
+
+    message = EmailMessage()
+    message["From"] = sender_email
+    message["To"] = recipient_email
+    message["Subject"] = f"{forward_subject} [{marker}]"
+    message.set_content("\n".join(body_lines))
+
+    resume_reference = extract_primary_resume_part_from_thread(thread)
+    if resume_reference:
+        attachment_message_id, resume_part = resume_reference
+        filename = (resume_part.get("filename") or "resume").strip() or "resume"
+        raw = gmail_message_attachment_bytes(gmail_service, attachment_message_id, resume_part)
+        mime_type = (resume_part.get("mimeType") or "").strip() or (
+            mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        )
+        maintype, subtype = mime_type.split("/", 1) if "/" in mime_type else ("application", "octet-stream")
+        if raw:
+            message.add_attachment(raw, maintype=maintype, subtype=subtype, filename=filename)
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    sent = gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return sent.get("id", "")
+
+
 def parse_iso_datetime(value: str, timezone_name: str) -> datetime | None:
     if not value:
         return None
@@ -2531,9 +2637,21 @@ def slack_thread_marker(thread_id: str) -> str:
     return f"{SLACK_THREAD_MARKER_PREFIX}{thread_id}"
 
 
+def forward_thread_marker(thread_id: str) -> str:
+    return f"{FORWARD_THREAD_MARKER_PREFIX}{thread_id}"
+
+
 def extract_thread_id_from_slack_message(message_text: str) -> str:
     match = re.search(rf"{SLACK_THREAD_MARKER_PREFIX}([A-Za-z0-9_-]+)", message_text or "")
     return match.group(1).strip() if match else ""
+
+
+def slack_reaction_names(reactions: list[dict[str, Any]]) -> set[str]:
+    return {
+        (reaction.get("name", "") or "").strip().lower()
+        for reaction in reactions
+        if isinstance(reaction, dict) and int(reaction.get("count", 0) or 0) > 0
+    }
 
 
 def derive_decision_from_reactions(
@@ -2541,11 +2659,7 @@ def derive_decision_from_reactions(
     proceed_reactions: set[str],
     reject_reactions: set[str],
 ) -> str:
-    reaction_names = {
-        (reaction.get("name", "") or "").strip().lower()
-        for reaction in reactions
-        if isinstance(reaction, dict) and int(reaction.get("count", 0) or 0) > 0
-    }
+    reaction_names = slack_reaction_names(reactions)
     has_proceed = bool(reaction_names.intersection(proceed_reactions))
     has_reject = bool(reaction_names.intersection(reject_reactions))
     if has_proceed and has_reject:
@@ -2634,7 +2748,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         marker = slack_thread_marker(thread_id)
         fallback_text = (
             f"{mention_prefix}New candidate: {candidate['candidate_name']} ({candidate['role']}) "
-            f"- react :white_check_mark: to proceed or :x: to reject. {marker}"
+            f"- react :white_check_mark: to proceed, :x: to reject, or :arrow_right: to forward to Tenn. {marker}"
         )
         resume_url = candidate.get("resume_url", "")
         notion_url = candidate.get("notion_url", "")
@@ -2654,7 +2768,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
                         f"*Location:* {candidate['location']}\n"
                         f"*Career Stage:* {candidate['career_stage']}\n"
                         f"*LinkedIn:* {linkedin_display}\n"
-                        "React with :white_check_mark: to `Proceed` or :x: to `Reject`."
+                        "React with :white_check_mark: to `Proceed`, :x: to `Reject`, or :arrow_right: to forward to Tenn."
                     ),
                 },
             },
@@ -2742,12 +2856,13 @@ def sync_slack_decisions(
     config: Config,
     notion: NotionClient,
     database_schema: dict[str, Any],
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     if not slack_enabled(config):
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0
 
     properties = database_schema.get("properties", {})
     prop = resolve_property_map(config.property_map, database_schema)
+    title_prop_name = resolve_title_property_name(properties, prop.candidate_name)
     required_props = [prop.decision, prop.decision_time, prop.gmail_thread_id]
     for required in required_props:
         if required not in properties:
@@ -2759,10 +2874,14 @@ def sync_slack_decisions(
     messages = client.list_channel_messages(channel_id, oldest_ts)
 
     decisions_by_thread: dict[str, tuple[str, float]] = {}
+    forward_threads: set[str] = set()
     for message in messages:
         thread_id = extract_thread_id_from_slack_message(message.get("text", ""))
         if not thread_id:
             continue
+        reaction_names = slack_reaction_names(message.get("reactions", []))
+        if reaction_names.intersection(config.slack_forward_reactions):
+            forward_threads.add(thread_id)
         decision = derive_decision_from_reactions(
             message.get("reactions", []),
             config.slack_proceed_reactions,
@@ -2778,9 +2897,6 @@ def sync_slack_decisions(
         if not current or ts > current[1]:
             decisions_by_thread[thread_id] = (decision, ts)
 
-    if not decisions_by_thread:
-        return 0, 0, 0, 0
-
     pages = notion.query_pages({"page_size": 100})
     page_by_thread: dict[str, dict[str, Any]] = {}
     for page in pages:
@@ -2793,6 +2909,10 @@ def sync_slack_decisions(
     skipped_missing = 0
     skipped_locked = 0
     skipped_unchanged = 0
+    forwards_sent = 0
+    forwards_skipped_missing = 0
+    forwards_skipped_existing = 0
+    gmail_service = None
     now_iso = iso(datetime.now(timezone.utc))
 
     for thread_id, (decision, _ts) in decisions_by_thread.items():
@@ -2843,7 +2963,67 @@ def sync_slack_decisions(
         notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
         updated += 1
 
-    return updated, skipped_missing, skipped_locked, skipped_unchanged
+    if forward_threads and config.forward_to_email:
+        gmail_service = ensure_google_service(
+            api_name="gmail",
+            api_version="v1",
+            scopes=GMAIL_SCOPES,
+            credentials_env="GOOGLE_GMAIL_CREDENTIALS_FILE",
+            credentials_default="secrets/google-gmail-credentials.json",
+            token_env="GOOGLE_GMAIL_TOKEN_FILE",
+            token_default="secrets/google-gmail-token.json",
+            help_text="Set GOOGLE_GMAIL_CREDENTIALS_FILE or place Gmail OAuth credentials in secrets/.",
+        )
+        internal_domains = {email_domain(config.from_email)}
+        if config.hiring_alias:
+            internal_domains.add(email_domain(config.hiring_alias))
+        internal_domains.discard("")
+
+        for thread_id in sorted(forward_threads):
+            page = page_by_thread.get(thread_id)
+            if not page:
+                forwards_skipped_missing += 1
+                continue
+            if thread_forward_already_sent(
+                gmail_service,
+                sender_email=config.from_email,
+                recipient_email=config.forward_to_email,
+                thread_id=thread_id,
+            ):
+                forwards_skipped_existing += 1
+                continue
+
+            page_props = page.get("properties", {})
+            candidate_name = notion_prop_value(page_props.get(title_prop_name, {})).strip() or "Candidate"
+            candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
+            role_values = notion_prop_values(page_props.get(prop.role, {}))
+            role = ", ".join(role_values) if role_values else notion_prop_value(page_props.get(prop.role, {})).strip()
+            notion_url = notion_page_url(page.get("id", ""))
+            resume_url = notion_prop_value(page_props.get(prop.resume_url, {})).strip()
+
+            forward_candidate_thread_to_recipient(
+                gmail_service,
+                sender_email=config.from_email,
+                recipient_email=config.forward_to_email,
+                thread_id=thread_id,
+                candidate_name=candidate_name,
+                candidate_email=candidate_email,
+                role=role or "Unknown",
+                notion_url=notion_url,
+                resume_url=resume_url,
+                internal_domains=internal_domains,
+            )
+            forwards_sent += 1
+
+    return (
+        updated,
+        skipped_missing,
+        skipped_locked,
+        skipped_unchanged,
+        forwards_sent,
+        forwards_skipped_missing,
+        forwards_skipped_existing,
+    )
 
 
 def require_notion_property(
@@ -3990,7 +4170,15 @@ def sync_slack_decisions_cmd(_args: argparse.Namespace) -> None:
     notion = NotionClient(config.notion_token, config.notion_database_id)
     database_schema = notion.get_database()
     try:
-        updated, skipped_missing, skipped_locked, skipped_unchanged = sync_slack_decisions(
+        (
+            updated,
+            skipped_missing,
+            skipped_locked,
+            skipped_unchanged,
+            forwards_sent,
+            forwards_skipped_missing,
+            forwards_skipped_existing,
+        ) = sync_slack_decisions(
             config, notion, database_schema
         )
     except Exception as exc:
@@ -4001,6 +4189,9 @@ def sync_slack_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Slack decisions skipped (no matching Notion thread): {skipped_missing}")
     print(f"Slack decisions skipped (Notion already decided): {skipped_locked}")
     print(f"Slack decisions skipped (unchanged): {skipped_unchanged}")
+    print(f"Tenn forwards sent: {forwards_sent}")
+    print(f"Tenn forwards skipped (no matching Notion thread): {forwards_skipped_missing}")
+    print(f"Tenn forwards skipped (already sent): {forwards_skipped_existing}")
 
 
 def run_cmd(_args: argparse.Namespace) -> None:
@@ -4101,6 +4292,8 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "slack_allow_decision_override": config.slack_allow_decision_override,
         "slack_proceed_reactions": sorted(config.slack_proceed_reactions),
         "slack_reject_reactions": sorted(config.slack_reject_reactions),
+        "slack_forward_reactions": sorted(config.slack_forward_reactions),
+        "forward_to_email": config.forward_to_email,
         "reject_delay_hours": config.reject_delay_hours,
         "no_response_wait_days": config.no_response_wait_days,
         "assignment_keywords": sorted(config.assignment_keywords),
