@@ -2802,6 +2802,10 @@ def sync_slack_decisions(
             continue
 
         page_props = page.get("properties", {})
+        existing_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
+        if status_is_terminal(existing_status):
+            skipped_locked += 1
+            continue
         existing_decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
         if existing_decision == decision:
             skipped_unchanged += 1
@@ -2855,6 +2859,7 @@ def require_notion_property(
 
 ROLE_OPTIONS = ("BDR", "Growth Generalist", "Other")
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process")
+TERMINAL_STATUSES = {"rejected"}
 
 
 def notion_prop_values(prop: dict[str, Any]) -> list[str]:
@@ -2867,6 +2872,10 @@ def notion_prop_values(prop: dict[str, Any]) -> list[str]:
         ]
     value = notion_prop_value(prop)
     return [value] if value else []
+
+
+def status_is_terminal(status: str) -> bool:
+    return clean_text(status).lower() in TERMINAL_STATUSES
 
 
 def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
@@ -3059,12 +3068,12 @@ def upsert_candidate_page(
         notion, database_schema, prop_map, gmail_thread_id, candidate_email
     )
 
+    if page:
+        # Existing ATS rows are manually curated in Notion. Avoid overwriting
+        # profile fields during subsequent sync cycles.
+        return page["id"], False
+
     role_values: list[str] = [role] if role in ROLE_OPTIONS else []
-    if page and prop_map.role in properties_schema:
-        existing_roles = [
-            item for item in notion_prop_values(page.get("properties", {}).get(prop_map.role, {})) if item in ROLE_OPTIONS
-        ]
-        role_values = list(dict.fromkeys([*existing_roles, *role_values]))
 
     base_values: dict[str, Any] = {
         title_prop_name: candidate_name,
@@ -3092,10 +3101,6 @@ def upsert_candidate_page(
         built = build_notion_value(properties_schema[prop_name], value)
         if built is not None:
             properties_payload[prop_name] = built
-
-    if page:
-        notion.update_page(page["id"], properties_payload)
-        return page["id"], False
 
     created = notion.create_page(properties_payload)
     return created["id"], True
@@ -3517,6 +3522,18 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             thread_ids=related_thread_ids,
             fallback_thread_id=thread_id,
         )
+
+        if status_is_terminal(current_status):
+            archive_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
+            if archive_labels:
+                archived_count, archive_failures = remove_labels_from_threads(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    label_ids=archive_labels,
+                )
+                non_scheduling_threads_archived += archived_count
+                non_scheduling_archive_failures += archive_failures
+            continue
 
         update_payload: dict[str, Any] = {}
         in_pipeline = False
