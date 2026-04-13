@@ -25,6 +25,10 @@ A bare-bones extraction of `agentic-os` focused on:
    ./.codex/scripts/codex-skills/sync_codex_skills.sh
    ```
 
+## SOPs
+
+- HubSpot credential setup and safe verification: `docs/instructions/hubspot-credential-verification.md`
+
 ## Daily Lead Progress Slack Post (Railway)
 
 1. Put your token in `.env.local`:
