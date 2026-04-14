@@ -47,6 +47,22 @@ test('HubSpot discovery classification uses owner scope, include terms, and excl
   }, config), false);
 });
 
+test('HubSpot discovery classification supports fetched owner email scope', () => {
+  const config = buildDiscoveryDigestConfig({
+    DISCOVERY_DIGEST_SALES_EMAILS: 'seller@trytruewind.com',
+    DISCOVERY_DIGEST_INTERNAL_DOMAINS: 'trytruewind.com',
+  });
+
+  assert.equal(isLikelyHubSpotDiscoveryMeeting({
+    properties: {
+      hubspot_owner_email: 'seller@trytruewind.com',
+      hs_meeting_title: 'Discovery call with Acme',
+      hs_meeting_body: '',
+    },
+    _externalContacts: [{ email: 'cfo@acme.com' }],
+  }, config), true);
+});
+
 test('Grain discovery classification requires sales scope and an external participant', () => {
   const config = buildDiscoveryDigestConfig({
     DISCOVERY_DIGEST_SALES_EMAILS: 'sarah@trytruewind.com',
@@ -70,6 +86,20 @@ test('Grain discovery classification requires sales scope and an external partic
       { email: 'alex@trytruewind.com' },
     ],
   }, config), false);
+});
+
+test('Grain discovery classification supports owner email arrays from public API', () => {
+  const config = buildDiscoveryDigestConfig({
+    DISCOVERY_DIGEST_SALES_EMAILS: 'seller@trytruewind.com',
+    DISCOVERY_DIGEST_INTERNAL_DOMAINS: 'trytruewind.com',
+  });
+
+  assert.equal(isLikelyGrainDiscoveryRecording({
+    id: 'grain_3',
+    title: 'Intro with Acme',
+    owners: ['seller@trytruewind.com'],
+    participants: [{ email: 'buyer@acme.com' }],
+  }, config), true);
 });
 
 test('Grain matching prefers participant email overlap over nearest unrelated recording', () => {
