@@ -714,7 +714,10 @@ app.event('message', async ({ event, say }) => {
 // Daily Discovery Call Digest
 // ============================================================
 const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'slack-testing'; // #slack-testing
-const GRAIN_API_TOKEN = process.env.GRAIN_API_TOKEN || process.env.GRAIN_ACCESS_TOKEN || process.env.GRAIN_WORKSPACE_TOKEN;
+const GRAIN_API_TOKEN = process.env.GRAIN_API_TOKEN
+  || process.env.GRAIN_API
+  || process.env.GRAIN_ACCESS_TOKEN
+  || process.env.GRAIN_WORKSPACE_TOKEN;
 const GRAIN_API_BASE = process.env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api';
 
 async function grainRequest(endpoint) {
@@ -796,7 +799,7 @@ async function attachHubSpotContacts(meetings, config) {
 
 async function fetchGrainRecordingsForDay(startOfDay, endOfDay) {
   if (!GRAIN_API_TOKEN) {
-    throw new Error('Missing Grain API token. Set GRAIN_API_TOKEN, GRAIN_ACCESS_TOKEN, or GRAIN_WORKSPACE_TOKEN.');
+    throw new Error('Missing Grain API token. Set GRAIN_API_TOKEN, GRAIN_API, GRAIN_ACCESS_TOKEN, or GRAIN_WORKSPACE_TOKEN.');
   }
 
   const recordings = [];
