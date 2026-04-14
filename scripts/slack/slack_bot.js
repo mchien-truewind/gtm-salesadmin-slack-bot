@@ -19,6 +19,21 @@ const {
   DEFAULT_CHANNEL: INSTANTLY_POSITIVE_REPLY_DEFAULT_CHANNEL,
   handleInstantlyPositiveReplyWebhook,
 } = require('./instantly_positive_reply_alert');
+const {
+  buildDiscoveryDigestConfig,
+  dedupeDigestMeetings,
+  dedupeGrainRecordings,
+  findBestGrainRecordingForMeeting,
+  formatGrainTranscriptText,
+  getGrainRecordingId,
+  getGrainRecordingStartMs,
+  getGrainRecordingTitle,
+  getGrainRecordingUrl,
+  isLikelyGrainDiscoveryRecording,
+  isLikelyHubSpotDiscoveryMeeting,
+  normalizeDigestText,
+  parseListItems,
+} = require('./discovery_digest');
 
 // ============================================================
 // Google Sheets setup
@@ -76,34 +91,6 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
   });
 }
 
-// ============================================================
-// Read AI setup
-// ============================================================
-let readAiTokens = null;
-let readAiOauthState = null;
-const readAiTokensPath = path.resolve(__dirname, '../../secrets/read_ai_tokens.json');
-const readAiOauthPath = path.resolve(__dirname, '../../secrets/read_ai_oauth_state.json');
-
-if (fs.existsSync(readAiTokensPath)) {
-  readAiTokens = JSON.parse(fs.readFileSync(readAiTokensPath, 'utf8'));
-}
-if (fs.existsSync(readAiOauthPath)) {
-  readAiOauthState = JSON.parse(fs.readFileSync(readAiOauthPath, 'utf8'));
-}
-// For Railway: tokens from env vars
-if (!readAiTokens && process.env.READ_AI_REFRESH_TOKEN) {
-  readAiTokens = {
-    access_token: process.env.READ_AI_ACCESS_TOKEN || '',
-    refresh_token: process.env.READ_AI_REFRESH_TOKEN,
-  };
-  readAiOauthState = {
-    client_id: process.env.READ_AI_CLIENT_ID,
-    client_secret: process.env.READ_AI_CLIENT_SECRET,
-    token_endpoint: process.env.READ_AI_TOKEN_ENDPOINT || 'https://authn.read.ai/oauth2/token',
-    redirect_uri: process.env.READ_AI_REDIRECT_URI || 'https://api.read.ai/oauth/ui',
-  };
-}
-
 async function httpRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -119,128 +106,6 @@ async function httpRequest(url, options = {}) {
     if (options.body) req.write(options.body);
     req.end();
   });
-}
-
-const TOKEN_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
-const TOKEN_SHEET_RANGE = '_bot_config!B2'; // Cell with the refresh token
-
-async function loadRefreshTokenFromSheet() {
-  try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: TOKEN_SHEET_ID,
-      range: TOKEN_SHEET_RANGE,
-    });
-    const token = res.data.values?.[0]?.[0];
-    if (token) {
-      console.log('Loaded Read AI refresh token from Google Sheet');
-      return token;
-    }
-  } catch (err) {
-    console.error('Failed to load refresh token from sheet:', err.message);
-  }
-  return null;
-}
-
-async function saveRefreshTokenToSheet(token) {
-  try {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: TOKEN_SHEET_ID,
-      range: TOKEN_SHEET_RANGE,
-      valueInputOption: 'RAW',
-      requestBody: { values: [[token]] },
-    });
-    console.log('Saved Read AI refresh token to Google Sheet');
-  } catch (err) {
-    console.error('Failed to save refresh token to sheet:', err.message);
-  }
-}
-
-async function refreshReadAiToken() {
-  if (!readAiOauthState) return null;
-
-  // Try sheet first (most up-to-date), then in-memory, then env var
-  let refreshToken = await loadRefreshTokenFromSheet();
-  if (!refreshToken) {
-    refreshToken = readAiTokens?.refresh_token;
-  }
-  if (!refreshToken) {
-    refreshToken = process.env.READ_AI_REFRESH_TOKEN;
-  }
-  if (!refreshToken) return null;
-  console.log('Using refresh token:', refreshToken.slice(0, 20) + '...');
-
-  const clientId = readAiOauthState.client_id;
-  const clientSecret = readAiOauthState.client_secret;
-  const tokenEndpoint = readAiOauthState.token_endpoint;
-  if (!clientId || !clientSecret || !tokenEndpoint) return null;
-
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: refreshToken,
-    redirect_uri: readAiOauthState.redirect_uri || '',
-  }).toString();
-
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
-  try {
-    const payload = await httpRequest(tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-        'Authorization': `Basic ${basic}`,
-      },
-      body,
-    });
-
-    if (payload.access_token) {
-      if (!readAiTokens) readAiTokens = {};
-      readAiTokens.access_token = payload.access_token;
-      if (payload.refresh_token) {
-        readAiTokens.refresh_token = payload.refresh_token;
-        // Persist to Google Sheet so it survives Railway redeploys
-        await saveRefreshTokenToSheet(payload.refresh_token);
-        // Also persist locally if possible
-        if (fs.existsSync(path.dirname(readAiTokensPath))) {
-          fs.writeFileSync(readAiTokensPath, JSON.stringify(readAiTokens, null, 2));
-        }
-      }
-      console.log('Read AI token refreshed');
-      return payload.access_token;
-    }
-    console.error('Read AI refresh failed:', JSON.stringify(payload));
-    return null;
-  } catch (err) {
-    console.error('Read AI refresh error:', err.message);
-    return null;
-  }
-}
-
-async function readAiRequest(endpoint, retried = false) {
-  if (!readAiTokens && !readAiOauthState) return { error: 'Read AI not configured' };
-  const url = `https://api.read.ai/v1${endpoint}`;
-  try {
-    // Always refresh token before making a request to avoid stale token issues
-    await refreshReadAiToken();
-    if (!readAiTokens?.access_token) return { error: 'Failed to get Read AI access token' };
-    const result = await httpRequest(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${readAiTokens.access_token}`,
-        'Accept': 'application/json',
-      },
-    });
-    console.log(`Read AI ${endpoint}: ${typeof result === 'object' ? JSON.stringify(result).slice(0, 200) : result}`);
-    // If unauthorized, try refreshing token once more
-    if ((result.error === 'request_unauthorized' || result.error_description) && !retried) {
-      const newToken = await refreshReadAiToken();
-      if (newToken) return readAiRequest(endpoint, true);
-    }
-    return result;
-  } catch (err) {
-    console.error(`Read AI request error: ${err.message}`);
-    return { error: err.message };
-  }
 }
 
 // ============================================================
@@ -457,26 +322,26 @@ const TOOLS = [
       required: ['from_type', 'from_id', 'to_type'],
     },
   },
-  // --- Read AI tools ---
+  // --- Grain tools ---
   {
-    name: 'readai_list_meetings',
-    description: 'List recent meetings from Read AI with transcripts and summaries. Returns meeting titles, dates, participants, and IDs.',
+    name: 'grain_list_recordings',
+    description: 'List recent Grain recordings with titles, dates, participants, IDs, and transcript links.',
     input_schema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Max meetings to return (default 10, max 50)' },
+        limit: { type: 'number', description: 'Max recordings to return (default 10, max 50)' },
       },
     },
   },
   {
-    name: 'readai_get_meeting',
-    description: 'Get full details of a Read AI meeting including summary, topics, key questions, and transcript.',
+    name: 'grain_get_recording',
+    description: 'Get full details of a Grain recording including summary, participants, transcript, and transcript link.',
     input_schema: {
       type: 'object',
       properties: {
-        meeting_id: { type: 'string', description: 'The Read AI meeting ID' },
+        recording_id: { type: 'string', description: 'The Grain recording ID' },
       },
-      required: ['meeting_id'],
+      required: ['recording_id'],
     },
   },
 ];
@@ -577,33 +442,28 @@ async function executeTool(name, input) {
       return JSON.stringify(res.results || []);
     }
 
-    // --- Read AI ---
-    if (name === 'readai_list_meetings') {
+    // --- Grain ---
+    if (name === 'grain_list_recordings') {
       const limit = input.limit || 10;
-      const res = await readAiRequest(`/meetings?limit=${limit}`);
+      const res = await grainRequest(`/recordings?limit=${Math.min(limit, 50)}`);
       if (res.error) return `Error: ${res.error}`;
-      // Normalize response -- Read AI may return { items: [...] } or { meetings: [...] } or an array
-      const meetings = res.data || res.items || res.meetings || (Array.isArray(res) ? res : []);
-      return JSON.stringify(meetings.map(m => ({
-        id: m.id,
-        title: m.title || m.name,
-        date: m.start_time_ms ? new Date(m.start_time_ms).toISOString() : (m.start_time || m.date || m.created_at),
-        participants: m.participants || m.attendees,
-        report_url: m.report_url,
-        platform: m.platform,
+      const { items: recordings } = parseListItems(res);
+      return JSON.stringify(recordings.map(recording => ({
+        id: getGrainRecordingId(recording),
+        title: getGrainRecordingTitle(recording),
+        date: getGrainRecordingStartMs(recording) ? new Date(getGrainRecordingStartMs(recording)).toISOString() : '',
+        participants: recording.participants || recording.attendees,
+        transcript_url: getGrainRecordingUrl(recording),
       })));
     }
-    if (name === 'readai_get_meeting') {
-      // Try with expanded fields
-      const params = new URLSearchParams([
-        ['expand[]', 'summary'],
-        ['expand[]', 'topics'],
-        ['expand[]', 'key_questions'],
-        ['expand[]', 'transcript'],
-      ]);
-      const res = await readAiRequest(`/meetings/${input.meeting_id}?${params}`);
-      if (res.error) return `Error: ${res.error}`;
-      return JSON.stringify(res);
+    if (name === 'grain_get_recording') {
+      const detail = await fetchGrainRecordingDetail({ id: input.recording_id });
+      if (detail.error) return `Error: ${detail.error}`;
+      return JSON.stringify({
+        ...detail,
+        transcript_url: getGrainRecordingUrl(detail),
+        transcript_text: formatGrainTranscriptText(detail),
+      });
     }
 
     return `Unknown tool: ${name}`;
@@ -640,7 +500,7 @@ const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
 
 function getSystemPrompt() {
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-  return `You are Truewind's internal AI assistant in Slack. You have tools for Google Sheets, HubSpot CRM, and Read AI meeting transcripts. You MUST use them when asked to take actions. NEVER say you can't do something -- you have the tools, use them.
+  return `You are Truewind's internal AI assistant in Slack. You have tools for Google Sheets, HubSpot CRM, and Grain meeting transcripts. You MUST use them when asked to take actions. NEVER say you can't do something -- you have the tools, use them.
 
 Today's date is ${today}. Never use em dashes.
 
@@ -673,8 +533,8 @@ Key owner IDs:
 - Caitlyn Mathews: 84547075
 - Mercedes Chien: 87811681
 
-## Read AI
-You have access to Read AI meeting transcripts. You can list recent meetings and get full details including summaries, topics, key questions, and transcripts. Use this when asked about customer calls, meeting notes, or transcripts.
+## Grain
+You have access to Grain meeting transcripts. You can list recent recordings and get full details including summaries, participants, transcript text, and transcript links. Use this when asked about customer calls, meeting notes, or transcripts.
 
 ## General behavior
 - Keep responses short and direct
@@ -854,248 +714,275 @@ app.event('message', async ({ event, say }) => {
 // Daily Discovery Call Digest
 // ============================================================
 const DISCOVERY_DIGEST_CHANNEL = process.env.DISCOVERY_DIGEST_CHANNEL || 'slack-testing'; // #slack-testing
+const GRAIN_API_TOKEN = process.env.GRAIN_API_TOKEN || process.env.GRAIN_ACCESS_TOKEN || process.env.GRAIN_WORKSPACE_TOKEN;
+const GRAIN_API_BASE = process.env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api';
 
-function normalizeDigestText(value) {
-  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
-}
-
-function getDigestMeetingStartMs(meeting) {
-  const iso = meeting?.properties?.hs_meeting_start_time;
-  const parsed = iso ? new Date(iso).getTime() : 0;
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function getPrimaryDigestContact(meeting) {
-  return (meeting?._externalContacts || [])[0] || (meeting?._contacts || [])[0] || null;
-}
-
-function getDigestContactKey(contact) {
-  if (!contact) return '';
-  const email = normalizeDigestText(contact.email);
-  if (email) return email;
-  const name = normalizeDigestText(`${contact.firstname || ''} ${contact.lastname || ''}`);
-  const company = normalizeDigestText(contact.company);
-  return [name, company].filter(Boolean).join('|');
-}
-
-function getDigestMeetingKey(meeting) {
-  if (meeting?._readAiId) return `readai:${meeting._readAiId}`;
-  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
-  const startMs = getDigestMeetingStartMs(meeting);
-  const contactKey = getDigestContactKey(getPrimaryDigestContact(meeting));
-  return `hubspot:${title}|${startMs}|${contactKey}`;
-}
-
-function dedupeDigestMeetings(meetings) {
-  const seen = new Set();
-  const deduped = [];
-  for (const meeting of meetings) {
-    const key = getDigestMeetingKey(meeting);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(meeting);
+async function grainRequest(endpoint) {
+  if (!GRAIN_API_TOKEN) return { error: 'Grain not configured' };
+  const url = endpoint.startsWith('http') ? endpoint : `${GRAIN_API_BASE.replace(/\/$/, '')}${endpoint}`;
+  try {
+    return await httpRequest(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${GRAIN_API_TOKEN}`,
+        'Accept': 'application/json',
+      },
+    });
+  } catch (err) {
+    console.error(`Grain request error: ${err.message}`);
+    return { error: err.message };
   }
-  return deduped;
 }
 
-function dedupeReadAiMeetings(meetings) {
-  const seen = new Set();
-  const deduped = [];
-  for (const meeting of meetings) {
-    const key = meeting?.id || `${meeting?.report_url || ''}|${meeting?.start_time_ms || 0}|${meeting?.title || meeting?.name || ''}`;
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(meeting);
+async function searchHubSpotMeetingsForDigest(startOfDay, endOfDay) {
+  const meetings = [];
+  let after = '';
+  const MAX_PAGES = 10;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: startOfDay.toISOString() },
+          { propertyName: 'hs_meeting_start_time', operator: 'LT', value: endOfDay.toISOString() },
+        ],
+      }],
+      properties: [
+        'hs_meeting_title',
+        'hs_meeting_start_time',
+        'hs_meeting_end_time',
+        'hs_meeting_body',
+        'hubspot_owner_id',
+      ],
+      sorts: [{ propertyName: 'hs_meeting_start_time', direction: 'ASCENDING' }],
+      limit: 100,
+    };
+    if (after) body.after = after;
+
+    const res = await hubspotRequest('/crm/v3/objects/meetings/search', 'POST', body);
+    const pageItems = res.results || [];
+    meetings.push(...pageItems);
+    after = res.paging?.next?.after || '';
+    if (!after || pageItems.length === 0) break;
   }
-  return deduped;
+  return meetings;
+}
+
+async function attachHubSpotContacts(meetings, config) {
+  for (const meeting of meetings) {
+    try {
+      const assocRes = await hubspotRequest(`/crm/v4/objects/meetings/${meeting.id}/associations/contacts`);
+      const contactIds = (assocRes.results || []).map(r => r.toObjectId);
+      meeting._contactIds = contactIds;
+      meeting._contacts = [];
+      meeting._externalContacts = [];
+
+      for (const cid of contactIds.slice(0, 5)) {
+        const c = await hubspotRequest(`/crm/v3/objects/contacts/${cid}?properties=firstname,lastname,email,company,jobtitle`);
+        if (!c.id) continue;
+        meeting._contacts.push(c.properties);
+        const email = normalizeDigestText(c.properties?.email);
+        const domain = email.includes('@') ? email.split('@').pop() : '';
+        if (email && !config.internalDomains.has(domain)) {
+          meeting._externalContacts.push(c.properties);
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to get contacts for meeting ${meeting.id}:`, err.message);
+      meeting._contacts = [];
+      meeting._externalContacts = [];
+    }
+  }
+}
+
+async function fetchGrainRecordingsForDay(startOfDay, endOfDay) {
+  if (!GRAIN_API_TOKEN) {
+    throw new Error('Missing Grain API token. Set GRAIN_API_TOKEN, GRAIN_ACCESS_TOKEN, or GRAIN_WORKSPACE_TOKEN.');
+  }
+
+  const recordings = [];
+  let cursor = '';
+  const maxPages = Number(process.env.GRAIN_DIGEST_MAX_PAGES || 20);
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams({ limit: process.env.GRAIN_DIGEST_PAGE_SIZE || '100' });
+    if (cursor && !cursor.startsWith('http')) params.set('cursor', cursor);
+    const endpoint = cursor && cursor.startsWith('http') ? cursor : `/recordings?${params}`;
+    const payload = await grainRequest(endpoint);
+    if (payload?.error) throw new Error(`Grain recordings API returned an error: ${payload.error}`);
+
+    const { items, cursor: nextCursor, hasMore } = parseListItems(payload);
+    recordings.push(...items);
+    if (!hasMore || !nextCursor || items.length === 0) break;
+    cursor = nextCursor;
+  }
+
+  return dedupeGrainRecordings(recordings).filter(recording => {
+    const startMs = getGrainRecordingStartMs(recording);
+    return startMs >= startOfDay.getTime() && startMs < endOfDay.getTime();
+  });
+}
+
+async function fetchGrainRecordingDetail(recording) {
+  const id = getGrainRecordingId(recording);
+  if (!id) return recording;
+
+  const detailEndpoints = [
+    `/recordings/${encodeURIComponent(id)}?include=transcript,summary,participants`,
+    `/recordings/${encodeURIComponent(id)}`,
+    `/recordings/${encodeURIComponent(id)}/transcript?format=json`,
+    `/recordings/${encodeURIComponent(id)}/transcript`,
+  ];
+
+  let merged = { ...recording };
+  for (const endpoint of detailEndpoints) {
+    const payload = await grainRequest(endpoint);
+    if (!payload || payload.error) continue;
+    if (Array.isArray(payload) || typeof payload === 'string') {
+      merged.transcript = payload;
+    } else if (payload.transcript || payload.transcript_text || payload.text || payload.id) {
+      merged = { ...merged, ...payload };
+    }
+    if (formatGrainTranscriptText(merged)) break;
+  }
+  return merged;
+}
+
+async function applyGrainRecordingToMeeting(meeting, recording) {
+  const detail = await fetchGrainRecordingDetail(recording);
+  meeting._grainId = getGrainRecordingId(detail) || getGrainRecordingId(recording);
+  meeting._transcriptUrl = getGrainRecordingUrl(detail) || getGrainRecordingUrl(recording);
+  meeting._transcript = formatGrainTranscriptText(detail);
+  meeting._summary = typeof detail.summary === 'object' ? detail.summary.overview : detail.summary;
+  meeting._grainRecording = detail;
+  return meeting;
+}
+
+async function resolveExternalGrainContacts(recording, config) {
+  const contacts = [];
+  const participants = recording?.participants || recording?.attendees || [];
+  const externalParticipants = participants.filter(p => {
+    const email = normalizeDigestText(p.email || p.email_address);
+    const domain = email.includes('@') ? email.split('@').pop() : '';
+    return email && !config.internalDomains.has(domain);
+  });
+
+  for (const participant of externalParticipants.slice(0, 3)) {
+    const email = participant.email || participant.email_address;
+    try {
+      const searchRes = await hubspotRequest('/crm/v3/objects/contacts/search', 'POST', {
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
+        properties: ['firstname', 'lastname', 'email', 'company', 'jobtitle'],
+        limit: 1,
+      });
+      if (searchRes.results?.length > 0) {
+        contacts.push(searchRes.results[0].properties);
+        continue;
+      }
+    } catch (err) {
+      console.error(`Failed to resolve Grain participant ${email} in HubSpot:`, err.message);
+    }
+
+    const nameParts = String(participant.name || participant.full_name || '').trim().split(/\s+/);
+    contacts.push({
+      firstname: nameParts[0] || '',
+      lastname: nameParts.slice(1).join(' '),
+      email,
+      company: participant.company || '',
+      jobtitle: participant.title || participant.job_title || '',
+    });
+  }
+
+  return contacts;
+}
+
+function getPacificDayRange(now = new Date()) {
+  const labelFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  });
+  const labelParts = Object.fromEntries(labelFormatter.formatToParts(now).map(part => [part.type, part.value]));
+  const dateLabel = `${labelParts.weekday}, ${labelParts.month} ${Number(labelParts.day)}, ${labelParts.year}`;
+
+  const dateParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const values = Object.fromEntries(dateParts.map(part => [part.type, part.value]));
+  const year = Number(values.year);
+  const month = Number(values.month) - 1;
+  const day = Number(values.day);
+  const ptLocal = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const utcLocal = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const offsetMs = ptLocal.getTime() - utcLocal.getTime();
+
+  return {
+    startOfDay: new Date(Date.UTC(year, month, day, 0, 0, 0) - offsetMs),
+    endOfDay: new Date(Date.UTC(year, month, day + 1, 0, 0, 0) - offsetMs),
+    dateLabel,
+  };
 }
 
 async function runDiscoveryDigest(channelOverride) {
   const channel = channelOverride || DISCOVERY_DIGEST_CHANNEL;
   console.log('Running discovery call digest...');
 
-  // Get today's date range in PT (runs at 4 PM, so today's calls are done)
-  const now = new Date();
-  const ptOffset = -8; // PST
-  const ptNow = new Date(now.getTime() + ptOffset * 3600 * 1000);
-  const today = new Date(ptNow);
-  const startOfDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), -ptOffset, 0, 0));
-  const endOfDay = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1, -ptOffset, 0, 0));
-  const dateLabel = today.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+  const config = buildDiscoveryDigestConfig(process.env);
+  const { startOfDay, endOfDay, dateLabel } = getPacificDayRange();
 
   try {
-    // 1. Query HubSpot meetings where body contains "intro" and start time = yesterday
-    const meetingsRes = await hubspotRequest('/crm/v3/objects/meetings/search', 'POST', {
-      filterGroups: [{
-        filters: [
-          { propertyName: 'hs_meeting_body', operator: 'CONTAINS_TOKEN', value: 'intro' },
-          { propertyName: 'hs_meeting_start_time', operator: 'GTE', value: startOfDay.toISOString() },
-          { propertyName: 'hs_meeting_start_time', operator: 'LT', value: endOfDay.toISOString() },
-        ],
-      }],
-      properties: ['hs_meeting_title', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hs_meeting_body'],
-      limit: 50,
+    const allMeetings = await searchHubSpotMeetingsForDigest(startOfDay, endOfDay);
+    await attachHubSpotContacts(allMeetings, config);
+    const hubspotDiscoveryMeetings = allMeetings.filter(meeting => isLikelyHubSpotDiscoveryMeeting(meeting, config));
+    const canceled = hubspotDiscoveryMeetings.filter(m => normalizeDigestText(m.properties.hs_meeting_title).startsWith('canceled:'));
+    const scheduled = hubspotDiscoveryMeetings.filter(m => !normalizeDigestText(m.properties.hs_meeting_title).startsWith('canceled:'));
+
+    const grainToday = await fetchGrainRecordingsForDay(startOfDay, endOfDay);
+    console.log(`Grain: fetched ${grainToday.length} recordings for ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`);
+
+    const matchedGrainIds = new Set();
+    for (const meeting of scheduled) {
+      const matched = findBestGrainRecordingForMeeting(meeting, grainToday, config, matchedGrainIds);
+      if (!matched) continue;
+      await applyGrainRecordingToMeeting(meeting, matched);
+      if (meeting._grainId) matchedGrainIds.add(meeting._grainId);
+    }
+
+    const unmatchedGrainRecordings = grainToday.filter(recording => {
+      const id = getGrainRecordingId(recording);
+      return !id || !matchedGrainIds.has(id);
     });
+    for (const recording of unmatchedGrainRecordings) {
+      if (!isLikelyGrainDiscoveryRecording(recording, config)) continue;
+      const detail = await fetchGrainRecordingDetail(recording);
+      if (!isLikelyGrainDiscoveryRecording(detail, config)) continue;
 
-    const meetings = meetingsRes.results || [];
-
-    // 2. Split into canceled vs scheduled
-    const canceled = meetings.filter(m => (m.properties.hs_meeting_title || '').startsWith('Canceled:'));
-    const scheduled = meetings.filter(m => !(m.properties.hs_meeting_title || '').startsWith('Canceled:'));
-
-    // 3. Get associated contacts for each scheduled meeting
-    for (const meeting of scheduled) {
-      try {
-        const assocRes = await hubspotRequest(`/crm/v4/objects/meetings/${meeting.id}/associations/contacts`);
-        const contactIds = (assocRes.results || []).map(r => r.toObjectId);
-        meeting._contactIds = contactIds;
-
-        if (contactIds.length > 0) {
-          const contacts = [];
-          for (const cid of contactIds.slice(0, 5)) {
-            const c = await hubspotRequest(`/crm/v3/objects/contacts/${cid}?properties=firstname,lastname,email,company,jobtitle`);
-            if (c.id) contacts.push(c.properties);
-          }
-          meeting._contacts = contacts;
-          meeting._externalContacts = contacts.filter(c => c.email && !c.email.endsWith('@trytruewind.com'));
-        }
-      } catch (err) {
-        console.error(`Failed to get contacts for meeting ${meeting.id}:`, err.message);
-        meeting._contacts = [];
-        meeting._externalContacts = [];
-      }
-    }
-
-    // 4. Fetch ALL Read.ai meetings for the same day (paginate since API caps at 10/page)
-    //    Internal calls (syncs, standups, etc.) can fill a single page, so we must paginate
-    //    to ensure we don't miss actual discovery calls.
-    await refreshReadAiToken();
-    let readAiToday = [];
-    if (readAiTokens?.access_token) {
-      const dateStr = today.toISOString().slice(0, 10);
-      const nextDateStr = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
-      let startingAfter = '';
-      const MAX_PAGES = 10; // safety cap: 10 pages x 10 results = 100 meetings/day max
-      for (let page = 0; page < MAX_PAGES; page++) {
-        const params = new URLSearchParams({ limit: '10', start_date: dateStr, end_date: nextDateStr });
-        if (startingAfter) params.set('starting_after', startingAfter);
-        const rRes = await readAiRequest(`/meetings?${params}`);
-        const items = rRes.data || rRes.items || rRes.meetings || (Array.isArray(rRes) ? rRes : []);
-        readAiToday.push(...items);
-        // Stripe-style pagination: use last item ID as cursor when has_more is true
-        if (!rRes.has_more || items.length === 0) break;
-        startingAfter = items[items.length - 1].id || '';
-        if (!startingAfter) break;
-      }
-      readAiToday = dedupeReadAiMeetings(readAiToday);
-      console.log(`Read.ai: fetched ${readAiToday.length} meetings for ${dateStr}`);
-    }
-
-    // Match HubSpot meetings to Read.ai by time overlap (within 30 min)
-    const matchedReadAiIds = new Set();
-    for (const meeting of scheduled) {
-      const hsStart = getDigestMeetingStartMs(meeting);
-      const matched = readAiToday
-        .filter(rm => !matchedReadAiIds.has(rm.id))
-        .map(rm => ({ rm, diff: Math.abs((rm.start_time_ms || 0) - hsStart) }))
-        .filter(item => item.diff < 30 * 60 * 1000)
-        .sort((a, b) => a.diff - b.diff)[0]?.rm;
-      if (matched) {
-        meeting._readAiId = matched.id;
-        meeting._readAiUrl = matched.report_url || `https://app.read.ai/analytics/meetings/${matched.id}`;
-        matchedReadAiIds.add(matched.id);
-        try {
-          const params = new URLSearchParams([['expand[]', 'summary'], ['expand[]', 'transcript']]);
-          const detail = await readAiRequest(`/meetings/${matched.id}?${params}`);
-          if (!detail.error) {
-            meeting._summary = typeof detail.summary === 'object' ? detail.summary.overview : detail.summary;
-            meeting._transcript = detail.transcript;
-          }
-        } catch (err) {
-          console.error(`Failed to fetch Read.ai detail for ${matched.id}:`, err.message);
-        }
-      }
-    }
-
-    // 5. Read.ai fallback: find discovery calls not booked through Calendly
-    const EXCLUDE_PATTERNS = [
-      'retro', 'role play', 'check in', 'check-in', 'standup', 'stand-up',
-      'sync', '1:1', 'team', 'sprint', 'metrics', 'demo', 'all hands',
-      'follow up', 'follow-up', 'proposal', 'review', 'onboarding',
-      'kickoff', 'kick-off', 'training', 'internal', 'weekly', 'daily',
-    ];
-    const unmatched = readAiToday.filter(rm => !matchedReadAiIds.has(rm.id));
-    for (const rm of unmatched) {
-      const title = (rm.title || rm.name || '').toLowerCase();
-      // Skip if title matches internal patterns
-      if (EXCLUDE_PATTERNS.some(pat => title.includes(pat))) continue;
-      // Check participants for external emails
-      const participants = rm.participants || rm.attendees || [];
-      const emails = participants.map(p => (p.email || '')).filter(Boolean);
-      const hasExternal = emails.some(e => e && !e.endsWith('@trytruewind.com'));
-      if (!hasExternal) continue;
-
-      // This is likely a discovery call missed by HubSpot -- add it as a scheduled meeting
-      const externalParticipants = participants.filter(p => p.email && !p.email.endsWith('@trytruewind.com'));
+      const contacts = await resolveExternalGrainContacts(detail, config);
+      const startMs = getGrainRecordingStartMs(detail) || getGrainRecordingStartMs(recording);
       const fallbackMeeting = {
-        id: `readai_${rm.id}`,
+        id: `grain_${getGrainRecordingId(detail) || getGrainRecordingId(recording)}`,
         properties: {
-          hs_meeting_title: rm.title || rm.name || 'Unknown',
-          hs_meeting_start_time: rm.start_time_ms ? new Date(rm.start_time_ms).toISOString() : '',
+          hs_meeting_title: getGrainRecordingTitle(detail) || getGrainRecordingTitle(recording) || 'Unknown',
+          hs_meeting_start_time: startMs ? new Date(startMs).toISOString() : '',
         },
-        _readAiId: rm.id,
-        _readAiUrl: rm.report_url || `https://app.read.ai/analytics/meetings/${rm.id}`,
-        _contacts: [],
-        _externalContacts: [],
-        _fromFallback: true,
+        _contacts: contacts,
+        _externalContacts: contacts,
+        _fromGrainFallback: true,
       };
 
-      // Try to resolve external participants from HubSpot
-      for (const p of externalParticipants.slice(0, 3)) {
-        if (!p.email) continue;
-        try {
-          const searchRes = await hubspotRequest('/crm/v3/objects/contacts/search', 'POST', {
-            filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: p.email }] }],
-            properties: ['firstname', 'lastname', 'email', 'company', 'jobtitle'],
-            limit: 1,
-          });
-          if (searchRes.results?.length > 0) {
-            fallbackMeeting._externalContacts.push(searchRes.results[0].properties);
-          } else {
-            // Use Read.ai participant info as fallback
-            fallbackMeeting._externalContacts.push({
-              firstname: p.name || '', lastname: '', email: p.email,
-              company: '', jobtitle: '',
-            });
-          }
-        } catch (err) {
-          fallbackMeeting._externalContacts.push({
-            firstname: p.name || '', lastname: '', email: p.email,
-            company: '', jobtitle: '',
-          });
-        }
-      }
-
-      // Fetch transcript
-      try {
-        const params = new URLSearchParams([['expand[]', 'summary'], ['expand[]', 'transcript']]);
-        const detail = await readAiRequest(`/meetings/${rm.id}?${params}`);
-        if (!detail.error) {
-          fallbackMeeting._summary = typeof detail.summary === 'object' ? detail.summary.overview : detail.summary;
-          fallbackMeeting._transcript = detail.transcript;
-        }
-      } catch (err) {
-        console.error(`Failed to fetch Read.ai fallback detail for ${rm.id}:`, err.message);
-      }
-
+      await applyGrainRecordingToMeeting(fallbackMeeting, detail);
+      if (fallbackMeeting._grainId) matchedGrainIds.add(fallbackMeeting._grainId);
       scheduled.push(fallbackMeeting);
     }
 
     const uniqueCanceled = dedupeDigestMeetings(canceled);
     const uniqueScheduled = dedupeDigestMeetings(scheduled);
 
-    // 6. Determine no-shows: no Read.ai match, OR Read.ai match but no transcript/summary
-    const hasContent = (m) => m._readAiId && (m._summary || (m._transcript && (m._transcript.turns?.length > 0 || typeof m._transcript === 'string')));
+    // Completed means Grain has a matched recording with transcript or summary content.
+    const hasContent = (m) => m._grainId && (m._summary || m._transcript);
     const completed = uniqueScheduled.filter(m => hasContent(m));
     const noShows = uniqueScheduled.filter(m => !hasContent(m));
 
@@ -1109,20 +996,11 @@ async function runDiscoveryDigest(channelOverride) {
       return;
     }
 
-    // 6. Use Claude to extract takeaways and quotes from completed calls
+    // Use Claude to extract takeaways and quotes from completed calls.
     for (const meeting of completed) {
-      if (!meeting._transcript) continue;
-      const transcript = meeting._transcript;
-      let transcriptText = '';
-      if (transcript && transcript.turns) {
-        transcriptText = transcript.turns.slice(0, 100).map(t =>
-          `${t.speaker?.name || '?'}: ${t.text}`
-        ).join('\n');
-      } else if (typeof transcript === 'string') {
-        transcriptText = transcript.slice(0, 5000);
-      }
+      let transcriptText = String(meeting._transcript || '').slice(0, 5000);
       if (!transcriptText && meeting._summary) {
-        transcriptText = meeting._summary;
+        transcriptText = String(meeting._summary);
       }
       if (!transcriptText) continue;
 
@@ -1186,7 +1064,7 @@ QUOTE: "..." -- [Speaker Name]`,
       msg += `\n---\n*${header}*\n`;
       if (meeting._takeaway) msg += `Takeaway: ${meeting._takeaway}\n`;
       if (meeting._quote) msg += `Pain quote: ${meeting._quote}\n`;
-      if (meeting._readAiUrl) msg += `Transcript: ${meeting._readAiUrl}\n`;
+      if (meeting._transcriptUrl) msg += `Transcript: ${meeting._transcriptUrl}\n`;
     }
 
     await app.client.chat.postMessage({
@@ -1524,7 +1402,7 @@ function scheduleDailyProgress() {
   console.log('Slack bot is running in socket mode');
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
-  console.log(`  Read AI: ${readAiTokens ? 'ready (will refresh on first request)' : 'NOT CONFIGURED'}`);
+  console.log(`  Grain: ${GRAIN_API_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
 
   // Schedule daily discovery digest
   scheduleDiscoveryDigest();
