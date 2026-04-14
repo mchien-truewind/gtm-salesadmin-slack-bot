@@ -6,6 +6,8 @@ const {
   dedupeDigestMeetings,
   findBestGrainRecordingForMeeting,
   formatGrainTranscriptText,
+  getGrainRecordingStartMs,
+  getGrainRecordingUrl,
   isLikelyGrainDiscoveryRecording,
   isLikelyHubSpotDiscoveryMeeting,
   parseListItems,
@@ -107,6 +109,17 @@ test('transcript formatting handles Grain turn arrays', () => {
       { speaker: { name: 'Sam' }, content: 'Tell me more.' },
     ],
   }), 'Pat: We need better close visibility.\nSam: Tell me more.');
+});
+
+test('Grain recording helpers handle current public API field names', () => {
+  assert.equal(getGrainRecordingStartMs({
+    start_datetime: '2026-04-13T17:00:00.000Z',
+  }), Date.parse('2026-04-13T17:00:00.000Z'));
+
+  assert.equal(getGrainRecordingUrl({
+    public_url: 'https://grain.com/share/example',
+    url: 'https://api.grain.com/_/public-api/recordings/example',
+  }), 'https://grain.com/share/example');
 });
 
 test('dedupe prefers Grain recording identity and list parser handles common shapes', () => {

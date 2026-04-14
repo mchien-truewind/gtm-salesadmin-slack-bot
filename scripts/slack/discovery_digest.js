@@ -168,7 +168,7 @@ function getGrainRecordingStartMs(recording) {
   for (const key of ['start_time_ms', 'started_at_ms', 'scheduled_start_time_ms']) {
     if (Number.isFinite(recording?.[key])) return recording[key];
   }
-  for (const key of ['start_time', 'started_at', 'recorded_at', 'created_at', 'date']) {
+  for (const key of ['start_time', 'started_at', 'start_datetime', 'recorded_at', 'created_at', 'date']) {
     const raw = recording?.[key];
     const parsed = raw ? new Date(raw).getTime() : 0;
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
@@ -177,7 +177,7 @@ function getGrainRecordingStartMs(recording) {
 }
 
 function getGrainRecordingUrl(recording) {
-  const explicit = recording?.url || recording?.recording_url || recording?.share_url || recording?.app_url || recording?.meeting_url;
+  const explicit = recording?.public_url || recording?.url || recording?.recording_url || recording?.share_url || recording?.app_url || recording?.meeting_url;
   if (explicit) return String(explicit);
   const id = getGrainRecordingId(recording);
   return id ? `https://grain.com/app/recordings/${id}` : '';
@@ -197,6 +197,9 @@ function getGrainParticipantEmails(recording) {
 function isSalesOwnedGrainRecording(recording, config) {
   const ownerEmail = normalizeDigestText(recording?.owner?.email || recording?.creator?.email || recording?.user?.email);
   if (config.salesEmails.size > 0 && ownerEmail && config.salesEmails.has(ownerEmail)) return true;
+
+  const ownerValues = Array.isArray(recording?.owners) ? recording.owners.map(normalizeDigestText) : [];
+  if (config.salesEmails.size > 0 && ownerValues.some(owner => config.salesEmails.has(owner))) return true;
 
   const participantEmails = getGrainParticipantEmails(recording);
   if (config.salesEmails.size > 0 && participantEmails.some(email => config.salesEmails.has(email))) return true;
