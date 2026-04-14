@@ -103,7 +103,6 @@ def build_webhook_body(
         "campaign": None,
         "name": name,
         "event_type": POSITIVE_REPLY_EVENT,
-        "custom_interest_value": None,
     }
     if webhook_secret:
         body["headers"] = {"X-INSTANTLY-WEBHOOK-SECRET": webhook_secret}

@@ -32,7 +32,7 @@ class ConfigurePositiveReplyWebhookTests(unittest.TestCase):
 
         self.assertEqual(body["event_type"], "lead_interested")
         self.assertIsNone(body["campaign"])
-        self.assertIsNone(body["custom_interest_value"])
+        self.assertNotIn("custom_interest_value", body)
         self.assertEqual(
             body["headers"],
             {"X-INSTANTLY-WEBHOOK-SECRET": "secret-value"},
