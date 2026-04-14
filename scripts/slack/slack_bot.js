@@ -64,6 +64,7 @@ const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 // HubSpot setup
 // ============================================================
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
+const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30000);
 
 async function hubspotRequest(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
@@ -85,6 +86,9 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
         try { resolve(JSON.parse(data)); } catch { resolve(data); }
       });
     });
+    req.setTimeout(DEFAULT_HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`HubSpot request timed out after ${DEFAULT_HTTP_TIMEOUT_MS}ms`));
+    });
     req.on('error', reject);
     if (body) req.write(JSON.stringify(body));
     req.end();
@@ -101,6 +105,9 @@ async function httpRequest(url, options = {}) {
       res.on('end', () => {
         try { resolve(JSON.parse(data)); } catch { resolve(data); }
       });
+    });
+    req.setTimeout(options.timeout || DEFAULT_HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`HTTP request timed out after ${options.timeout || DEFAULT_HTTP_TIMEOUT_MS}ms`));
     });
     req.on('error', reject);
     if (options.body) req.write(options.body);
@@ -719,6 +726,7 @@ const GRAIN_API_TOKEN = process.env.GRAIN_API_TOKEN
   || process.env.GRAIN_ACCESS_TOKEN
   || process.env.GRAIN_WORKSPACE_TOKEN;
 const GRAIN_API_BASE = process.env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api';
+let discoveryDigestInFlight = null;
 
 async function grainRequest(endpoint) {
   if (!GRAIN_API_TOKEN) return { error: 'Grain not configured' };
@@ -755,6 +763,7 @@ async function searchHubSpotMeetingsForDigest(startOfDay, endOfDay) {
         'hs_meeting_end_time',
         'hs_meeting_body',
         'hubspot_owner_id',
+        'hubspot_owner_email',
       ],
       sorts: [{ propertyName: 'hs_meeting_start_time', direction: 'ASCENDING' }],
       limit: 100,
@@ -930,10 +939,26 @@ function getPacificDayRange(now = new Date()) {
 }
 
 async function runDiscoveryDigest(channelOverride) {
+  if (discoveryDigestInFlight) {
+    console.log('Discovery digest already running; joining in-flight run.');
+    return discoveryDigestInFlight;
+  }
+  discoveryDigestInFlight = runDiscoveryDigestImpl(channelOverride).finally(() => {
+    discoveryDigestInFlight = null;
+  });
+  return discoveryDigestInFlight;
+}
+
+async function runDiscoveryDigestImpl(channelOverride) {
   const channel = channelOverride || DISCOVERY_DIGEST_CHANNEL;
   console.log('Running discovery call digest...');
 
   const config = buildDiscoveryDigestConfig(process.env);
+  if (config.salesEmails.size === 0 && config.salesOwnerIds.size === 0) {
+    console.warn('Discovery digest: DISCOVERY_DIGEST_SALES_EMAILS or DISCOVERY_DIGEST_SALES_OWNER_IDS is not configured; classification will use discovery/external-participant heuristics only.');
+  } else if (config.salesEmails.size > 0 && config.salesOwnerIds.size === 0) {
+    console.warn('Discovery digest: DISCOVERY_DIGEST_SALES_EMAILS is configured without DISCOVERY_DIGEST_SALES_OWNER_IDS; HubSpot scheduled/no-show scoping depends on HubSpot returning hubspot_owner_email.');
+  }
   const { startOfDay, endOfDay, dateLabel } = getPacificDayRange();
 
   try {
@@ -1056,6 +1081,11 @@ QUOTE: "..." -- [Speaker Name]`,
       msg += ` -- ${cancelNames.join(', ')}`;
     }
     msg += '\n';
+    if (config.salesEmails.size === 0 && config.salesOwnerIds.size === 0) {
+      msg += '\nWarning: sales owner scope is not configured; this digest used discovery-call heuristics only.\n';
+    } else if (config.salesEmails.size > 0 && config.salesOwnerIds.size === 0) {
+      msg += '\nWarning: HubSpot scheduled/no-show scoping depends on HubSpot owner-email data; configure DISCOVERY_DIGEST_SALES_OWNER_IDS if owner emails are unavailable.\n';
+    }
 
     for (const meeting of completed) {
       const ext = (meeting._externalContacts || [])[0];
@@ -1401,6 +1431,12 @@ function scheduleDailyProgress() {
 }
 
 (async () => {
+  const shouldRunDigestCli = process.argv.includes('--run-digest');
+  if (shouldRunDigestCli) {
+    await runDiscoveryDigest();
+    return;
+  }
+
   await app.start();
   console.log('Slack bot is running in socket mode');
   console.log(`  Google Sheets: ready`);
@@ -1453,8 +1489,5 @@ function scheduleDailyProgress() {
     console.log(`  Health check on port ${PORT}`);
   });
 
-  // Allow manual trigger via CLI: node slack_bot.js --run-digest
-  if (process.argv.includes('--run-digest')) {
-    await runDiscoveryDigest();
-  }
+  // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
 })();
