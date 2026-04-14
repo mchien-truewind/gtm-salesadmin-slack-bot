@@ -16,6 +16,10 @@ const { App } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
 const {
+  DEFAULT_CHANNEL: INSTANTLY_POSITIVE_REPLY_DEFAULT_CHANNEL,
+  handleInstantlyPositiveReplyWebhook,
+} = require('./instantly_positive_reply_alert');
+const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -477,6 +481,17 @@ const app = new App({
   socketMode: true,
   appToken: process.env.SLACK_APP_TOKEN,
 });
+
+const INSTANTLY_POSITIVE_REPLY_CHANNEL = (
+  process.env.INSTANTLY_POSITIVE_REPLY_SLACK_CHANNEL
+  || INSTANTLY_POSITIVE_REPLY_DEFAULT_CHANNEL
+);
+const INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID = (
+  process.env.INSTANTLY_POSITIVE_REPLY_SLACK_MENTION_USER_ID
+  || process.env.SLACK_USER_ID
+  || ''
+).trim();
+const INSTANTLY_WEBHOOK_SECRET = (process.env.INSTANTLY_WEBHOOK_SECRET || '').trim();
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -1397,7 +1412,24 @@ function scheduleDailyProgress() {
 
   // Health check server for Railway (needs a port to know the service is alive)
   const PORT = process.env.PORT || 3000;
-  http.createServer((req, res) => {
+  http.createServer(async (req, res) => {
+    if (req.url.split('?')[0] === '/webhooks/instantly/positive-reply') {
+      try {
+        await handleInstantlyPositiveReplyWebhook(req, res, {
+          slackClient: app.client,
+          slackToken: process.env.SLACK_BOT_TOKEN,
+          channel: INSTANTLY_POSITIVE_REPLY_CHANNEL,
+          mentionUserId: INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID,
+          webhookSecret: INSTANTLY_WEBHOOK_SECRET,
+          logger: console,
+        });
+      } catch (err) {
+        console.error('Instantly positive reply webhook failed:', err.message);
+        res.writeHead(500);
+        res.end('webhook_failed');
+      }
+      return;
+    }
     if (req.url.startsWith('/run-digest')) {
       const qs = new URL(req.url, 'http://localhost').searchParams;
       const channel = qs.get('channel') || undefined;
