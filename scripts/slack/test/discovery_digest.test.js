@@ -5,6 +5,7 @@ const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   findBestGrainRecordingForMeeting,
+  formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
   getGrainRecordingStartMs,
   getGrainRecordingUrl,
@@ -164,4 +165,11 @@ test('dedupe prefers Grain recording identity and list parser handles common sha
     cursor: 'next',
     hasMore: true,
   });
+});
+
+test('empty discovery digest copy uses the digest date label, not yesterday', () => {
+  assert.equal(
+    formatEmptyDiscoveryDigestMessage('Wednesday, Apr 15, 2026'),
+    '*Discovery Call Digest -- Wednesday, Apr 15, 2026*\n\nNo discovery calls were scheduled for Wednesday, Apr 15, 2026.',
+  );
 });
