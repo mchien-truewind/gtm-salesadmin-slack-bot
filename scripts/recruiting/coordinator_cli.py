@@ -423,7 +423,7 @@ def load_config() -> Config:
         notion_database_id=notion_db,
         gmail_label_name=os.getenv("RECRUITING_GMAIL_LABEL", "hiring@").strip(),
         gmail_query=gmail_query,
-        gmail_max_messages=parse_env_int("RECRUITING_GMAIL_MAX_MESSAGES", 50),
+        gmail_max_messages=parse_env_int("RECRUITING_GMAIL_MAX_MESSAGES", 250),
         hiring_alias=os.getenv("RECRUITING_HIRING_ALIAS", "").strip().lower(),
         from_email=from_email,
         proceed_template=(os.getenv("RECRUITING_PROCEED_TEMPLATE", "").strip() or DEFAULT_PROCEED_TEMPLATE),
@@ -719,6 +719,12 @@ def should_auto_archive_sender(sender_email: str) -> bool:
     return normalize_email(sender_email) in AUTO_ARCHIVE_SENDER_EMAILS
 
 
+def candidate_name_from_email(candidate_email: str) -> str:
+    local = clean_text(candidate_email).split("@", 1)[0]
+    local = re.split(r"[._+\-]", local)[0].strip(" ,.-")
+    return local.capitalize() if local else "Unknown"
+
+
 def header_map(message: dict[str, Any]) -> dict[str, str]:
     headers = {}
     for entry in message.get("payload", {}).get("headers", []):
@@ -726,6 +732,38 @@ def header_map(message: dict[str, Any]) -> dict[str, str]:
         if name:
             headers[name] = entry.get("value", "")
     return headers
+
+
+def parse_candidate_identity_from_headers(
+    headers: dict[str, str],
+    *,
+    internal_domains: set[str] | None = None,
+) -> tuple[str, str]:
+    internal_domains = internal_domains or set()
+
+    candidate_headers = ["from"]
+    from_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+    if email_domain(from_email) in internal_domains:
+        # Google Groups rewrites From to hiring@trytruewind.com; the applicant
+        # is preserved in these original-sender headers.
+        candidate_headers = ["x-original-from", "reply-to", "x-original-sender", "from"]
+
+    for header_name in candidate_headers:
+        raw_value = headers.get(header_name, "")
+        if not raw_value:
+            continue
+        name, email = parseaddr(raw_value)
+        normalized_email = normalize_email(email or raw_value)
+        if not normalized_email or "@" not in normalized_email:
+            continue
+        if email_domain(normalized_email) in internal_domains and header_name != "from":
+            continue
+        candidate_name = clean_candidate_name(name.strip()) or candidate_name_from_email(normalized_email)
+        return candidate_name, normalized_email
+
+    name, email = parseaddr(headers.get("from", ""))
+    normalized_email = normalize_email(email)
+    return name.strip() or candidate_name_from_email(normalized_email), normalized_email
 
 
 def iter_parts(part: dict[str, Any]):
@@ -1545,6 +1583,9 @@ INVALID_ROLE_FRAGMENTS = (
     "fwd:",
     "former yc",
     "recruitment continues",
+    "moderator's spam report",
+    "spam report",
+    "contract idea",
 )
 
 
@@ -1584,6 +1625,13 @@ def canonicalize_truewind_role(raw_value: str) -> str:
     return "Other"
 
 
+def clean_candidate_name(value: str) -> str:
+    name = clean_text(value).strip("\"' ")
+    while len(name) >= 2 and name[0] in "[({<" and name[-1] in "])}>":
+        name = clean_text(name[1:-1]).strip("\"' ")
+    return name
+
+
 def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> tuple[str, str] | None:
     # Required prefix: [hiring@]. Candidate name may come from subject or sender fallback.
     normalized = clean_text(subject)
@@ -1595,7 +1643,7 @@ def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> t
     if prefix_match.group("prefix").strip().lower() != "hiring@":
         return None
     body = clean_text(prefix_match.group("body"))
-    fallback_name = clean_text(fallback_candidate_name)
+    fallback_name = clean_candidate_name(fallback_candidate_name)
     if not body and fallback_name:
         return "Unknown", fallback_name
 
@@ -1604,7 +1652,7 @@ def parse_required_subject(subject: str, fallback_candidate_name: str = "") -> t
         left = clean_text(match.group("left"))
         right = clean_text(match.group("right"))
         role = canonicalize_truewind_role(left)
-        candidate_name = right
+        candidate_name = clean_candidate_name(right)
 
         # Subjects like "Application - BDR Growth" contain role on the right side.
         if role == "Unknown" and fallback_name:
@@ -1675,6 +1723,54 @@ def list_label_messages(gmail_service, label_id: str, query: str, max_messages: 
         if not page_token:
             break
     return messages
+
+
+def list_messages_matching_query(gmail_service, query: str, max_messages: int) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while len(messages) < max_messages:
+        response = (
+            gmail_service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=min(100, max_messages - len(messages)),
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        batch = response.get("messages", [])
+        if not batch:
+            break
+        messages.extend(batch)
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return messages
+
+
+def merge_gmail_message_refs(*batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen_threads: set[str] = set()
+    seen_messages: set[str] = set()
+    for batch in batches:
+        for item in batch:
+            thread_id = str(item.get("threadId", "") or "").strip()
+            message_id = str(item.get("id", "") or "").strip()
+            dedupe_key = thread_id or message_id
+            if not dedupe_key:
+                continue
+            if thread_id and thread_id in seen_threads:
+                continue
+            if not thread_id and message_id in seen_messages:
+                continue
+            merged.append(item)
+            if thread_id:
+                seen_threads.add(thread_id)
+            if message_id:
+                seen_messages.add(message_id)
+    return merged
 
 
 def list_threads_matching_query(gmail_service, query: str, max_threads: int = 50) -> list[dict[str, Any]]:
@@ -3286,11 +3382,16 @@ def upsert_candidate_page(
     return created["id"], True
 
 
-def parse_candidate_from_message(message: dict[str, Any]) -> tuple[str, str, str]:
+def parse_candidate_from_message(
+    message: dict[str, Any],
+    *,
+    internal_domains: set[str] | None = None,
+) -> tuple[str, str, str]:
     headers = header_map(message)
-    from_name, from_email = parseaddr(headers.get("from", ""))
-    candidate_email = normalize_email(from_email)
-    candidate_name = from_name.strip() or (candidate_email.split("@", 1)[0] if candidate_email else "Unknown")
+    candidate_name, candidate_email = parse_candidate_identity_from_headers(
+        headers,
+        internal_domains=internal_domains,
+    )
     subject = headers.get("subject", "").strip()
     return candidate_name, candidate_email, subject
 
@@ -3329,7 +3430,10 @@ def select_application_message_from_thread(
     fallback_external: dict[str, Any] | None = None
     for message in messages:
         headers = header_map(message)
-        candidate_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        _candidate_name, candidate_email, _subject = parse_candidate_from_message(
+            message,
+            internal_domains=internal_domains,
+        )
         if email_domain(candidate_email) in internal_domains:
             continue
         if fallback_external is None:
@@ -3372,7 +3476,9 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     )
 
     label_id = gmail_label_id(gmail_service, config.gmail_label_name)
-    messages = list_label_messages(gmail_service, label_id, config.gmail_query, config.gmail_max_messages)
+    labeled_messages = list_label_messages(gmail_service, label_id, config.gmail_query, config.gmail_max_messages)
+    subject_messages = list_messages_matching_query(gmail_service, config.gmail_query, config.gmail_max_messages)
+    messages = merge_gmail_message_refs(labeled_messages, subject_messages)
 
     processed = 0
     created = 0
@@ -3408,7 +3514,10 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             skipped += 1
             continue
 
-        candidate_name, candidate_email, subject = parse_candidate_from_message(application_message)
+        candidate_name, candidate_email, subject = parse_candidate_from_message(
+            application_message,
+            internal_domains=internal_domains,
+        )
         candidate_domain = email_domain(candidate_email)
         if candidate_domain in internal_domains:
             skipped += 1
