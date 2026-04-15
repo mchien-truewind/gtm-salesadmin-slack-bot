@@ -26,6 +26,7 @@ const {
   findBestGrainRecordingForMeeting,
   formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
+  formatNoShowMeetingLabel,
   getGrainRecordingId,
   getGrainRecordingStartMs,
   getGrainRecordingTitle,
@@ -799,6 +800,28 @@ async function attachHubSpotContacts(meetings, config) {
           meeting._externalContacts.push(c.properties);
         }
       }
+
+      if (meeting._externalContacts.length === 0) {
+        const companyAssoc = await hubspotRequest(`/crm/v4/objects/meetings/${meeting.id}/associations/companies`);
+        const companyIds = (companyAssoc.results || []).map(r => r.toObjectId);
+        for (const companyId of companyIds.slice(0, 3)) {
+          const companyContactAssoc = await hubspotRequest(`/crm/v4/objects/companies/${companyId}/associations/contacts`);
+          const companyContactIds = (companyContactAssoc.results || []).map(r => r.toObjectId);
+          for (const cid of companyContactIds.slice(0, 5)) {
+            if (meeting._contactIds.includes(cid)) continue;
+            const c = await hubspotRequest(`/crm/v3/objects/contacts/${cid}?properties=firstname,lastname,email,company,jobtitle`);
+            if (!c.id) continue;
+            meeting._contactIds.push(cid);
+            meeting._contacts.push(c.properties);
+            const email = normalizeDigestText(c.properties?.email);
+            const domain = email.includes('@') ? email.split('@').pop() : '';
+            if (email && !config.internalDomains.has(domain)) {
+              meeting._externalContacts.push(c.properties);
+            }
+          }
+          if (meeting._externalContacts.length > 0) break;
+        }
+      }
     } catch (err) {
       console.error(`Failed to get contacts for meeting ${meeting.id}:`, err.message);
       meeting._contacts = [];
@@ -1080,6 +1103,12 @@ QUOTE: "..." -- [Speaker Name]`,
     if (uniqueCanceled.length > 0) {
       const cancelNames = uniqueCanceled.map(m => (m.properties.hs_meeting_title || '').replace('Canceled: ', '').replace(' and Sarah Elix', ''));
       msg += ` -- ${cancelNames.join(', ')}`;
+    }
+    if (noShows.length > 0) {
+      msg += '\n\n*No-show details:*';
+      for (const meeting of noShows) {
+        msg += `\n- ${formatNoShowMeetingLabel(meeting)}`;
+      }
     }
     msg += '\n';
     if (config.salesEmails.size === 0 && config.salesOwnerIds.size === 0) {

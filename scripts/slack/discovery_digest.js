@@ -138,9 +138,10 @@ function getDigestContactKey(contact) {
 
 function getDigestMeetingKey(meeting) {
   if (meeting?._grainId) return `grain:${meeting._grainId}`;
-  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
   const startMs = getDigestMeetingStartMs(meeting);
   const contactKey = getDigestContactKey(getPrimaryDigestContact(meeting));
+  if (startMs && contactKey) return `hubspot-contact-time:${startMs}|${contactKey}`;
+  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
   return `hubspot:${title}|${startMs}|${contactKey}`;
 }
 
@@ -259,6 +260,22 @@ function formatGrainTranscriptText(recording) {
   return '';
 }
 
+function formatDigestContactLabel(contact) {
+  if (!contact) return '';
+  const name = `${contact.firstname || ''} ${contact.lastname || ''}`.trim();
+  const company = String(contact.company || '').trim();
+  const email = String(contact.email || '').trim();
+  const label = [name, company ? `(${company})` : ''].filter(Boolean).join(' ');
+  if (label && email) return `${label} <${email}>`;
+  return label || email;
+}
+
+function formatNoShowMeetingLabel(meeting) {
+  const contactLabel = formatDigestContactLabel(getPrimaryDigestContact(meeting));
+  if (contactLabel) return contactLabel;
+  return meeting?.properties?.hs_meeting_title || meeting?.title || 'Unknown';
+}
+
 function formatEmptyDiscoveryDigestMessage(dateLabel) {
   return `*Discovery Call Digest -- ${dateLabel}*\n\nNo discovery calls were scheduled for ${dateLabel}.`;
 }
@@ -321,6 +338,7 @@ module.exports = {
   findBestGrainRecordingForMeeting,
   formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
+  formatNoShowMeetingLabel,
   getDigestMeetingStartMs,
   getGrainParticipantEmails,
   getGrainRecordingId,
