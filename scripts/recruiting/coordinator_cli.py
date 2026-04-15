@@ -2838,7 +2838,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         if not thread_id:
             failed += 1
             continue
-        if thread_id in posted_threads:
+        if thread_id in posted_threads and thread_id in history_posted_threads:
             continue
 
         marker = slack_thread_marker(thread_id)
