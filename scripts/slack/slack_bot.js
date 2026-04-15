@@ -24,6 +24,7 @@ const {
   dedupeDigestMeetings,
   dedupeGrainRecordings,
   findBestGrainRecordingForMeeting,
+  formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
   getGrainRecordingId,
   getGrainRecordingStartMs,
@@ -1018,9 +1019,9 @@ async function runDiscoveryDigestImpl(channelOverride) {
       await app.client.chat.postMessage({
         token: process.env.SLACK_BOT_TOKEN,
         channel,
-        text: `*Discovery Call Digest -- ${dateLabel}*\n\nNo discovery calls were scheduled yesterday.`,
+        text: formatEmptyDiscoveryDigestMessage(dateLabel),
       });
-      console.log('No discovery calls yesterday.');
+      console.log(`No discovery calls scheduled for ${dateLabel}.`);
       return;
     }
 

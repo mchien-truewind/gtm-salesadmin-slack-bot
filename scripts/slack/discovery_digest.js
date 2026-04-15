@@ -259,6 +259,10 @@ function formatGrainTranscriptText(recording) {
   return '';
 }
 
+function formatEmptyDiscoveryDigestMessage(dateLabel) {
+  return `*Discovery Call Digest -- ${dateLabel}*\n\nNo discovery calls were scheduled for ${dateLabel}.`;
+}
+
 function getTokenOverlapScore(left, right) {
   const leftTokens = new Set(normalizeDigestText(left).split(/[^a-z0-9]+/).filter(token => token.length >= 3));
   const rightTokens = new Set(normalizeDigestText(right).split(/[^a-z0-9]+/).filter(token => token.length >= 3));
@@ -315,6 +319,7 @@ module.exports = {
   dedupeDigestMeetings,
   dedupeGrainRecordings,
   findBestGrainRecordingForMeeting,
+  formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
   getDigestMeetingStartMs,
   getGrainParticipantEmails,
