@@ -122,7 +122,10 @@ DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
     "roleplay,role play,chat transcript,complete the following,next step in the process,within the next 48 hours"
 )
-AUTO_ARCHIVE_SENDER_EMAILS = {"drew.katnik@cybercoders.com"}
+AUTO_ARCHIVE_SENDER_EMAILS = {
+    "drew.katnik@cybercoders.com",
+    "noreply-spamdigest@google.com",
+}
 
 _DOCLING_CONVERTER: Any | None = None
 _DOCLING_CHECKED = False
