@@ -65,7 +65,7 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
-        "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "17.5"),
+        "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "10"),
     }
 
 
