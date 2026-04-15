@@ -5,6 +5,7 @@ const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   findBestGrainRecordingForMeeting,
+  formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
   formatNoShowMeetingLabel,
   getGrainRecordingStartMs,
@@ -198,4 +199,11 @@ test('no-show meeting label includes external email when available', () => {
       email: 'swadhwa@nucleusdna.co',
     }],
   }), 'Sunil Wadhawa (Nucleus DNA) <swadhwa@nucleusdna.co>');
+});
+
+test('empty discovery digest copy uses the digest date label, not yesterday', () => {
+  assert.equal(
+    formatEmptyDiscoveryDigestMessage('Wednesday, Apr 15, 2026'),
+    '*Discovery Call Digest -- Wednesday, Apr 15, 2026*\n\nNo discovery calls were scheduled for Wednesday, Apr 15, 2026.',
+  );
 });
