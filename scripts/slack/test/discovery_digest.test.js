@@ -6,6 +6,7 @@ const {
   dedupeDigestMeetings,
   findBestGrainRecordingForMeeting,
   formatGrainTranscriptText,
+  formatNoShowMeetingLabel,
   getGrainRecordingStartMs,
   getGrainRecordingUrl,
   isLikelyGrainDiscoveryRecording,
@@ -164,4 +165,37 @@ test('dedupe prefers Grain recording identity and list parser handles common sha
     cursor: 'next',
     hasMore: true,
   });
+});
+
+test('dedupe collapses duplicate HubSpot meetings with same external contact and start time', () => {
+  const deduped = dedupeDigestMeetings([
+    {
+      properties: {
+        hs_meeting_title: 'Calendly: Truewind Intro Meeting',
+        hs_meeting_start_time: '2026-04-14T17:30:00.000Z',
+      },
+      _externalContacts: [{ email: 'buyer@example.com', firstname: 'Buyer', lastname: 'One' }],
+    },
+    {
+      properties: {
+        hs_meeting_title: 'Truewind Intro Meeting // Buyer One',
+        hs_meeting_start_time: '2026-04-14T17:30:00.000Z',
+      },
+      _externalContacts: [{ email: 'buyer@example.com', firstname: 'Buyer', lastname: 'One' }],
+    },
+  ]);
+
+  assert.equal(deduped.length, 1);
+});
+
+test('no-show meeting label includes external email when available', () => {
+  assert.equal(formatNoShowMeetingLabel({
+    properties: { hs_meeting_title: 'Calendly: Truewind Intro Meeting' },
+    _externalContacts: [{
+      firstname: 'Sunil',
+      lastname: 'Wadhawa',
+      company: 'Nucleus DNA',
+      email: 'swadhwa@nucleusdna.co',
+    }],
+  }), 'Sunil Wadhawa (Nucleus DNA) <swadhwa@nucleusdna.co>');
 });

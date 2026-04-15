@@ -138,9 +138,10 @@ function getDigestContactKey(contact) {
 
 function getDigestMeetingKey(meeting) {
   if (meeting?._grainId) return `grain:${meeting._grainId}`;
-  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
   const startMs = getDigestMeetingStartMs(meeting);
   const contactKey = getDigestContactKey(getPrimaryDigestContact(meeting));
+  if (startMs && contactKey) return `hubspot-contact-time:${startMs}|${contactKey}`;
+  const title = normalizeDigestText(meeting?.properties?.hs_meeting_title || meeting?.title);
   return `hubspot:${title}|${startMs}|${contactKey}`;
 }
 
@@ -259,6 +260,22 @@ function formatGrainTranscriptText(recording) {
   return '';
 }
 
+function formatDigestContactLabel(contact) {
+  if (!contact) return '';
+  const name = `${contact.firstname || ''} ${contact.lastname || ''}`.trim();
+  const company = String(contact.company || '').trim();
+  const email = String(contact.email || '').trim();
+  const label = [name, company ? `(${company})` : ''].filter(Boolean).join(' ');
+  if (label && email) return `${label} <${email}>`;
+  return label || email;
+}
+
+function formatNoShowMeetingLabel(meeting) {
+  const contactLabel = formatDigestContactLabel(getPrimaryDigestContact(meeting));
+  if (contactLabel) return contactLabel;
+  return meeting?.properties?.hs_meeting_title || meeting?.title || 'Unknown';
+}
+
 function getTokenOverlapScore(left, right) {
   const leftTokens = new Set(normalizeDigestText(left).split(/[^a-z0-9]+/).filter(token => token.length >= 3));
   const rightTokens = new Set(normalizeDigestText(right).split(/[^a-z0-9]+/).filter(token => token.length >= 3));
@@ -316,6 +333,7 @@ module.exports = {
   dedupeGrainRecordings,
   findBestGrainRecordingForMeeting,
   formatGrainTranscriptText,
+  formatNoShowMeetingLabel,
   getDigestMeetingStartMs,
   getGrainParticipantEmails,
   getGrainRecordingId,
