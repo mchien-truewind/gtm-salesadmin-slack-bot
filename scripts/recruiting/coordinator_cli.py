@@ -52,7 +52,7 @@ RESUME_LINK_FILE_HINTS = (".pdf", ".doc", ".docx", ".rtf", ".txt")
 RESUME_LINK_RE = re.compile(r"https?://[^\s<>\")']+", flags=re.IGNORECASE)
 
 DEFAULT_PROCEED_TEMPLATE = "Thanks for your submission. When are you free for a 20-minute intro call?"
-DEFAULT_BDR_PROCEED_TEMPLATE = (
+DEFAULT_CUSTOM_GPT_PROCEED_TEMPLATE = (
     "Thanks for the submission. We'd love to get to know you a little better.\n\n"
     "As part of the next step in the process, please complete the following within the next 48 hours:\n"
     "1. Go to this roleplay link: https://chatgpt.com/g/g-698d0a0186288191bc1b95c61e3e36ed-truewind-bdr-roleplay\n"
@@ -1571,6 +1571,8 @@ NON_US_KEYWORDS = {
 
 
 ROLE_CANONICAL = {
+    "ae": "AE",
+    "account executive": "AE",
     "bdr": "BDR",
     "sdr": "BDR",
     "founding sdr": "BDR",
@@ -1614,6 +1616,8 @@ def canonicalize_truewind_role(raw_value: str) -> str:
         return "Growth Generalist"
     if "growth associate" in lowered or "gtm associate" in lowered:
         return "Growth Generalist"
+    if "account executive" in lowered or re.search(r"\bae\b", lowered):
+        return "AE"
     if "bdr" in lowered or "business development representative" in lowered:
         return "BDR"
     if "sdr" in lowered:
@@ -3136,7 +3140,8 @@ def require_notion_property(
     return properties[prop_name]
 
 
-ROLE_OPTIONS = ("BDR", "Growth Generalist", "Other")
+ROLE_OPTIONS = ("BDR", "Growth Generalist", "AE", "Other")
+CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process")
 TERMINAL_STATUSES = {"rejected"}
 
@@ -3795,7 +3800,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         decision = notion_prop_value(page_props.get(prop.decision, {})).strip().lower()
         current_status = notion_prop_value(page_props.get(prop.status, {})).strip().lower()
         candidate_roles = page_role_values(page_props, prop)
-        uses_bdr_assignment = "BDR" in candidate_roles
+        uses_custom_gpt_assignment = bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(candidate_roles))
         candidate_name = notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "Candidate"
 
         candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
@@ -3884,7 +3889,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         sent_archive_labels = [hiring_label_id] if hiring_label_id else []
         if current_status == "proceed drafted":
-            if uses_bdr_assignment:
+            if uses_custom_gpt_assignment:
                 proceed_sent_at = thread_latest_assignment_sent_at_any_thread(
                     gmail_service,
                     thread_ids=related_thread_ids,
@@ -3901,7 +3906,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                 )
             if proceed_sent_at:
                 if prop.status in properties_schema:
-                    next_status = "In CustomGPT Process" if uses_bdr_assignment else "In Process"
+                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "In Process"
                     update_payload[prop.status] = build_notion_value(properties_schema[prop.status], next_status)
                 archived_count, archive_failures = remove_labels_from_threads(
                     gmail_service,
@@ -4115,7 +4120,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
             if not proceed_draft_id:
-                proceed_body = DEFAULT_BDR_PROCEED_TEMPLATE if uses_bdr_assignment else config.proceed_template
+                proceed_body = DEFAULT_CUSTOM_GPT_PROCEED_TEMPLATE if uses_custom_gpt_assignment else config.proceed_template
                 draft_id = create_reply_draft(
                     gmail_service,
                     sender_email=config.from_email,
@@ -4141,7 +4146,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             scheduling_draft_id = notion_prop_value(page_props.get(prop.scheduling_draft_id, {})).strip()
             proposed_slot_raw = notion_prop_value(page_props.get(prop.proposed_slot, {})).strip()
             anchor = decision_time or now
-            if not uses_bdr_assignment:
+            if not uses_custom_gpt_assignment:
                 reply_dt, reply_text = latest_candidate_message_since_any_thread(
                     gmail_service,
                     thread_ids=related_thread_ids,
