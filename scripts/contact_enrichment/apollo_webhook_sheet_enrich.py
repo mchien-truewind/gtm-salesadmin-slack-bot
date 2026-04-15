@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
+try:
+    from scripts.contact_enrichment.icp_title_filters import title_is_non_icp
+except ModuleNotFoundError:
+    from icp_title_filters import title_is_non_icp
+
 SOURCE_REQUIRED_COLUMNS = [
     "first name",
     "last name",
@@ -172,7 +177,12 @@ def read_source_rows(sheets, spreadsheet_id: str, tab_name: str) -> list[dict[st
             "state": _pick(row, "state", "province", "region"),
             "country": _pick(row, "country"),
         }
+        if title_is_non_icp(out["title"]):
+            continue
         normalized.append(out)
+
+    if not normalized:
+        return []
 
     for column in SOURCE_REQUIRED_COLUMNS:
         if column not in normalized[0]:
