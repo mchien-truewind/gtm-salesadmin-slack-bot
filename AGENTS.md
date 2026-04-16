@@ -13,6 +13,8 @@
 
 9. No human intervention is needed for `.md` or `.py` edits; proceed autonomously unless the request is truly ambiguous.
 
+10. When the user asks for `/review`, `Claude review`, or says Claude should review the work, invoke the actual Claude review path available in the repo or host, such as the Claude CLI. Do not treat Codex subagents or internal reviewer agents as a substitute for Claude review. If Claude cannot be invoked, state the blocker explicitly before presenting reviewed work.
+
 ## Default Path (All Tasks)
 
 1. Task log
