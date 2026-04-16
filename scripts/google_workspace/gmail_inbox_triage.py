@@ -7,6 +7,8 @@ import json
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 from difflib import SequenceMatcher
 from collections import Counter
 from dataclasses import dataclass
@@ -385,11 +387,39 @@ class TriageConfig:
     refresh_existing_drafts: bool
     dry_run: bool
     route_only: bool
+    slack_token: str
+    slack_channel: str
+    slack_mention_user_id: str
+    slack_notifications: bool
 
 
 def load_env_files() -> None:
     load_dotenv(".env.local")
     load_dotenv()
+
+
+def first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def default_slack_channel() -> str:
+    return first_env(
+        "GMAIL_TRIAGE_SLACK_CHANNEL",
+        "INSTANTLY_POSITIVE_REPLY_SLACK_CHANNEL",
+        "ACTIONABLE_REPLY_SLACK_CHANNEL",
+        "GMAIL_TRIAGE_SLACK_MENTION_USER_ID",
+        "INSTANTLY_POSITIVE_REPLY_SLACK_MENTION_USER_ID",
+        "SLACK_USER_ID",
+    )
+
+
+def normalize_slack_channel(channel: str) -> str:
+    cleaned = channel.strip()
+    return cleaned[1:] if cleaned.startswith("#") else cleaned
 
 
 def resolve_existing_path(raw_path: str) -> Path:
@@ -722,6 +752,184 @@ def automated_header_reason(headers: dict[str, str], *, sender: str) -> str | No
     if headers.get("list-unsubscribe"):
         return f"list-unsubscribe-header:{sender_label}"
     return None
+
+
+def positive_reply_notification_reason(message: dict[str, Any], *, my_email: str) -> str | None:
+    headers = header_map(message)
+    sender = normalize_email(headers.get("from", ""))
+    if sender == my_email:
+        return None
+
+    sender_domain = email_domain(sender)
+    provider = ""
+    if "instantly" in sender_domain:
+        provider = "instantly"
+    elif "lemlist" in sender_domain or "lemwarm" in sender_domain:
+        provider = "lemlist"
+
+    subject = headers.get("subject", "").strip()
+    body = message_text(message)
+    haystack = f"{subject}\n{body}".lower()
+    if "may have sent a positive reply" in haystack:
+        return f"positive-reply-notification:{provider or 'unknown'}"
+    if provider and ("positive reply" in haystack or "replied positively" in haystack):
+        return f"positive-reply-notification:{provider}"
+    return None
+
+
+def extract_email_from_text(value: str) -> str:
+    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", value)
+    return match.group(0).lower() if match else ""
+
+
+def slack_escape(value: str) -> str:
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def gmail_thread_url(thread_id: str) -> str:
+    return f"https://mail.google.com/mail/u/0/#inbox/{thread_id}"
+
+
+def format_slack_response_alert(
+    *,
+    message: dict[str, Any],
+    thread_id: str,
+    title: str,
+    reason: str,
+    mention_user_id: str,
+    draft_id: str = "",
+) -> str:
+    headers = header_map(message)
+    subject = headers.get("subject", "").strip()
+    sender = headers.get("from", "").strip()
+    body = message_text(message).strip()
+    lead_email = extract_email_from_text(f"{subject}\n{body}")
+
+    prefix = f"<@{mention_user_id}> " if mention_user_id else ""
+    lines = [
+        f"{prefix}*{slack_escape(title)}*",
+        f"Subject: {slack_escape(subject or '(no subject)')}",
+        f"From: {slack_escape(sender or '(unknown)')}",
+        f"Reason: {slack_escape(reason)}",
+    ]
+    if lead_email:
+        lines.append(f"Lead: {slack_escape(lead_email)}")
+    if draft_id:
+        lines.append(f"Draft: {slack_escape(draft_id)}")
+    lines.append(f"Gmail: {gmail_thread_url(thread_id)}")
+    return "\n".join(lines)
+
+
+def slack_api(method: str, *, token: str, params: dict[str, str]) -> dict[str, Any]:
+    data = urllib.parse.urlencode(
+        params
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not payload.get("ok"):
+        raise RuntimeError(f"Slack API {method} failed: {payload.get('error', 'unknown_error')}")
+    return payload
+
+
+def slack_channel_is_user_id(channel: str) -> bool:
+    return bool(re.match(r"^[UW][A-Z0-9]+$", channel.strip()))
+
+
+def resolve_slack_post_channel(*, token: str, channel: str) -> str:
+    normalized = normalize_slack_channel(channel)
+    if not slack_channel_is_user_id(normalized):
+        return normalized
+    payload = slack_api("conversations.open", token=token, params={"users": normalized})
+    resolved = ((payload.get("channel") or {}).get("id") or "").strip()
+    if not resolved:
+        raise RuntimeError("Slack API conversations.open did not return a channel id")
+    return resolved
+
+
+def post_slack_message(*, token: str, channel: str, text: str) -> dict[str, Any]:
+    target_channel = resolve_slack_post_channel(token=token, channel=channel)
+    return slack_api(
+        "chat.postMessage",
+        token=token,
+        params={
+            "channel": target_channel,
+            "text": text,
+        },
+    )
+
+
+def maybe_notify_slack(
+    *,
+    config: TriageConfig,
+    thread_record: dict[str, Any],
+    thread_id: str,
+    message: dict[str, Any],
+    alert_kind: str,
+    title: str,
+    reason: str,
+    draft_id: str = "",
+) -> str:
+    message_id = str(message.get("id", "") or message_internal_ms(message) or thread_id)
+    alert_key = f"{alert_kind}:{message_id}"
+    if thread_record.get("last_slack_alert_key") == alert_key:
+        return "duplicate"
+    if not config.slack_notifications:
+        return "disabled"
+    if config.dry_run:
+        print(f"[slack:dry-run] thread={thread_id} kind={alert_kind} reason={reason}")
+        return "dry_run"
+    if not config.slack_token or not config.slack_channel:
+        raise RuntimeError("Slack notifications are enabled but token/channel config is missing")
+
+    text = format_slack_response_alert(
+        message=message,
+        thread_id=thread_id,
+        title=title,
+        reason=reason,
+        mention_user_id=config.slack_mention_user_id,
+        draft_id=draft_id,
+    )
+    try:
+        post_slack_message(token=config.slack_token, channel=config.slack_channel, text=text)
+    except Exception as exc:
+        raise RuntimeError(f"Slack notification failed for thread {thread_id}: {exc}") from exc
+
+    thread_record["last_slack_alert_key"] = alert_key
+    thread_record["last_slack_alerted_at"] = datetime.now(timezone.utc).isoformat()
+    return "posted"
+
+
+def validate_slack_notification_config(config: TriageConfig) -> None:
+    if not config.slack_notifications or config.dry_run:
+        return
+    if not config.slack_token:
+        raise RuntimeError(
+            "Missing Slack token for Gmail triage notifications. "
+            "Set SLACK_BOT_TOKEN/SLACK_USER_TOKEN or pass --no-slack-notifications intentionally."
+        )
+    if not config.slack_channel:
+        raise RuntimeError(
+            "Missing Slack channel or user ID for Gmail triage notifications. "
+            "Set GMAIL_TRIAGE_SLACK_CHANNEL, GMAIL_TRIAGE_SLACK_MENTION_USER_ID, or SLACK_USER_ID."
+        )
+    if not config.slack_mention_user_id and not re.match(r"^[UW][A-Z0-9]+$", config.slack_channel):
+        raise RuntimeError(
+            "Missing Slack mention user ID for channel notifications. "
+            "Set GMAIL_TRIAGE_SLACK_MENTION_USER_ID or SLACK_USER_ID so response-needed alerts ping a user."
+        )
 
 
 def support_update_reason(message: dict[str, Any], *, my_email: str) -> str | None:
@@ -1809,6 +2017,7 @@ def archive_thread(
 
 
 def run_triage(config: TriageConfig) -> int:
+    validate_slack_notification_config(config)
     gmail_service = ensure_gmail_service(config.credentials_file, config.token_file)
     profile = gmail_service.users().getProfile(userId="me").execute()
     my_email = normalize_email(profile.get("emailAddress", ""))
@@ -1839,6 +2048,11 @@ def run_triage(config: TriageConfig) -> int:
     thread_ids = list_inbox_thread_ids(gmail_service, query=config.query, max_threads=config.max_threads)
     counters = Counter()
 
+    def record_slack_status(status: str) -> None:
+        counters[f"slack_notifications_{status}"] += 1
+        if status == "posted":
+            write_json(config.state_file, state)
+
     for thread_id in thread_ids:
         thread = (
             gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
@@ -1862,6 +2076,26 @@ def run_triage(config: TriageConfig) -> int:
         thread_record["last_classification"] = decision
         thread_record["last_subject"] = info.get("subject", "")
         thread_record["last_processed_at"] = datetime.now(timezone.utc).isoformat()
+
+        inbound_for_alert = latest_inbound_message(thread, my_email)
+        positive_reply_reason = (
+            positive_reply_notification_reason(inbound_for_alert, my_email=my_email)
+            if inbound_for_alert
+            else None
+        )
+        if positive_reply_reason and inbound_for_alert:
+            slack_status = maybe_notify_slack(
+                config=config,
+                thread_record=thread_record,
+                thread_id=thread_id,
+                message=inbound_for_alert,
+                alert_kind="positive_reply_notification",
+                title="Response needed: positive reply notification",
+                reason=positive_reply_reason,
+            )
+            record_slack_status(slack_status)
+            thread_record["positive_reply_notification"] = positive_reply_reason
+            print(f"[slack:{slack_status}] thread={thread_id} subject={info.get('subject','')} reason={positive_reply_reason}")
 
         if decision == "marketing":
             archive_with_label(
@@ -2055,7 +2289,17 @@ def run_triage(config: TriageConfig) -> int:
                 label_id=review_label_id,
                 dry_run=config.dry_run,
             )
+            slack_status = maybe_notify_slack(
+                config=config,
+                thread_record=thread_record,
+                thread_id=thread_id,
+                message=inbound,
+                alert_kind="needs_review",
+                title="Response needed: Gmail triage needs review",
+                reason=draft_reason,
+            )
             counters["conversation_needs_review_labeled"] += 1
+            record_slack_status(slack_status)
             print(f"[label:needs-review] thread={thread_id} subject={subject} reason={draft_reason}")
             continue
         if (
@@ -2070,6 +2314,17 @@ def run_triage(config: TriageConfig) -> int:
                 counters["conversation_existing_drafts_refreshed"] += 1
                 print(f"[draft:refresh-delete] thread={thread_id} draft={previous_draft_id}")
             else:
+                slack_status = maybe_notify_slack(
+                    config=config,
+                    thread_record=thread_record,
+                    thread_id=thread_id,
+                    message=inbound,
+                    alert_kind="draft_created",
+                    title="Response needed: Gmail draft exists",
+                    reason=draft_reason,
+                    draft_id=previous_draft_id,
+                )
+                record_slack_status(slack_status)
                 counters["conversation_draft_skipped_existing"] += 1
                 continue
 
@@ -2106,8 +2361,18 @@ def run_triage(config: TriageConfig) -> int:
                 label_id=review_label_id,
                 dry_run=config.dry_run,
             )
+            slack_status = maybe_notify_slack(
+                config=config,
+                thread_record=thread_record,
+                thread_id=thread_id,
+                message=inbound,
+                alert_kind="needs_review",
+                title="Response needed: Gmail triage needs review",
+                reason=quality_reason,
+            )
             counters["conversation_needs_review_labeled"] += 1
             counters["conversation_draft_quality_blocked"] += 1
+            record_slack_status(slack_status)
             thread_record["last_draft_gate"] = quality_reason
             print(f"[label:needs-review] thread={thread_id} subject={subject} reason={quality_reason}")
             continue
@@ -2124,7 +2389,18 @@ def run_triage(config: TriageConfig) -> int:
             )
             thread_record["last_drafted_for_message_id"] = latest_inbound_id
             thread_record["last_draft_id"] = draft_id
+        slack_status = maybe_notify_slack(
+            config=config,
+            thread_record=thread_record,
+            thread_id=thread_id,
+            message=inbound,
+            alert_kind="draft_created",
+            title="Response needed: Gmail draft created",
+            reason=draft_reason,
+            draft_id=draft_id,
+        )
         counters["drafts_created"] += 1
+        record_slack_status(slack_status)
         print(f"[draft] thread={thread_id} draft={draft_id} subject={subject}")
 
     write_json(config.state_file, state)
@@ -2154,6 +2430,11 @@ def run_triage(config: TriageConfig) -> int:
     print(f"- conversation_skipped_existing: {counters.get('conversation_draft_skipped_existing', 0)}")
     print(f"- conversation_route_only_skipped: {counters.get('conversation_route_only_skipped', 0)}")
     print(f"- waiting_on_other_side: {counters.get('conversation_waiting_on_other_side', 0)}")
+    print(f"- slack_notifications_posted: {counters.get('slack_notifications_posted', 0)}")
+    print(f"- slack_notifications_duplicate: {counters.get('slack_notifications_duplicate', 0)}")
+    print(f"- slack_notifications_disabled: {counters.get('slack_notifications_disabled', 0)}")
+    print(f"- slack_notifications_failed: {counters.get('slack_notifications_failed', 0)}")
+    print(f"- slack_notifications_dry_run: {counters.get('slack_notifications_dry_run', 0)}")
     if config.dry_run:
         print("- mode: dry-run (no Gmail mutations)")
 
@@ -2262,6 +2543,30 @@ def parse_args() -> argparse.Namespace:
         "--route-only",
         action="store_true",
         help="Only apply auto/marketing routing; skip conversation draft creation",
+    )
+    run.add_argument(
+        "--slack-token-env",
+        default=os.getenv("GMAIL_TRIAGE_SLACK_TOKEN_ENV", "SLACK_BOT_TOKEN"),
+        help="Env var containing the Slack token used for response-needed notifications",
+    )
+    run.add_argument(
+        "--slack-channel",
+        default=default_slack_channel(),
+        help="Slack channel for response-needed notifications",
+    )
+    run.add_argument(
+        "--slack-mention-user-id",
+        default=first_env(
+            "GMAIL_TRIAGE_SLACK_MENTION_USER_ID",
+            "INSTANTLY_POSITIVE_REPLY_SLACK_MENTION_USER_ID",
+            "SLACK_USER_ID",
+        ),
+        help="Optional Slack user ID to mention on response-needed notifications",
+    )
+    run.add_argument(
+        "--no-slack-notifications",
+        action="store_true",
+        help="Disable Slack response-needed notifications for this run",
     )
     run.add_argument("--dry-run", action="store_true", help="Log intended actions without changing Gmail")
 
@@ -2408,6 +2713,10 @@ def command_run(args: argparse.Namespace) -> int:
         refresh_existing_drafts=bool(args.refresh_existing_drafts),
         dry_run=bool(args.dry_run),
         route_only=bool(args.route_only),
+        slack_token=first_env(args.slack_token_env, "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
+        slack_channel=normalize_slack_channel(args.slack_channel),
+        slack_mention_user_id=args.slack_mention_user_id.strip(),
+        slack_notifications=not bool(args.no_slack_notifications),
     )
     return run_triage(config)
 

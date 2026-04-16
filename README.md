@@ -197,7 +197,21 @@ Script:
    python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --dry-run
    ```
 
-4. Run with mutations enabled:
+4. Configure Slack response-needed alerts before running with mutations enabled.
+   Real runs fail closed unless Slack notifications are configured. Set either a DM/user target:
+   ```sh
+   export SLACK_USER_ID=U1234567890
+   ```
+
+   Or set a channel plus an explicit mention:
+   ```sh
+   export GMAIL_TRIAGE_SLACK_CHANNEL=hiring-review
+   export GMAIL_TRIAGE_SLACK_MENTION_USER_ID=U1234567890
+   ```
+
+   The token defaults to `SLACK_BOT_TOKEN`, then `SLACK_USER_TOKEN`. Use `--slack-token-env` to point at another env var. Use `--no-slack-notifications` only for an intentional non-alerting run.
+
+5. Run with mutations enabled:
    ```sh
    python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25
    ```
@@ -213,12 +227,12 @@ python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --st
 python3 scripts/google_workspace/gmail_inbox_triage.py run --max-threads 25 --refresh-style-profile
 ```
 
-5. Audit drafts addressed to blocked/no-reply senders (report-only):
+6. Audit drafts addressed to blocked/no-reply senders (report-only):
    ```sh
    python3 scripts/google_workspace/gmail_inbox_triage.py audit-blocked-drafts --max-drafts 500 --dry-run
    ```
 
-6. Delete blocked drafts found by the audit:
+7. Delete blocked drafts found by the audit:
    ```sh
    python3 scripts/google_workspace/gmail_inbox_triage.py audit-blocked-drafts --max-drafts 500 --delete
    ```
