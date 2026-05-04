@@ -1183,12 +1183,31 @@ function scheduleDiscoveryDigest() {
 // ============================================================
 // Daily meetings-booked progress post
 // ============================================================
+const DEFAULT_PROGRESS_WEEKLY_GOAL = 30;
+const LEGACY_PROGRESS_WEEKLY_GOAL = 10;
+
+function parseProgressWeeklyGoal(rawValue) {
+  if (rawValue == null || String(rawValue).trim() === '') {
+    return DEFAULT_PROGRESS_WEEKLY_GOAL;
+  }
+
+  const weeklyGoal = Number.parseFloat(rawValue);
+  if (Number.isNaN(weeklyGoal)) {
+    throw new Error(`Invalid LEAD_REPORT_WEEKLY_GOAL: ${rawValue}`);
+  }
+  if (weeklyGoal === LEGACY_PROGRESS_WEEKLY_GOAL) {
+    console.warn('Ignoring legacy LEAD_REPORT_WEEKLY_GOAL=10 override; using 30');
+    return DEFAULT_PROGRESS_WEEKLY_GOAL;
+  }
+  return weeklyGoal;
+}
+
 const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
 const PROGRESS_INBOUND_CHANNEL = process.env.LEAD_REPORT_INBOUND_CHANNEL || 'leads';
 const PROGRESS_OUTBOUND_CHANNEL = process.env.LEAD_REPORT_OUTBOUND_CHANNEL || 'gtm-outbound';
 const PROGRESS_INBOUND_PHRASE = process.env.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting';
 const PROGRESS_OUTBOUND_PHRASE = process.env.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting';
-const PROGRESS_WEEKLY_GOAL = parseFloat(process.env.LEAD_REPORT_WEEKLY_GOAL || '30');
+const PROGRESS_WEEKLY_GOAL = parseProgressWeeklyGoal(process.env.LEAD_REPORT_WEEKLY_GOAL);
 const PROGRESS_EXCLUDE_PATTERNS = ['truewind', 'test'];
 const PROGRESS_TIMEZONE = 'America/Los_Angeles';
 const PROGRESS_TARGET_HOUR = 18;
