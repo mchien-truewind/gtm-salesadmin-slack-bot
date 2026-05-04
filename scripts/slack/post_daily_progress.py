@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Dict, Iterable, Tuple
 from zoneinfo import ZoneInfo
 
+DEFAULT_WEEKLY_GOAL = 30.0
+LEGACY_WEEKLY_GOAL = 10.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -65,8 +68,23 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),
-        "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", "30"),
+        "weekly_goal": pick("LEAD_REPORT_WEEKLY_GOAL", str(int(DEFAULT_WEEKLY_GOAL))),
     }
+
+
+def parse_weekly_goal(raw_value: str) -> float:
+    try:
+        weekly_goal = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid LEAD_REPORT_WEEKLY_GOAL: {raw_value}") from exc
+
+    if weekly_goal == LEGACY_WEEKLY_GOAL:
+        print(
+            "warning: ignoring legacy LEAD_REPORT_WEEKLY_GOAL=10 override; using 30",
+            file=sys.stderr,
+        )
+        return DEFAULT_WEEKLY_GOAL
+    return weekly_goal
 
 
 def slack_api(method: str, token: str, params: Dict[str, str], use_get: bool = False) -> Dict:
@@ -270,10 +288,7 @@ def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
     config = get_config(repo_root, args)
-    try:
-        weekly_goal = float(config["weekly_goal"])
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid LEAD_REPORT_WEEKLY_GOAL: {config['weekly_goal']}") from exc
+    weekly_goal = parse_weekly_goal(config["weekly_goal"])
 
     (
         now_local,
