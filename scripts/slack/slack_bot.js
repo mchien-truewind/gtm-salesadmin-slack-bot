@@ -85,7 +85,23 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
       let data = '';
       res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+        let parsed = {};
+        if (data) {
+          try { parsed = JSON.parse(data); } catch { parsed = data; }
+        }
+
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const responseMessage = parsed && typeof parsed === 'object'
+            ? (parsed.message || parsed.error || JSON.stringify(parsed))
+            : parsed;
+          const err = new Error(`HubSpot ${res.statusCode}: ${responseMessage}`);
+          err.statusCode = res.statusCode;
+          err.body = parsed;
+          reject(err);
+          return;
+        }
+
+        resolve(parsed);
       });
     });
     req.setTimeout(DEFAULT_HTTP_TIMEOUT_MS, () => {
@@ -95,6 +111,28 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
+}
+
+function requireHubSpotObjectId(response, operation) {
+  if (!response || typeof response !== 'object') {
+    throw new Error(`${operation} did not return a JSON object from HubSpot`);
+  }
+  if (!response.id) {
+    throw new Error(`${operation} succeeded but HubSpot response did not include top-level id: ${JSON.stringify(response)}`);
+  }
+  return String(response.id);
+}
+
+function formatHubSpotObjectResponse(response, objectTypeId) {
+  const id = requireHubSpotObjectId(response, 'HubSpot object write');
+  const properties = response.properties || {};
+  return {
+    ...properties,
+    id,
+    hubspot_id: id,
+    url: `https://app.hubspot.com/contacts/43974586/record/${objectTypeId}/${id}`,
+    properties,
+  };
 }
 
 async function httpRequest(url, options = {}) {
@@ -421,22 +459,24 @@ async function executeTool(name, input) {
       if (input.phone) props.phone = input.phone;
       if (input.properties) Object.assign(props, input.properties);
       const res = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: props });
-      return JSON.stringify({ id: res.id, url: `https://app.hubspot.com/contacts/43974586/record/0-1/${res.id}`, ...res.properties });
+      return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
     }
     if (name === 'hubspot_update_contact') {
-      const res = await hubspotRequest(`/crm/v3/objects/contacts/${input.contact_id}`, 'PATCH', { properties: input.properties });
-      return JSON.stringify({ id: res.id, ...res.properties });
+      const contactId = encodeURIComponent(input.contact_id);
+      const res = await hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, 'PATCH', { properties: input.properties });
+      return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
     }
     if (name === 'hubspot_create_deal') {
       const props = { dealname: input.dealname, dealstage: input.dealstage, pipeline: input.pipeline || '105321581' };
       if (input.amount) props.amount = String(input.amount);
       if (input.properties) Object.assign(props, input.properties);
       const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: props });
-      return JSON.stringify({ id: res.id, url: `https://app.hubspot.com/contacts/43974586/record/0-3/${res.id}`, ...res.properties });
+      return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
     }
     if (name === 'hubspot_update_deal') {
-      const res = await hubspotRequest(`/crm/v3/objects/deals/${input.deal_id}`, 'PATCH', { properties: input.properties });
-      return JSON.stringify({ id: res.id, ...res.properties });
+      const dealId = encodeURIComponent(input.deal_id);
+      const res = await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, 'PATCH', { properties: input.properties });
+      return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
     }
     if (name === 'hubspot_create_association') {
       const res = await hubspotRequest(
