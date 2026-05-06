@@ -29,6 +29,26 @@ A bare-bones extraction of `agentic-os` focused on:
 
 - HubSpot credential setup and safe verification: `docs/instructions/hubspot-credential-verification.md`
 
+## Slack Claude Bot (Railway)
+
+The Slack Cloudbot runs with:
+
+```sh
+npm start
+```
+
+That starts `node scripts/slack/slack_bot.js`.
+
+Required Claude/Anthropic env:
+
+```sh
+ANTHROPIC_API_KEY=...
+CLAUDE_MODEL=claude-opus-4-1-20250805
+```
+
+`CLAUDE_MODEL` is optional in code and defaults to `claude-opus-4-1-20250805`.
+Use the exact Anthropic API model ID, not a Claude.ai plan name.
+
 ## Daily Lead Progress Slack Post (Railway)
 
 1. Put your token in `.env.local`:

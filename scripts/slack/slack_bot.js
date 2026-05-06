@@ -543,6 +543,7 @@ const INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID = (
 const INSTANTLY_WEBHOOK_SECRET = (process.env.INSTANTLY_WEBHOOK_SECRET || '').trim();
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-1-20250805';
 
 const PRIORITY_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI/edit?gid=0#gid=0';
 const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
@@ -692,7 +693,7 @@ async function handleMessage(text, threadTs, channel, isThread, say) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         return await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: CLAUDE_MODEL,
           max_tokens: 2048,
           system: getSystemPrompt(),
           tools: TOOLS,
@@ -1098,7 +1099,7 @@ async function runDiscoveryDigestImpl(channelOverride) {
 
       try {
         const claudeRes = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: CLAUDE_MODEL,
           max_tokens: 500,
           system: `You extract key takeaways and pain point quotes from sales discovery call transcripts. Be concise. Never use em dashes.`,
           messages: [{
