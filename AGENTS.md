@@ -15,6 +15,8 @@
 
 10. When the user asks for `/review`, `Claude review`, or says Claude should review the work, invoke the actual Claude review path available in the repo or host, such as the Claude CLI. Do not treat Codex subagents or internal reviewer agents as a substitute for Claude review. If Claude cannot be invoked, state the blocker explicitly before presenting reviewed work.
 
+11. After pushing changes that affect the Slack/Claude bot runtime, verify Railway auto-deploy status for the pushed commit before final handoff. Use GitHub deployments/statuses when the local Railway CLI is not linked to the correct project.
+
 ## Default Path (All Tasks)
 
 1. Task log
@@ -46,3 +48,4 @@
 - Worktrees: `scripts/worktrees/create_tree.sh`, `scripts/worktrees/remove_tree.sh`
 - PR creation: `gh` (or your org's wrapper)
 - Skills sync into Codex: `./.codex/scripts/codex-skills/sync_codex_skills.sh`
+- Railway deploy verification: `gh api repos/mchien-truewind/leads-update/deployments` and then `gh api repos/mchien-truewind/leads-update/deployments/<deployment_id>/statuses`.

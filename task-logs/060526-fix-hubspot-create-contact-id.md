@@ -13,6 +13,9 @@ The user reported that the Truewind Slack Cloudbot tool `hubspot_create_contact`
 - Updated `hubspot_create_contact` to return a response with an explicit top-level `id`, `hubspot_id`, `url`, and `properties`.
 - Reused the same formatter for HubSpot contact/deal create/update write tools so they do not build record URLs from missing IDs.
 - Encoded contact/deal IDs in update paths.
+- Committed and pushed the fix to `main` as `33e02dd`.
+- Verified GitHub reported a successful Railway production deployment for commit `33e02dd`.
+- Added an `AGENTS.md` rule to verify Railway auto-deploy status after future Slack/Claude bot runtime pushes.
 
 ## Decisions Made
 
@@ -37,8 +40,9 @@ The user reported that the Truewind Slack Cloudbot tool `hubspot_create_contact`
 - Ran `node --check scripts/slack/slack_bot.js`.
 - Ran `npm test`; all 11 Node tests passed.
 - Ran a Claude-backed code review through local Claude Code. It found no blockers and agreed the fix addresses the reported undefined-ID behavior.
+- Checked GitHub deployments for `mchien-truewind/leads-update`; deployment `4601751859` for `33e02dd` reached `success` at `2026-05-06T22:22:16Z` in `mchien-truewind / production`.
 
 ## Follow-Ups
 
-- Deploy or restart the Slack bot service after this change is committed/pushed so the running Cloudbot picks up the fix.
+- No manual restart is needed for this fix because Railway auto-deploy succeeded for the pushed commit.
 - If desired, later replace the hardcoded HubSpot portal ID with an environment variable.
