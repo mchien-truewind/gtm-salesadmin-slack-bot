@@ -20,7 +20,8 @@ The user asked to route the Truewind Slack Cloudbot between Opus and Sonnet base
 
 - Used deterministic keyword/context routing instead of making an extra LLM call to classify the task.
 - Kept Sonnet as the default to control cost and latency.
-- Preserved `CLAUDE_MODEL` as a backwards-compatible fallback for the high/Opus model path.
+- Removed `CLAUDE_MODEL` from the high-model fallback chain so a stale Railway `CLAUDE_MODEL` variable cannot silently override Opus routing.
+- The broad `plan` keyword was removed and the high-context default threshold was raised from 1800 to 3000 characters to reduce accidental Opus routing.
 
 ## Mistakes, Blockers, And Fixes
 

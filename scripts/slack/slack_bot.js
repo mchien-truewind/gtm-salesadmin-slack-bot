@@ -548,7 +548,6 @@ const CLAUDE_DEFAULT_MODEL = process.env.CLAUDE_MODEL_DEFAULT
   || 'claude-sonnet-4-6';
 const CLAUDE_HIGH_MODEL = process.env.CLAUDE_MODEL_HIGH
   || process.env.CLAUDE_MODEL_OPUS
-  || process.env.CLAUDE_MODEL
   || 'claude-opus-4-1-20250805';
 const CLAUDE_DIGEST_MODEL = process.env.CLAUDE_DIGEST_MODEL || CLAUDE_DEFAULT_MODEL;
 
@@ -621,9 +620,9 @@ function selectClaudeModelForMessages(messages) {
     .join('\n')
     .toLowerCase();
 
-  const highIntent = /\b(review|analy[sz]e|analysis|strategy|strategic|plan|planning|debug|troubleshoot|root cause|investigate|architecture|design|compare|evaluate|recommend|recommendation|decide|decision|tradeoff|risk|risks|complex|deep|think hard|think deeply|implementation|proposal|prioriti[sz]e|roadmap)\b/.test(text);
+  const highIntent = /\b(review|analy[sz]e|analysis|strategy|strategic|planning|debug|troubleshoot|root cause|investigate|architecture|design|compare|evaluate|recommend|recommendation|decide|decision|tradeoff|risk|risks|complex|deep|think hard|think deeply|implementation|proposal|prioriti[sz]e|roadmap)\b/.test(text);
   const multiStepAsk = /\b(step by step|multi-step|multiple steps|end to end|from scratch)\b/.test(text);
-  const longContext = text.length > Number(process.env.CLAUDE_HIGH_CONTEXT_CHARS || 1800);
+  const longContext = text.length > Number(process.env.CLAUDE_HIGH_CONTEXT_CHARS || 3000);
   const longThread = messages.filter((message) => message.role === 'user').length >= Number(process.env.CLAUDE_HIGH_THREAD_MESSAGES || 5);
   const repeatedQuestions = (text.match(/\?/g) || []).length >= 3;
 
