@@ -43,11 +43,14 @@ Required Claude/Anthropic env:
 
 ```sh
 ANTHROPIC_API_KEY=...
-CLAUDE_MODEL=claude-opus-4-1-20250805
+CLAUDE_MODEL_DEFAULT=claude-sonnet-4-6
+CLAUDE_MODEL_HIGH=claude-opus-4-1-20250805
+CLAUDE_DIGEST_MODEL=claude-sonnet-4-6
 ```
 
-`CLAUDE_MODEL` is optional in code and defaults to `claude-opus-4-1-20250805`.
-Use the exact Anthropic API model ID, not a Claude.ai plan name.
+The Slack reply path routes simple/direct asks to `CLAUDE_MODEL_DEFAULT` and more complex asks to `CLAUDE_MODEL_HIGH`.
+`CLAUDE_DIGEST_MODEL` controls the discovery digest transcript extraction model separately.
+All model variables are optional in code; use exact Anthropic API model IDs, not Claude.ai plan names.
 
 ## Daily Lead Progress Slack Post (Railway)
 

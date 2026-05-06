@@ -543,7 +543,14 @@ const INSTANTLY_POSITIVE_REPLY_MENTION_USER_ID = (
 const INSTANTLY_WEBHOOK_SECRET = (process.env.INSTANTLY_WEBHOOK_SECRET || '').trim();
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-1-20250805';
+const CLAUDE_DEFAULT_MODEL = process.env.CLAUDE_MODEL_DEFAULT
+  || process.env.CLAUDE_MODEL_SONNET
+  || 'claude-sonnet-4-6';
+const CLAUDE_HIGH_MODEL = process.env.CLAUDE_MODEL_HIGH
+  || process.env.CLAUDE_MODEL_OPUS
+  || process.env.CLAUDE_MODEL
+  || 'claude-opus-4-1-20250805';
+const CLAUDE_DIGEST_MODEL = process.env.CLAUDE_DIGEST_MODEL || CLAUDE_DEFAULT_MODEL;
 
 const PRIORITY_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI/edit?gid=0#gid=0';
 const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
@@ -592,6 +599,47 @@ You have access to Grain meeting transcripts. You can list recent recordings and
 - The Slack metadata (channel_id, thread_ts, thread_date) is appended to the last message.
 - NEVER lie or fabricate results. If a tool call fails, show the actual error message. If you cannot do something, say exactly why (e.g. missing scope, token expired, tool not available). Do NOT say "done" or "created" unless you received a successful response with an ID back from the API.
 - If a HubSpot record was just created and search can't find it, explain that HubSpot search indexing has a delay and provide the direct record ID/URL instead of claiming it doesn't exist.`;
+}
+
+function getMessageContentText(content) {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((block) => {
+    if (!block) return '';
+    if (typeof block === 'string') return block;
+    if (typeof block.text === 'string') return block.text;
+    if (typeof block.content === 'string') return block.content;
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+function selectClaudeModelForMessages(messages) {
+  const text = messages
+    .filter((message) => message.role === 'user')
+    .map((message) => getMessageContentText(message.content))
+    .join('\n')
+    .toLowerCase();
+
+  const highIntent = /\b(review|analy[sz]e|analysis|strategy|strategic|plan|planning|debug|troubleshoot|root cause|investigate|architecture|design|compare|evaluate|recommend|recommendation|decide|decision|tradeoff|risk|risks|complex|deep|think hard|think deeply|implementation|proposal|prioriti[sz]e|roadmap)\b/.test(text);
+  const multiStepAsk = /\b(step by step|multi-step|multiple steps|end to end|from scratch)\b/.test(text);
+  const longContext = text.length > Number(process.env.CLAUDE_HIGH_CONTEXT_CHARS || 1800);
+  const longThread = messages.filter((message) => message.role === 'user').length >= Number(process.env.CLAUDE_HIGH_THREAD_MESSAGES || 5);
+  const repeatedQuestions = (text.match(/\?/g) || []).length >= 3;
+
+  if (highIntent || multiStepAsk || longContext || longThread || repeatedQuestions) {
+    return {
+      model: CLAUDE_HIGH_MODEL,
+      tier: 'high',
+      reason: highIntent ? 'high_intent'
+        : multiStepAsk ? 'multi_step'
+          : longContext ? 'long_context'
+            : longThread ? 'long_thread'
+              : 'repeated_questions',
+    };
+  }
+
+  return { model: CLAUDE_DEFAULT_MODEL, tier: 'default', reason: 'simple_or_direct' };
 }
 
 // ============================================================
@@ -688,12 +736,15 @@ async function handleMessage(text, threadTs, channel, isThread, say) {
   const lastMsg = messages[messages.length - 1];
   lastMsg.content += `\n\n[Slack metadata: channel_id=${channel}, thread_ts=${parentTs}, thread_date=${threadDate}]`;
 
+  const selectedModel = selectClaudeModelForMessages(messages);
+  console.log(`Claude model selected: ${selectedModel.model} tier=${selectedModel.tier} reason=${selectedModel.reason}`);
+
   // Helper to call Claude with retries on overload (529)
   async function callClaude(msgs) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         return await anthropic.messages.create({
-          model: CLAUDE_MODEL,
+          model: selectedModel.model,
           max_tokens: 2048,
           system: getSystemPrompt(),
           tools: TOOLS,
@@ -1099,7 +1150,7 @@ async function runDiscoveryDigestImpl(channelOverride) {
 
       try {
         const claudeRes = await anthropic.messages.create({
-          model: CLAUDE_MODEL,
+          model: CLAUDE_DIGEST_MODEL,
           max_tokens: 500,
           system: `You extract key takeaways and pain point quotes from sales discovery call transcripts. Be concise. Never use em dashes.`,
           messages: [{
