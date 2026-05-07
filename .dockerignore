@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+npm-debug.log*
+task-logs
+outputs
+secrets
+.env*
+scripts/slack/test
+scripts/slack/tests
+scripts/slack/*.py
+scripts/slack/*.sh
