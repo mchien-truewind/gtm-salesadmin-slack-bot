@@ -2010,7 +2010,7 @@ function parseProgressWeeklyGoal(rawValue) {
   return weeklyGoal;
 }
 
-const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
+const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'slack-slack-testing';
 const PROGRESS_INBOUND_CHANNEL = process.env.LEAD_REPORT_INBOUND_CHANNEL || 'leads';
 const PROGRESS_OUTBOUND_CHANNEL = process.env.LEAD_REPORT_OUTBOUND_CHANNEL || 'gtm-outbound';
 const PROGRESS_INBOUND_PHRASE = process.env.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting';

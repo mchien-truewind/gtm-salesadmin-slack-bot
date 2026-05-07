@@ -77,7 +77,7 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
    ```
 2. Optional overrides in `.env.local`:
    ```sh
-   LEAD_REPORT_TARGET_CHANNEL=gtm-general
+   LEAD_REPORT_TARGET_CHANNEL=slack-slack-testing
    LEAD_REPORT_INBOUND_CHANNEL=leads
    LEAD_REPORT_OUTBOUND_CHANNEL=gtm-outbound
    LEAD_REPORT_INBOUND_PHRASE=Booked Calendly Meeting
@@ -85,9 +85,9 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
    LEAD_REPORT_WINDOW_HOURS=24
    LEAD_REPORT_TIMEZONE=America/Los_Angeles
    ```
-3. Test with live counts to `#slack-testing`:
+3. Test with live counts to `#slack-slack-testing`:
    ```sh
-   python3 scripts/slack/post_daily_progress.py --target-channel slack-testing
+   python3 scripts/slack/post_daily_progress.py --target-channel slack-slack-testing
    ```
 4. Install daily scheduler (macOS `launchd`, 18:07 local machine time):
    ```sh
