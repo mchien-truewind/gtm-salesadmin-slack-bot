@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const http = require('http');
+const crypto = require('crypto');
 
 // Load .env.local if it exists (local dev), otherwise use environment variables (Railway)
 const envPath = path.resolve(__dirname, '../../.env.local');
@@ -1989,7 +1990,7 @@ function scheduleDiscoveryDigest() {
 }
 
 // ============================================================
-// Daily meetings-booked progress post
+// Daily deal progress post
 // ============================================================
 const DEFAULT_PROGRESS_WEEKLY_GOAL = 30;
 const LEGACY_PROGRESS_WEEKLY_GOAL = 10;
@@ -2010,16 +2011,14 @@ function parseProgressWeeklyGoal(rawValue) {
   return weeklyGoal;
 }
 
-const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'slack-slack-testing';
-const PROGRESS_INBOUND_CHANNEL = process.env.LEAD_REPORT_INBOUND_CHANNEL || 'leads';
-const PROGRESS_OUTBOUND_CHANNEL = process.env.LEAD_REPORT_OUTBOUND_CHANNEL || 'gtm-outbound';
-const PROGRESS_INBOUND_PHRASE = process.env.LEAD_REPORT_INBOUND_PHRASE || 'Booked Calendly Meeting';
-const PROGRESS_OUTBOUND_PHRASE = process.env.LEAD_REPORT_OUTBOUND_PHRASE || 'New Meeting';
+const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'slack-testing';
+const PROGRESS_DEAL_SOURCE_PROPERTY = process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY || 'deal_source';
+const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
 const PROGRESS_WEEKLY_GOAL = parseProgressWeeklyGoal(process.env.LEAD_REPORT_WEEKLY_GOAL);
-const PROGRESS_EXCLUDE_PATTERNS = ['truewind', 'test'];
 const PROGRESS_TIMEZONE = 'America/Los_Angeles';
 const PROGRESS_TARGET_HOUR = 18;
 const PROGRESS_TARGET_MINUTE = 7;
+const PROGRESS_ALLOWED_WEEKDAY_INDEXES = new Set([0, 1, 2, 3, 4, 5]); // Sunday, Monday-Friday.
 const PACIFIC_WEEKDAY_INDEX = {
   Sun: 0,
   Mon: 1,
@@ -2059,35 +2058,16 @@ async function resolveChannelId(name) {
   return null;
 }
 
-async function collectMatchingTimestamps(channelId, phrase, oldest, latest, excludePatterns) {
-  const timestamps = [];
-  const skipLower = excludePatterns.map(p => p.toLowerCase());
-  let cursor;
-  do {
-    const res = await app.client.conversations.history({
-      token: process.env.SLACK_BOT_TOKEN,
-      channel: channelId,
-      oldest: String(oldest),
-      latest: String(latest),
-      inclusive: true,
-      limit: 200,
-      cursor: cursor || undefined,
-    });
-    for (const msg of res.messages || []) {
-      const text = msg.text || '';
-      if (!text.includes(phrase)) continue;
-      const lower = text.toLowerCase();
-      if (skipLower.some(p => lower.includes(p))) continue;
-      timestamps.push(parseFloat(msg.ts));
-    }
-    cursor = res.response_metadata?.next_cursor;
-  } while (cursor);
-  return timestamps;
-}
-
 function fmtNum(v) {
   const s = v.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
   return s || '0';
+}
+
+function classifyProgressDealSource(source) {
+  const normalized = String(source || '').trim().toLowerCase();
+  if (normalized.startsWith('inbound')) return 'inbound';
+  if (normalized.startsWith('outbound')) return 'outbound';
+  return 'unclassified';
 }
 
 function getPacificParts(date = new Date()) {
@@ -2157,9 +2137,14 @@ function getDailyProgressWindow(now = new Date()) {
     now,
     nowPacific,
     targetRunUtc,
+    todayStartUtc,
+    weekStartUtc,
     todayOldest: todayStartUtc.getTime() / 1000,
-    weekOldest: weekStartUtc.getTime() / 1000,
   };
+}
+
+function shouldRunDailyProgressOnPacificDay(weekdayIndex) {
+  return PROGRESS_ALLOWED_WEEKDAY_INDEXES.has(weekdayIndex);
 }
 
 function getNextDailyProgressRun(referenceDate = new Date()) {
@@ -2190,56 +2175,156 @@ function getNextDailyProgressRun(referenceDate = new Date()) {
     );
   }
 
+  while (!shouldRunDailyProgressOnPacificDay(getPacificParts(nextRunUtc).weekdayIndex)) {
+    nextDate = shiftPacificDate(nextDate, 1);
+    nextRunUtc = pacificLocalToUtcDate(
+      nextDate.year,
+      nextDate.month,
+      nextDate.day,
+      PROGRESS_TARGET_HOUR,
+      PROGRESS_TARGET_MINUTE,
+      0,
+    );
+  }
+
   return { nextDate, nextRunUtc };
+}
+
+async function searchProgressDeals(startDate, endDate) {
+  const deals = [];
+  let after;
+
+  for (let page = 0; page < 100; page += 1) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'createdate', operator: 'GTE', value: startDate.toISOString() },
+          { propertyName: 'createdate', operator: 'LT', value: endDate.toISOString() },
+        ],
+      }],
+      properties: [
+        'dealname',
+        'createdate',
+        PROGRESS_DEAL_SOURCE_PROPERTY,
+        'pipeline',
+        'dealstage',
+        'hubspot_owner_id',
+      ],
+      sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
+      limit: 100,
+    };
+    if (after) body.after = after;
+
+    const response = await hubspotRequest('/crm/v3/objects/deals/search', 'POST', body);
+    deals.push(...(response.results || []));
+    after = response.paging?.next?.after;
+    if (!after) break;
+  }
+
+  return deals;
+}
+
+function summarizeProgressDeals(deals, todayStartUtc) {
+  const summary = {
+    today: { inbound: 0, outbound: 0 },
+    week: { inbound: 0, outbound: 0 },
+    excluded: [],
+    sourceBreakdown: {},
+  };
+
+  for (const deal of deals) {
+    const properties = deal.properties || {};
+    const source = properties[PROGRESS_DEAL_SOURCE_PROPERTY] || '';
+    const sourceKey = source || '(blank)';
+    summary.sourceBreakdown[sourceKey] = (summary.sourceBreakdown[sourceKey] || 0) + 1;
+
+    const bucket = classifyProgressDealSource(source);
+    if (bucket === 'unclassified') {
+      summary.excluded.push({
+        id: deal.id,
+        dealname: properties.dealname || '',
+        source: sourceKey,
+      });
+      continue;
+    }
+
+    summary.week[bucket] += 1;
+    const createdAt = new Date(properties.createdate);
+    if (!Number.isNaN(createdAt.getTime()) && createdAt >= todayStartUtc) {
+      summary.today[bucket] += 1;
+    }
+  }
+
+  return summary;
+}
+
+function isAuthorizedProgressTrigger(reqUrl, headers = {}) {
+  if (!PROGRESS_TRIGGER_SECRET) return false;
+
+  const params = new URL(reqUrl, 'http://localhost').searchParams;
+  const provided = params.get('token') || headers['x-lead-report-token'] || '';
+  const expectedBuffer = Buffer.from(PROGRESS_TRIGGER_SECRET);
+  const providedBuffer = Buffer.from(String(provided));
+  return providedBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
 async function runDailyProgress(channelOverride, options = {}) {
   const force = Boolean(options.force);
+  const allowDuplicate = Boolean(options.allowDuplicate);
   const targetName = channelOverride || PROGRESS_TARGET_CHANNEL;
   try {
-    const [inboundId, outboundId, targetId] = await Promise.all([
-      resolveChannelId(PROGRESS_INBOUND_CHANNEL),
-      resolveChannelId(PROGRESS_OUTBOUND_CHANNEL),
-      resolveChannelId(targetName),
-    ]);
-    if (!inboundId) throw new Error(`Channel not found: #${PROGRESS_INBOUND_CHANNEL}`);
-    if (!outboundId) throw new Error(`Channel not found: #${PROGRESS_OUTBOUND_CHANNEL}`);
+    const targetId = await resolveChannelId(targetName);
     if (!targetId) throw new Error(`Channel not found: #${targetName}`);
 
-    const { latest, now, nowPacific, targetRunUtc, todayOldest, weekOldest } = getDailyProgressWindow();
+    const { latest, now, nowPacific, targetRunUtc, todayStartUtc, weekStartUtc, todayOldest } = getDailyProgressWindow();
     const dateLabel = formatPacificDateLabel(nowPacific);
+
+    if (!force && !shouldRunDailyProgressOnPacificDay(nowPacific.weekdayIndex)) {
+      console.log(`Daily progress: skipped non-reporting day ${dateLabel} PT`);
+      return;
+    }
 
     if (!force && now < targetRunUtc) {
       console.log(`Daily progress: deferred until ${targetRunUtc.toISOString()} for ${dateLabel} PT`);
       return;
     }
 
-    const [inboundTs, outboundTs] = await Promise.all([
-      collectMatchingTimestamps(inboundId, PROGRESS_INBOUND_PHRASE, weekOldest, latest, PROGRESS_EXCLUDE_PATTERNS),
-      collectMatchingTimestamps(outboundId, PROGRESS_OUTBOUND_PHRASE, weekOldest, latest, []),
-    ]);
-
-    const weekInbound = inboundTs.length;
-    const weekOutbound = outboundTs.length;
-    const todayInbound = inboundTs.filter(ts => ts >= todayOldest).length;
-    const todayOutbound = outboundTs.filter(ts => ts >= todayOldest).length;
+    const deals = await searchProgressDeals(weekStartUtc, now);
+    const dealSummary = summarizeProgressDeals(deals, todayStartUtc);
+    const weekInbound = dealSummary.week.inbound;
+    const weekOutbound = dealSummary.week.outbound;
+    const todayInbound = dealSummary.today.inbound;
+    const todayOutbound = dealSummary.today.outbound;
     const todayTotal = todayInbound + todayOutbound;
     const weekTotal = weekInbound + weekOutbound;
     const remaining = Math.max(PROGRESS_WEEKLY_GOAL - weekTotal, 0);
 
-    const dupCheck = await app.client.conversations.history({
-      token: process.env.SLACK_BOT_TOKEN,
-      channel: targetId,
-      oldest: String(todayOldest),
-      latest: String(latest),
-      inclusive: true,
-      limit: 50,
-    });
-    const prefix = `Today ${dateLabel}`;
-    const alreadyPosted = (dupCheck.messages || []).some(m => (m.text || '').startsWith(prefix));
-    if (alreadyPosted) {
-      console.log(`Daily progress: skipped duplicate for ${dateLabel} in #${targetName}`);
-      return;
+    if (dealSummary.excluded.length) {
+      const examples = dealSummary.excluded.slice(0, 5)
+        .map(d => `${d.id}:${d.source}`)
+        .join(', ');
+      console.log(
+        `Daily progress: excluded ${dealSummary.excluded.length} deals without Inbound/Outbound `
+        + `${PROGRESS_DEAL_SOURCE_PROPERTY} prefix (${examples})`,
+      );
+    }
+
+    if (!allowDuplicate) {
+      const dupCheck = await app.client.conversations.history({
+        token: process.env.SLACK_BOT_TOKEN,
+        channel: targetId,
+        oldest: String(todayOldest),
+        latest: String(latest),
+        inclusive: true,
+        limit: 50,
+      });
+      const prefix = `Today ${dateLabel}`;
+      const alreadyPosted = (dupCheck.messages || []).some(m => (m.text || '').startsWith(prefix));
+      if (alreadyPosted) {
+        console.log(`Daily progress: skipped duplicate for ${dateLabel} in #${targetName}`);
+        return;
+      }
     }
 
     const text = `Today ${dateLabel}\n`
@@ -2260,7 +2345,10 @@ async function runDailyProgress(channelOverride, options = {}) {
       channel: targetId,
       text,
     });
-    console.log(`Daily progress: posted to #${targetName} (today=${todayInbound}+${todayOutbound}, week=${weekInbound}+${weekOutbound})`);
+    console.log(
+      `Daily progress: posted to #${targetName} from HubSpot deals `
+      + `(today=${todayInbound}+${todayOutbound}, week=${weekInbound}+${weekOutbound})`,
+    );
   } catch (err) {
     console.error('Daily progress error:', err.message);
   }
@@ -2304,7 +2392,7 @@ function scheduleDailyProgress() {
   // Schedule daily discovery digest
   scheduleDiscoveryDigest();
 
-  // Schedule daily meetings-booked progress
+  // Schedule daily HubSpot deal progress
   scheduleDailyProgress();
 
   // Health check server for Railway (needs a port to know the service is alive)
@@ -2345,8 +2433,17 @@ function scheduleDailyProgress() {
       res.end(`Digest triggered${channel ? ` → #${channel}` : ''}`);
       return;
     }
-    if (req.url === '/run-daily-progress') {
-      runDailyProgress(undefined, { force: true });
+    if (req.url.split('?')[0] === '/run-daily-progress') {
+      const qs = new URL(req.url, 'http://localhost').searchParams;
+      if (!isAuthorizedProgressTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      runDailyProgress(undefined, {
+        force: true,
+        allowDuplicate: qs.get('allowDuplicate') === '1',
+      });
       res.writeHead(200);
       res.end('Daily progress triggered');
       return;

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Post daily lead progress counts to Slack.
 
-Default behavior:
+Legacy local fallback behavior:
 - Inbound count: messages in #leads containing "Booked Calendly Meeting"
 - Outbound count: messages in #gtm-outbound containing "New Meeting"
-- Target channel: #slack-slack-testing
+- Target channel: #slack-testing
 - Week resets on Monday in report timezone.
+
+Production Railway reporting is implemented in slack_bot.js and counts HubSpot deals
+by createdate + deal_source instead of Slack keywords.
 """
 
 from __future__ import annotations
@@ -64,7 +67,7 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "token": token,
         "inbound_channel": pick("LEAD_REPORT_INBOUND_CHANNEL", "leads"),
         "outbound_channel": pick("LEAD_REPORT_OUTBOUND_CHANNEL", "gtm-outbound"),
-        "target_channel": target_override or pick("LEAD_REPORT_TARGET_CHANNEL", "slack-slack-testing"),
+        "target_channel": target_override or pick("LEAD_REPORT_TARGET_CHANNEL", "slack-testing"),
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),

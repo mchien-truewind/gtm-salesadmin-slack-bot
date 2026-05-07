@@ -31,37 +31,32 @@ cat >"$PLIST_PATH" <<EOF
     <dict>
       <key>Weekday</key><integer>0</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
     <dict>
       <key>Weekday</key><integer>1</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
     <dict>
       <key>Weekday</key><integer>2</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
     <dict>
       <key>Weekday</key><integer>3</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
     <dict>
       <key>Weekday</key><integer>4</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
     <dict>
       <key>Weekday</key><integer>5</integer>
       <key>Hour</key><integer>18</integer>
-      <key>Minute</key><integer>0</integer>
-    </dict>
-    <dict>
-      <key>Weekday</key><integer>6</integer>
-      <key>Hour</key><integer>23</integer>
-      <key>Minute</key><integer>59</integer>
+      <key>Minute</key><integer>7</integer>
     </dict>
   </array>
 
@@ -81,7 +76,6 @@ echo "logs:"
 echo "  ${LOG_DIR}/daily-lead-progress.out.log"
 echo "  ${LOG_DIR}/daily-lead-progress.err.log"
 echo "schedule:"
-echo "  Sun-Fri at 18:00 local machine time"
-echo "  Sat at 23:59 local machine time"
+echo "  Sun-Fri at 18:07 local machine time"
 echo "test run now:"
 echo "  launchctl kickstart -k gui/$(id -u)/${PLIST_NAME}"

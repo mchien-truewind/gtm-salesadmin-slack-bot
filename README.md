@@ -71,23 +71,55 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
 
 ## Daily Lead Progress Slack Post (Railway)
 
+The Railway Slack bot posts the report to `#slack-testing` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created during the reporting window, grouped by the configured deal source property:
+
+- `deal_source` starting with `Inbound` counts as Inbound.
+- `deal_source` starting with `Outbound` counts as Outbound, including values like `Outbound - Event`.
+- Blank or nonmatching deal source values are excluded and logged for cleanup.
+
+Required env:
+
+```sh
+SLACK_BOT_TOKEN=xoxb-...
+HUBSPOT_PRIVATE_TOKEN=...
+LEAD_REPORT_TARGET_CHANNEL=slack-testing
+LEAD_REPORT_TRIGGER_SECRET=...
+```
+
+Optional overrides:
+
+```sh
+LEAD_REPORT_DEAL_SOURCE_PROPERTY=deal_source
+LEAD_REPORT_WEEKLY_GOAL=30
+```
+
+Manual test post from Railway:
+
+```sh
+curl -H "x-lead-report-token: $LEAD_REPORT_TRIGGER_SECRET" \
+  https://leads-update-production.up.railway.app/run-daily-progress
+```
+
+To intentionally post a second copy for same-day testing, append `?allowDuplicate=1`.
+
+Legacy local fallback:
+
 1. Put your token in `.env.local`:
    ```sh
    SLACK_USER_TOKEN=xoxp-...
    ```
 2. Optional overrides in `.env.local`:
    ```sh
-   LEAD_REPORT_TARGET_CHANNEL=slack-slack-testing
+   LEAD_REPORT_TARGET_CHANNEL=slack-testing
    LEAD_REPORT_INBOUND_CHANNEL=leads
    LEAD_REPORT_OUTBOUND_CHANNEL=gtm-outbound
    LEAD_REPORT_INBOUND_PHRASE=Booked Calendly Meeting
    LEAD_REPORT_OUTBOUND_PHRASE=New Meeting
-   LEAD_REPORT_WINDOW_HOURS=24
    LEAD_REPORT_TIMEZONE=America/Los_Angeles
    ```
-3. Test with live counts to `#slack-slack-testing`:
+3. Test with Slack keyword counts to `#slack-testing`:
    ```sh
-   python3 scripts/slack/post_daily_progress.py --target-channel slack-slack-testing
+   python3 scripts/slack/post_daily_progress.py --target-channel slack-testing
    ```
 4. Install daily scheduler (macOS `launchd`, 18:07 local machine time):
    ```sh
@@ -99,8 +131,9 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
    ```
 
 Notes:
-- The Railway Slack bot posts the report every day after 6 PM Pacific.
-- The "This week so far" total includes Monday through end-of-day Sunday, then restarts on Monday.
+- The Railway Slack bot is the production source of truth for this report.
+- The target Slack channel must be public or otherwise visible to Slack `conversations.list`.
+- The "This week so far" total includes Monday through the current report run, then restarts on Monday.
 - It posts with the same message format used in local runs.
 
 ## Overnight Apollo Phone Enrichment (Webhook + Google Sheets)
