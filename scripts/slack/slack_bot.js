@@ -20,6 +20,9 @@ const {
   handleInstantlyPositiveReplyWebhook,
 } = require('./instantly_positive_reply_alert');
 const {
+  handleCalendlyHubSpotWebhook,
+} = require('./calendly_hubspot');
+const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -1604,6 +1607,16 @@ function scheduleDailyProgress() {
         });
       } catch (err) {
         console.error('Instantly positive reply webhook failed:', err.message);
+        res.writeHead(500);
+        res.end('webhook_failed');
+      }
+      return;
+    }
+    if (req.method === 'POST' && req.url.split('?')[0] === '/webhooks/calendly') {
+      try {
+        await handleCalendlyHubSpotWebhook(req, res, { logger: console });
+      } catch (err) {
+        console.error('Calendly HubSpot webhook failed:', err.message);
         res.writeHead(500);
         res.end('webhook_failed');
       }
