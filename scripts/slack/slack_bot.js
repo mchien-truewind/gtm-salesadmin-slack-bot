@@ -2013,8 +2013,10 @@ function parseProgressWeeklyGoal(rawValue) {
 
 const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'slack-testing';
 const PROGRESS_DEAL_SOURCE_PROPERTY = process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY || 'deal_source';
+const PROGRESS_PIPELINE_ID = process.env.LEAD_REPORT_PIPELINE_ID || '105321581';
 const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
 const PROGRESS_WEEKLY_GOAL = parseProgressWeeklyGoal(process.env.LEAD_REPORT_WEEKLY_GOAL);
+const PROGRESS_TEST_DEAL_PATTERNS = [/\btest\b/i, /truewind/i];
 const PROGRESS_TIMEZONE = 'America/Los_Angeles';
 const PROGRESS_TARGET_HOUR = 18;
 const PROGRESS_TARGET_MINUTE = 7;
@@ -2070,16 +2072,57 @@ function classifyProgressDealSource(source) {
   return 'unknown';
 }
 
+function normalizeProgressDealKey(dealName) {
+  return String(dealName || '')
+    .toLowerCase()
+    .replace(/\s+-\s+new deal$/i, '')
+    .replace(/\s+-\s+s\d+$/i, '')
+    .replace(/,?\s+inc\.?$/i, '')
+    .replace(/\s+-\s+truewind intro meeting.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isObviousTestProgressDeal(deal) {
+  const properties = deal.properties || {};
+  const dealName = String(properties.dealname || '');
+  return PROGRESS_TEST_DEAL_PATTERNS.some(pattern => pattern.test(dealName));
+}
+
+function dedupeProgressDeals(deals) {
+  const kept = [];
+  const seenKeys = new Set();
+  const duplicates = [];
+
+  for (const deal of deals) {
+    const properties = deal.properties || {};
+    const key = normalizeProgressDealKey(properties.dealname) || `deal:${deal.id}`;
+    if (seenKeys.has(key)) {
+      duplicates.push({
+        id: deal.id,
+        dealname: properties.dealname || '',
+        key,
+      });
+      continue;
+    }
+    seenKeys.add(key);
+    kept.push(deal);
+  }
+
+  return { kept, duplicates };
+}
+
 function getPacificParts(date = new Date()) {
   const parsed = {};
   for (const part of PACIFIC_DATE_FORMATTER.formatToParts(date)) {
     if (part.type !== 'literal') parsed[part.type] = part.value;
   }
+  const hour = Number(parsed.hour) === 24 ? 0 : Number(parsed.hour);
   return {
     year: Number(parsed.year),
     month: Number(parsed.month),
     day: Number(parsed.day),
-    hour: Number(parsed.hour),
+    hour,
     minute: Number(parsed.minute),
     second: Number(parsed.second),
     weekdayIndex: PACIFIC_WEEKDAY_INDEX[parsed.weekday],
@@ -2200,6 +2243,7 @@ async function searchProgressDeals(startDate, endDate) {
         filters: [
           { propertyName: 'createdate', operator: 'GTE', value: startDate.toISOString() },
           { propertyName: 'createdate', operator: 'LT', value: endDate.toISOString() },
+          { propertyName: 'pipeline', operator: 'EQ', value: PROGRESS_PIPELINE_ID },
         ],
       }],
       properties: [
@@ -2225,14 +2269,31 @@ async function searchProgressDeals(startDate, endDate) {
 }
 
 function summarizeProgressDeals(deals, todayStartUtc) {
+  const nonTestDeals = [];
+  const skippedTests = [];
+  for (const deal of deals) {
+    if (isObviousTestProgressDeal(deal)) {
+      const properties = deal.properties || {};
+      skippedTests.push({
+        id: deal.id,
+        dealname: properties.dealname || '',
+      });
+      continue;
+    }
+    nonTestDeals.push(deal);
+  }
+
+  const { kept: countableDeals, duplicates } = dedupeProgressDeals(nonTestDeals);
   const summary = {
     today: { inbound: 0, outbound: 0, unknown: 0 },
     week: { inbound: 0, outbound: 0, unknown: 0 },
     unknown: [],
+    skippedTests,
+    duplicates,
     sourceBreakdown: {},
   };
 
-  for (const deal of deals) {
+  for (const deal of countableDeals) {
     const properties = deal.properties || {};
     const source = properties[PROGRESS_DEAL_SOURCE_PROPERTY] || '';
     const sourceKey = source || '(blank)';
@@ -2308,6 +2369,18 @@ async function runDailyProgress(channelOverride, options = {}) {
         `Daily progress: counted ${dealSummary.unknown.length} unknown deals without Inbound/Outbound `
         + `${PROGRESS_DEAL_SOURCE_PROPERTY} prefix (${examples})`,
       );
+    }
+    if (dealSummary.skippedTests.length) {
+      const examples = dealSummary.skippedTests.slice(0, 5)
+        .map(d => `${d.id}:${d.dealname}`)
+        .join(', ');
+      console.log(`Daily progress: skipped ${dealSummary.skippedTests.length} obvious test/internal deals (${examples})`);
+    }
+    if (dealSummary.duplicates.length) {
+      const examples = dealSummary.duplicates.slice(0, 5)
+        .map(d => `${d.id}:${d.key}`)
+        .join(', ');
+      console.log(`Daily progress: deduped ${dealSummary.duplicates.length} duplicate deals (${examples})`);
     }
 
     if (!allowDuplicate) {
