@@ -224,23 +224,27 @@ def build_message(
     week_inbound: int,
     week_outbound: int,
     weekly_goal: float,
+    today_unknown: int = 0,
+    week_unknown: int = 0,
 ) -> str:
     def fmt_num(value: float) -> str:
         text = f"{value:.2f}".rstrip("0").rstrip(".")
         return text if text else "0"
 
-    week_total = week_inbound + week_outbound
+    week_total = week_inbound + week_outbound + week_unknown
     remaining = max(weekly_goal - week_total, 0.0)
-    today_total = today_inbound + today_outbound
+    today_total = today_inbound + today_outbound + today_unknown
     return (
         f"Today {date_label(now_local)}\n"
         f"Inbound: {today_inbound}\n"
         f"Outbound: {today_outbound}\n"
+        f"Unknown: {today_unknown}\n"
         f"Total: {today_total}\n"
         "\n\n"
         "This week so far\n"
         f"Inbound: {week_inbound}\n"
         f"Outbound: {week_outbound}\n"
+        f"Unknown: {week_unknown}\n"
         f"Total: {week_total}\n"
         "\n"
         f"Weekly Goal: {fmt_num(weekly_goal)}\n"

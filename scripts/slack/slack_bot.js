@@ -2067,7 +2067,7 @@ function classifyProgressDealSource(source) {
   const normalized = String(source || '').trim().toLowerCase();
   if (normalized.startsWith('inbound')) return 'inbound';
   if (normalized.startsWith('outbound')) return 'outbound';
-  return 'unclassified';
+  return 'unknown';
 }
 
 function getPacificParts(date = new Date()) {
@@ -2226,9 +2226,9 @@ async function searchProgressDeals(startDate, endDate) {
 
 function summarizeProgressDeals(deals, todayStartUtc) {
   const summary = {
-    today: { inbound: 0, outbound: 0 },
-    week: { inbound: 0, outbound: 0 },
-    excluded: [],
+    today: { inbound: 0, outbound: 0, unknown: 0 },
+    week: { inbound: 0, outbound: 0, unknown: 0 },
+    unknown: [],
     sourceBreakdown: {},
   };
 
@@ -2239,15 +2239,13 @@ function summarizeProgressDeals(deals, todayStartUtc) {
     summary.sourceBreakdown[sourceKey] = (summary.sourceBreakdown[sourceKey] || 0) + 1;
 
     const bucket = classifyProgressDealSource(source);
-    if (bucket === 'unclassified') {
-      summary.excluded.push({
+    if (bucket === 'unknown') {
+      summary.unknown.push({
         id: deal.id,
         dealname: properties.dealname || '',
         source: sourceKey,
       });
-      continue;
     }
-
     summary.week[bucket] += 1;
     const createdAt = new Date(properties.createdate);
     if (!Number.isNaN(createdAt.getTime()) && createdAt >= todayStartUtc) {
@@ -2296,16 +2294,18 @@ async function runDailyProgress(channelOverride, options = {}) {
     const weekOutbound = dealSummary.week.outbound;
     const todayInbound = dealSummary.today.inbound;
     const todayOutbound = dealSummary.today.outbound;
-    const todayTotal = todayInbound + todayOutbound;
-    const weekTotal = weekInbound + weekOutbound;
+    const weekUnknown = dealSummary.week.unknown;
+    const todayUnknown = dealSummary.today.unknown;
+    const todayTotal = todayInbound + todayOutbound + todayUnknown;
+    const weekTotal = weekInbound + weekOutbound + weekUnknown;
     const remaining = Math.max(PROGRESS_WEEKLY_GOAL - weekTotal, 0);
 
-    if (dealSummary.excluded.length) {
-      const examples = dealSummary.excluded.slice(0, 5)
+    if (dealSummary.unknown.length) {
+      const examples = dealSummary.unknown.slice(0, 5)
         .map(d => `${d.id}:${d.source}`)
         .join(', ');
       console.log(
-        `Daily progress: excluded ${dealSummary.excluded.length} deals without Inbound/Outbound `
+        `Daily progress: counted ${dealSummary.unknown.length} unknown deals without Inbound/Outbound `
         + `${PROGRESS_DEAL_SOURCE_PROPERTY} prefix (${examples})`,
       );
     }
@@ -2330,11 +2330,13 @@ async function runDailyProgress(channelOverride, options = {}) {
     const text = `Today ${dateLabel}\n`
       + `Inbound: ${todayInbound}\n`
       + `Outbound: ${todayOutbound}\n`
+      + `Unknown: ${todayUnknown}\n`
       + `Total: ${todayTotal}\n`
       + `\n\n`
       + `This week so far\n`
       + `Inbound: ${weekInbound}\n`
       + `Outbound: ${weekOutbound}\n`
+      + `Unknown: ${weekUnknown}\n`
       + `Total: ${weekTotal}\n`
       + `\n`
       + `Weekly Goal: ${fmtNum(PROGRESS_WEEKLY_GOAL)}\n`
@@ -2347,7 +2349,7 @@ async function runDailyProgress(channelOverride, options = {}) {
     });
     console.log(
       `Daily progress: posted to #${targetName} from HubSpot deals `
-      + `(today=${todayInbound}+${todayOutbound}, week=${weekInbound}+${weekOutbound})`,
+      + `(today=${todayInbound}+${todayOutbound}+${todayUnknown}, week=${weekInbound}+${weekOutbound}+${weekUnknown})`,
     );
   } catch (err) {
     console.error('Daily progress error:', err.message);

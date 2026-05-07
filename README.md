@@ -75,7 +75,7 @@ The Railway Slack bot posts the report to `#slack-testing` at 6:07 PM Pacific on
 
 - `deal_source` starting with `Inbound` counts as Inbound.
 - `deal_source` starting with `Outbound` counts as Outbound, including values like `Outbound - Event`.
-- Blank or nonmatching deal source values are excluded and logged for cleanup.
+- Blank or nonmatching deal source values count as Unknown and appear as `Unknown: X`.
 
 Required env:
 
@@ -135,6 +135,7 @@ Notes:
 - The target Slack channel must be public or otherwise visible to Slack `conversations.list`.
 - The "This week so far" total includes Monday through the current report run, then restarts on Monday.
 - It posts with the same message format used in local runs.
+- The local fallback uses Slack keyword counts, so Unknown is always `0` there; production HubSpot counts include blank and nonmatching `deal_source` values in Unknown.
 
 ## Overnight Apollo Phone Enrichment (Webhook + Google Sheets)
 
