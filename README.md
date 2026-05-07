@@ -71,7 +71,7 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
 
 ## Daily Lead Progress Slack Post (Railway)
 
-The Railway Slack bot posts the report to `#slack-testing` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property:
+The Railway Slack bot posts the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property:
 
 - `deal_source` starting with `Inbound` counts as Inbound.
 - `deal_source` starting with `Outbound` counts as Outbound, including values like `Outbound - Event`.
@@ -82,7 +82,7 @@ Required env:
 ```sh
 SLACK_BOT_TOKEN=xoxb-...
 HUBSPOT_PRIVATE_TOKEN=...
-LEAD_REPORT_TARGET_CHANNEL=slack-testing
+LEAD_REPORT_TARGET_CHANNEL=gtm-general
 LEAD_REPORT_TRIGGER_SECRET=...
 ```
 
@@ -111,16 +111,16 @@ Legacy local fallback:
    ```
 2. Optional overrides in `.env.local`:
    ```sh
-   LEAD_REPORT_TARGET_CHANNEL=slack-testing
+   LEAD_REPORT_TARGET_CHANNEL=gtm-general
    LEAD_REPORT_INBOUND_CHANNEL=leads
    LEAD_REPORT_OUTBOUND_CHANNEL=gtm-outbound
    LEAD_REPORT_INBOUND_PHRASE=Booked Calendly Meeting
    LEAD_REPORT_OUTBOUND_PHRASE=New Meeting
    LEAD_REPORT_TIMEZONE=America/Los_Angeles
    ```
-3. Test with Slack keyword counts to `#slack-testing`:
+3. Test with Slack keyword counts to `#gtm-general`:
    ```sh
-   python3 scripts/slack/post_daily_progress.py --target-channel slack-testing
+   python3 scripts/slack/post_daily_progress.py --target-channel gtm-general
    ```
 4. Install daily scheduler (macOS `launchd`, 18:07 local machine time):
    ```sh

@@ -4,7 +4,7 @@
 Legacy local fallback behavior:
 - Inbound count: messages in #leads containing "Booked Calendly Meeting"
 - Outbound count: messages in #gtm-outbound containing "New Meeting"
-- Target channel: #slack-testing
+- Target channel: #gtm-general
 - Week resets on Monday in report timezone.
 
 Production Railway reporting is implemented in slack_bot.js and counts HubSpot deals
@@ -67,7 +67,7 @@ def get_config(repo_root: Path, args: argparse.Namespace) -> Dict[str, str]:
         "token": token,
         "inbound_channel": pick("LEAD_REPORT_INBOUND_CHANNEL", "leads"),
         "outbound_channel": pick("LEAD_REPORT_OUTBOUND_CHANNEL", "gtm-outbound"),
-        "target_channel": target_override or pick("LEAD_REPORT_TARGET_CHANNEL", "slack-testing"),
+        "target_channel": target_override or pick("LEAD_REPORT_TARGET_CHANNEL", "gtm-general"),
         "inbound_phrase": pick("LEAD_REPORT_INBOUND_PHRASE", "Booked Calendly Meeting"),
         "outbound_phrase": pick("LEAD_REPORT_OUTBOUND_PHRASE", "New Meeting"),
         "report_tz": pick("LEAD_REPORT_TIMEZONE", "America/Los_Angeles"),

@@ -2011,7 +2011,7 @@ function parseProgressWeeklyGoal(rawValue) {
   return weeklyGoal;
 }
 
-const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'slack-testing';
+const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-general';
 const PROGRESS_DEAL_SOURCE_PROPERTY = process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY || 'deal_source';
 const PROGRESS_PIPELINE_ID = process.env.LEAD_REPORT_PIPELINE_ID || '105321581';
 const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
