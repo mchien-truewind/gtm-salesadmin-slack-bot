@@ -50,19 +50,17 @@ const { execSync } = require("child_process");
 // ICP config
 // ---------------------------------------------------------------------------
 
-const ICP_SINGLE_TOKENS = ["cfo", "ceo", "controller", "treasurer", "bookkeeper"];
+const ICP_SINGLE_TOKENS = ["cfo", "ceo", "controller"];
 
 const ICP_COMPOUND_TOKENS = [
-  ["senior", "accountant"],
-  ["staff", "accountant"],
-  ["avp", "accountant"],
-  ["director", "finance"],
   ["head", "finance"],
+  ["head", "financial"],
   ["vp", "finance"],
+  ["vp", "financial"],
   ["vice", "finance"],
-  ["finance", "manager"],
-  ["chief", "accounting"],
-  ["finance", "officer"],
+  ["vice", "financial"],
+  ["chief", "financial"],
+  ["chief", "executive"],
 ];
 
 // ---------------------------------------------------------------------------
