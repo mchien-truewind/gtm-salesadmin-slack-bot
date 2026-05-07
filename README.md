@@ -52,6 +52,23 @@ The Slack reply path routes simple/direct asks to `CLAUDE_MODEL_DEFAULT` and mor
 `CLAUDE_DIGEST_MODEL` controls the discovery digest transcript extraction model separately.
 All model variables are optional in code; use exact Anthropic API model IDs, not Claude.ai plan names.
 
+Required for HubSpot writes:
+
+```sh
+HUBSPOT_PRIVATE_TOKEN=...
+FIRECRAWL_API_KEY=...
+```
+
+Optional owner mapping for the end-to-end HubSpot prospect workflow:
+
+```sh
+SLACK_TO_HUBSPOT_OWNER_JSON='{"U12345678":{"id":"87811681","name":"Mercedes Chien"}}'
+HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS=U12345678,U23456789
+HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS=C12345678
+```
+
+The workflow first tries to match the Slack tagger's Slack email to a HubSpot owner. That requires Slack `users:read.email` scope; if unavailable, it checks the optional Slack user mapping. HubSpot writes are authorized when the tagger maps to a HubSpot owner or the Slack user/channel is allowlisted. If no owner can be mapped for an authorized request, it defaults to Xavier Marco (`89305622`). Firecrawl is used to find and scrape LinkedIn profiles before contact creation; without `FIRECRAWL_API_KEY`, the workflow falls back to email/company parsing.
+
 ## Daily Lead Progress Slack Post (Railway)
 
 1. Put your token in `.env.local`:

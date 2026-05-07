@@ -70,6 +70,57 @@ const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
 // ============================================================
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN;
 const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30000);
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || process.env.FIRECRAWL_KEY;
+const FIRECRAWL_API_BASE = (process.env.FIRECRAWL_API_BASE || 'https://api.firecrawl.dev/v1').replace(/\/$/, '');
+const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '43974586';
+
+const TRUEWIND_HUBSPOT = {
+  pipeline: '105321581',
+  mqlDealStage: '1307720553',
+  defaultOwnerId: '89305622',
+  defaultOwnerName: 'Xavier Marco',
+  contactToCompanyAssociationTypeId: 279,
+  dealToContactAssociationTypeId: 3,
+  dealToCompanyAssociationTypeId: 341,
+  ownersByName: {
+    'xavier marco': { id: '89305622', name: 'Xavier Marco' },
+    xavier: { id: '89305622', name: 'Xavier Marco' },
+    'mercedes chien': { id: '87811681', name: 'Mercedes Chien' },
+    mercedes: { id: '87811681', name: 'Mercedes Chien' },
+    'alex lee': { id: '559564379', name: 'Alex Lee' },
+    alex: { id: '559564379', name: 'Alex Lee' },
+    'aidan gleghorn': { id: '89053735', name: 'Aidan Gleghorn' },
+    aidan: { id: '89053735', name: 'Aidan Gleghorn' },
+    'noah salah': { id: '90960689', name: 'Noah Salah' },
+    noah: { id: '90960689', name: 'Noah Salah' },
+    'jenilee chen': { id: '91143842', name: 'Jenilee Chen' },
+    jenilee: { id: '91143842', name: 'Jenilee Chen' },
+    'sarah elix': { id: '84547076', name: 'Sarah Elix' },
+    sarah: { id: '84547076', name: 'Sarah Elix' },
+  },
+};
+
+function parseSlackOwnerMap() {
+  const raw = process.env.SLACK_TO_HUBSPOT_OWNER_JSON || process.env.SLACK_USER_TO_HUBSPOT_OWNER_JSON || '';
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error(`Invalid Slack owner map JSON: ${err.message}`);
+    return {};
+  }
+}
+
+const SLACK_TO_HUBSPOT_OWNER = parseSlackOwnerMap();
+const hubspotContactPropertyCache = new Map();
+
+function parseDelimitedEnvSet(name) {
+  return new Set(String(process.env[name] || '').split(',').map((value) => value.trim()).filter(Boolean));
+}
+
+const HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS');
+const HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS');
+const HUBSPOT_WRITE_REQUIRE_AUTH = process.env.HUBSPOT_WRITE_REQUIRE_AUTH !== 'false';
 
 async function hubspotRequest(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
@@ -133,7 +184,7 @@ function formatHubSpotObjectResponse(response, objectTypeId) {
     ...properties,
     id,
     hubspot_id: id,
-    url: `https://app.hubspot.com/contacts/43974586/record/${objectTypeId}/${id}`,
+    url: `https://app.hubspot.com/contacts/${HUBSPOT_PORTAL_ID}/record/${objectTypeId}/${id}`,
     properties,
   };
 }
@@ -156,6 +207,601 @@ async function httpRequest(url, options = {}) {
     if (options.body) req.write(options.body);
     req.end();
   });
+}
+
+function normalizeEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email));
+}
+
+function titleCase(value) {
+  return String(value || '')
+    .replace(/[-_.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ');
+}
+
+function parseNameFromEmail(email) {
+  const localPart = normalizeEmail(email).split('@')[0] || '';
+  const cleaned = localPart
+    .replace(/\+.*$/, '')
+    .replace(/[0-9]+/g, ' ')
+    .replace(/[._-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const parts = cleaned.split(' ').filter(Boolean);
+  return {
+    firstname: titleCase(parts[0] || ''),
+    lastname: titleCase(parts.slice(1).join(' ')),
+  };
+}
+
+function getEmailDomain(email) {
+  const parts = normalizeEmail(email).split('@');
+  return parts.length === 2 ? parts[1] : '';
+}
+
+function inferCompanyFromEmail(email) {
+  const domain = getEmailDomain(email);
+  if (!domain) return { company: '', domain: '' };
+  const genericDomains = new Set([
+    'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com',
+    'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'hey.com', 'msn.com', 'live.com',
+  ]);
+  if (genericDomains.has(domain)) return { company: '', domain };
+  const root = domain.split('.').slice(0, -1).join(' ') || domain.split('.')[0];
+  return { company: titleCase(root), domain };
+}
+
+function compactProperties(properties, options = {}) {
+  const preserveEmptyKeys = new Set(options.preserveEmptyKeys || []);
+  return Object.fromEntries(
+    Object.entries(properties || {}).filter(([key, value]) => (
+      value !== undefined && value !== null && (value !== '' || preserveEmptyKeys.has(key))
+    ))
+  );
+}
+
+function deduceLeadSource(contextText) {
+  const text = String(contextText || '').toLowerCase();
+  if (/\b(webinar|web cast|webcast)\b/.test(text)) return 'Webinar';
+  if (/\b(referred by|referral|referred|intro(?:duced)? by|introduction from)\b/.test(text)) return 'Referral';
+  if (/\b(they contacted us|inbound|came inbound|reached out to us|contacted us)\b/.test(text)) return 'Self serve';
+  if (/\b(met at|conference|event|summit|meetup|trade show|booth|expo)\b/.test(text)) return 'Event';
+  if (/\b(reached out|contacted|outbound|prospect(?:ed)?|sales sourced)\b/.test(text)) return 'Outbound - Sales Sourced List';
+  return 'Outbound - Sales Sourced List';
+}
+
+function resolveHubSpotOwner(input = {}) {
+  const metadata = getSlackMetadata(input);
+  const slackUserId = String(input.slack_user_id || input.slackUserId || metadata.slack_user_id || '').trim();
+  const mapped = slackUserId ? SLACK_TO_HUBSPOT_OWNER[slackUserId] : null;
+  if (mapped) {
+    if (typeof mapped === 'string') {
+      const byIdName = Object.values(TRUEWIND_HUBSPOT.ownersByName).find((owner) => owner.id === mapped)?.name || `HubSpot owner ${mapped}`;
+      return { id: mapped, name: byIdName, source: 'from Slack tag' };
+    }
+    if (mapped.id) return { id: String(mapped.id), name: mapped.name || `HubSpot owner ${mapped.id}`, source: 'from Slack tag' };
+  }
+
+  const ownerName = String(input.owner_name || input.owner || '').trim().toLowerCase();
+  if (ownerName && TRUEWIND_HUBSPOT.ownersByName[ownerName]) {
+    return { ...TRUEWIND_HUBSPOT.ownersByName[ownerName], source: 'explicit owner' };
+  }
+
+  return {
+    id: TRUEWIND_HUBSPOT.defaultOwnerId,
+    name: TRUEWIND_HUBSPOT.defaultOwnerName,
+    source: slackUserId ? 'default; Slack user not mapped' : 'default',
+  };
+}
+
+async function resolveHubSpotOwnerForProspect(input = {}) {
+  const metadata = getSlackMetadata(input);
+  const slackUserId = String(input.slack_user_id || input.slackUserId || metadata.slack_user_id || '').trim();
+  let slackUserEmail = String(input.slack_user_email || input.slackUserEmail || '').trim().toLowerCase();
+  if (!slackUserEmail && slackUserId) {
+    slackUserEmail = (await getSlackUserEmail(slackUserId)).trim().toLowerCase();
+  }
+  if (slackUserEmail) {
+    try {
+      const owners = await hubspotRequest('/crm/v3/owners/?limit=100');
+      const owner = (owners.results || []).find((candidate) => (
+        String(candidate.email || '').trim().toLowerCase() === slackUserEmail
+      ));
+      if (owner?.id) {
+        const name = [owner.firstName, owner.lastName].filter(Boolean).join(' ') || owner.email || `HubSpot owner ${owner.id}`;
+        return { id: String(owner.id), name, source: 'from Slack tag' };
+      }
+    } catch (err) {
+      console.error(`Could not map Slack user email to HubSpot owner: ${err.message}`);
+    }
+  }
+
+  return resolveHubSpotOwner(input);
+}
+
+function getSlackMetadata(input = {}) {
+  const context = String(input.context || input.context_text || input.notes || '');
+  const metadataMatch = context.match(/\[Slack metadata:\s*([^\]]+)\]/i);
+  const metadata = {};
+  if (metadataMatch) {
+    for (const pair of metadataMatch[1].split(',')) {
+      const [rawKey, ...rawValueParts] = pair.split('=');
+      const key = rawKey?.trim();
+      const value = rawValueParts.join('=').trim();
+      if (key && value) metadata[key] = value;
+    }
+  }
+  return {
+    channel_id: input.channel_id || input.channelId || metadata.channel_id || '',
+    slack_user_id: input.slack_user_id || input.slackUserId || metadata.slack_user_id || '',
+  };
+}
+
+function isHubSpotWriteAuthorized(input, owner) {
+  if (!HUBSPOT_WRITE_REQUIRE_AUTH) return { authorized: true, reason: 'auth disabled' };
+  const metadata = getSlackMetadata(input);
+  const slackUserId = String(metadata.slack_user_id || '').trim();
+  const channelId = String(metadata.channel_id || '').trim();
+  if (slackUserId && HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS.has(slackUserId)) {
+    return { authorized: true, reason: 'allowed Slack user' };
+  }
+  if (channelId && HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS.has(channelId)) {
+    return { authorized: true, reason: 'allowed Slack channel' };
+  }
+  if (owner?.source === 'from Slack tag') {
+    return { authorized: true, reason: 'Slack user maps to HubSpot owner' };
+  }
+  return {
+    authorized: false,
+    reason: 'HubSpot writes require a mapped HubSpot owner or an allowed Slack user/channel',
+  };
+}
+
+async function firecrawlRequest(endpoint, body) {
+  if (!FIRECRAWL_API_KEY) {
+    return { success: false, error: 'Firecrawl not configured. Set FIRECRAWL_API_KEY.' };
+  }
+  const payload = await httpRequest(`${FIRECRAWL_API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${FIRECRAWL_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+    timeout: Number(process.env.FIRECRAWL_TIMEOUT_MS || DEFAULT_HTTP_TIMEOUT_MS),
+  });
+  if (!payload || payload.success === false) {
+    return { success: false, error: payload?.error || payload?.message || JSON.stringify(payload) };
+  }
+  return payload;
+}
+
+function isLinkedInProfileUrl(url) {
+  return /^https?:\/\/([a-z]{2,3}\.)?www\.linkedin\.com\/in\//i.test(String(url || ''));
+}
+
+function normalizeLinkedInUrl(url) {
+  if (!url) return '';
+  try {
+    const parsed = new URL(url);
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return String(url).split('?')[0].replace(/\/$/, '');
+  }
+}
+
+function scoreLinkedInResult(result, email, inputName) {
+  const haystack = `${result.title || ''} ${result.description || ''} ${result.url || ''}`.toLowerCase();
+  let score = 0;
+  if (isLinkedInProfileUrl(result.url)) score += 5;
+  const domain = getEmailDomain(email).split('.')[0];
+  if (domain && haystack.includes(domain.toLowerCase())) score += 1;
+  for (const part of String(inputName || '').toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (haystack.includes(part)) score += 1;
+  }
+  if (haystack.includes('linkedin')) score += 1;
+  return score;
+}
+
+function extractLinkedInProfile(markdown, fallback = {}) {
+  const text = String(markdown || '');
+  const title = String(fallback.title || '');
+  const description = String(fallback.description || '');
+  const combined = `${title}\n${description}\n${text}`.replace(/\s+/g, ' ').trim();
+  const result = {};
+
+  const titleParts = title.split('|')[0].split(' - ');
+  if (titleParts[0] && !/linkedin/i.test(titleParts[0])) {
+    const nameParts = titleParts[0].trim().split(/\s+/);
+    if (nameParts.length >= 2) {
+      result.firstname = titleCase(nameParts[0]);
+      result.lastname = titleCase(nameParts.slice(1).join(' '));
+    }
+  }
+
+  const headline = titleParts.slice(1).join(' - ') || description;
+  const atMatch = headline.match(/(.+?)\s+(?:at|@)\s+(.+?)(?:\s+\||$)/i);
+  if (atMatch) {
+    result.jobtitle = atMatch[1].trim();
+    result.company = atMatch[2].replace(/\s*\|.*$/, '').trim();
+  }
+
+  const currentMatch = combined.match(/Current:\s*([^.;|]+?)(?:\.|;|\||$)/i);
+  if (!result.jobtitle && currentMatch) result.jobtitle = currentMatch[1].trim();
+
+  return compactProperties(result);
+}
+
+async function findLinkedInEnrichment({ email, firstname, lastname }) {
+  const emailName = parseNameFromEmail(email);
+  const fullName = [firstname || emailName.firstname, lastname || emailName.lastname].filter(Boolean).join(' ');
+  const queries = [
+    `"${email}" LinkedIn`,
+    fullName ? `"${fullName}" LinkedIn` : '',
+  ].filter(Boolean);
+
+  const candidates = [];
+  const seenUrls = new Set();
+  for (const query of queries) {
+    let payload;
+    try {
+      payload = await firecrawlRequest('/search', {
+        query,
+        limit: Number(process.env.FIRECRAWL_LINKEDIN_SEARCH_LIMIT || 5),
+        scrapeOptions: { formats: ['markdown'] },
+      });
+    } catch (err) {
+      return { found: false, error: err.message, candidates: [] };
+    }
+    if (!payload.success) return { found: false, error: payload.error, candidates: [] };
+
+    for (const item of payload.data || []) {
+      if (!isLinkedInProfileUrl(item.url)) continue;
+      const url = normalizeLinkedInUrl(item.url);
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      candidates.push({
+        url,
+        title: item.title || '',
+        description: item.description || '',
+        profile: extractLinkedInProfile(item.markdown, item),
+        score: scoreLinkedInResult(item, email, fullName),
+      });
+    }
+    if (candidates.length > 0) break;
+  }
+
+  if (candidates.length === 0) return { found: false, candidates: [] };
+  candidates.sort((a, b) => b.score - a.score);
+  const top = candidates[0];
+  const tied = candidates.filter((candidate) => candidate.score === top.score);
+  if (tied.length > 1 && top.score < 8) {
+    return { found: false, needsDisambiguation: true, candidates: candidates.slice(0, 5) };
+  }
+  return { found: true, url: top.url, profile: top.profile, candidates: candidates.slice(0, 5) };
+}
+
+async function getHubSpotContactProperty(propertyName) {
+  if (hubspotContactPropertyCache.has(propertyName)) {
+    return hubspotContactPropertyCache.get(propertyName);
+  }
+  try {
+    const property = await hubspotRequest(`/crm/v3/properties/contacts/${encodeURIComponent(propertyName)}`);
+    hubspotContactPropertyCache.set(propertyName, property);
+    return property;
+  } catch (err) {
+    if (err.statusCode === 404) {
+      hubspotContactPropertyCache.set(propertyName, null);
+      return null;
+    }
+    if (err.statusCode === 401 || err.statusCode === 403) {
+      console.error(`Cannot read HubSpot contact property ${propertyName}: ${err.message}`);
+      hubspotContactPropertyCache.set(propertyName, null);
+      return null;
+    }
+    throw err;
+  }
+}
+
+async function getExistingContactProperties(propertyNames, fallbackPropertyNames = []) {
+  const checks = await Promise.all(propertyNames.map(async (propertyName) => ({
+    propertyName,
+    property: await getHubSpotContactProperty(propertyName),
+  })));
+  const writable = checks.filter((check) => (
+    check.property
+    && !check.property.readOnlyValue
+    && !check.property.calculated
+  )).map((check) => check.propertyName);
+  return writable.length > 0 ? writable : fallbackPropertyNames;
+}
+
+async function resolveContactTypeValue() {
+  const requested = process.env.TRUEWIND_HUBSPOT_CONTACT_TYPE || 'Prospective Customer';
+  const property = await getHubSpotContactProperty('contact_type');
+  const options = property?.options || [];
+  if (options.some((option) => option.value === requested)) return requested;
+  if (options.some((option) => option.label === requested)) {
+    return options.find((option) => option.label === requested).value;
+  }
+  const legacy = options.find((option) => option.value === 'Prospective Customer' || option.label === 'Prospective Customer');
+  if (legacy) return legacy.value;
+  return requested;
+}
+
+async function searchHubSpotObject(objectType, filters, properties, limit = 10) {
+  const res = await hubspotRequest(`/crm/v3/objects/${objectType}/search`, 'POST', {
+    filterGroups: [{ filters }],
+    properties,
+    limit,
+  });
+  return res.results || [];
+}
+
+async function findContactByEmail(email) {
+  const linkedinProperties = await getExistingContactProperties(
+    ['linkedin___profile', 'hs_linkedin_url', 'linkedin_profile_url'],
+    ['linkedin___profile', 'hs_linkedin_url']
+  );
+  const results = await searchHubSpotObject(
+    'contacts',
+    [{ propertyName: 'email', operator: 'EQ', value: normalizeEmail(email) }],
+    ['email', 'firstname', 'lastname', 'company', 'jobtitle', 'lifecyclestage', 'hs_lead_status', 'contact_type', 'erp', 'lead_source', ...linkedinProperties],
+    10
+  );
+  return results[0] || null;
+}
+
+async function findOrCreateCompany(companyName, domain) {
+  const properties = ['name', 'domain'];
+  let results = [];
+  if (domain) {
+    results = await searchHubSpotObject('companies', [{ propertyName: 'domain', operator: 'EQ', value: domain }], properties, 1);
+  }
+  if (results.length === 0 && companyName) {
+    results = await searchHubSpotObject('companies', [{ propertyName: 'name', operator: 'EQ', value: companyName }], properties, 1);
+  }
+  if (results[0]) return { record: results[0], created: false };
+
+  const res = await hubspotRequest('/crm/v3/objects/companies', 'POST', {
+    properties: compactProperties({ name: companyName, domain }),
+  });
+  return { record: res, created: true };
+}
+
+async function findExistingDeal(dealName) {
+  const results = await searchHubSpotObject(
+    'deals',
+    [
+      { propertyName: 'dealname', operator: 'EQ', value: dealName },
+      { propertyName: 'pipeline', operator: 'EQ', value: TRUEWIND_HUBSPOT.pipeline },
+    ],
+    ['dealname', 'pipeline', 'dealstage', 'closedate', 'amount'],
+    1
+  );
+  return results[0] || null;
+}
+
+async function createHubSpotAssociation(fromType, fromId, toType, toId, associationTypeId) {
+  return hubspotRequest(
+    `/crm/v4/objects/${fromType}/${encodeURIComponent(fromId)}/associations/${toType}/${encodeURIComponent(toId)}`,
+    'PUT',
+    [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId }]
+  );
+}
+
+function mergeExistingContactUpdate({ proposed, existingProperties, explicitKeys }) {
+  const merged = {};
+  for (const [key, value] of Object.entries(proposed)) {
+    if (key === 'email') continue;
+    const existingValue = existingProperties?.[key];
+    const isBlank = existingValue === undefined || existingValue === null || existingValue === '';
+    if (explicitKeys.has(key) || isBlank) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
+function formatWorkflowError(err, partial) {
+  const lines = [`Error: ${err.message}`];
+  const partialLines = [];
+  if (partial.contactId) partialLines.push(`Contact ID: ${partial.contactId}`);
+  if (partial.companyId) partialLines.push(`Company ID: ${partial.companyId}`);
+  if (partial.dealId) partialLines.push(`Deal ID: ${partial.dealId}`);
+  if (partial.linkedinUrl) partialLines.push(`LinkedIn URL: ${partial.linkedinUrl}`);
+  if (partialLines.length > 0) {
+    lines.push('Partial HubSpot work completed before the error:');
+    lines.push(...partialLines);
+  }
+  return lines.join('\n');
+}
+
+function shouldSetLifecycleToOpportunity(currentLifecycleStage) {
+  const current = String(currentLifecycleStage || '').toLowerCase();
+  if (!current) return true;
+  const order = ['subscriber', 'lead', 'marketingqualifiedlead', 'salesqualifiedlead', 'opportunity', 'customer'];
+  const currentIndex = order.indexOf(current);
+  const opportunityIndex = order.indexOf('opportunity');
+  return currentIndex === -1 || currentIndex <= opportunityIndex;
+}
+
+function formatProspectWorkflowResponse(summary) {
+  const linkedinLine = summary.linkedinUrl
+    ? `✓ LinkedIn found: ${summary.linkedinUrl}`
+    : `✓ LinkedIn found: not found; used email/company fallback${summary.linkedinError ? ` (${summary.linkedinError})` : ''}`;
+  const title = summary.contact.jobtitle ? `, ${summary.contact.jobtitle}` : '';
+  return [
+    linkedinLine,
+    `✓ Contact created/updated: ${summary.contact.name}${title} at ${summary.company.name} (ID: ${summary.contact.id})`,
+    `✓ Deal ${summary.deal.created ? 'created' : 'matched'}: ${summary.deal.name} (ID: ${summary.deal.id})`,
+    `✓ Company ${summary.company.created ? 'created' : 'matched'}: ${summary.company.name} (ID: ${summary.company.id})`,
+    `✓ Owner: ${summary.owner.name} (${summary.owner.source})`,
+    `✓ Lead source: ${summary.leadSource}`,
+  ].join('\n');
+}
+
+async function runTruewindHubSpotProspectWorkflow(input) {
+  const email = normalizeEmail(input.email);
+  if (!isValidEmail(email)) {
+    return 'Missing required email. Please provide a valid prospect email address before I push this to HubSpot.';
+  }
+
+  const context = input.context || input.context_text || input.notes || '';
+  const parsedName = parseNameFromEmail(email);
+  const inferred = inferCompanyFromEmail(email);
+  const owner = await resolveHubSpotOwnerForProspect(input);
+  const authorization = isHubSpotWriteAuthorized(input, owner);
+  if (!authorization.authorized) {
+    return `Not authorized to write to HubSpot: ${authorization.reason}. Ask an admin to set HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS or HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS, or map your Slack account to a HubSpot owner.`;
+  }
+  const leadSource = input.lead_source || deduceLeadSource(context);
+  const erp = input.erp || '';
+
+  let linkedin = { found: false, candidates: [] };
+  if (input.linkedin_url) {
+    linkedin = { found: true, url: normalizeLinkedInUrl(input.linkedin_url), profile: {} };
+  } else {
+    linkedin = await findLinkedInEnrichment({
+      email,
+      firstname: input.firstname || parsedName.firstname,
+      lastname: input.lastname || parsedName.lastname,
+    });
+    if (linkedin.needsDisambiguation) {
+      return [
+        'Multiple possible LinkedIn profiles matched. Please reply with the correct URL:',
+        ...linkedin.candidates.map((candidate, index) => `${index + 1}. ${candidate.title || candidate.url} - ${candidate.url}`),
+      ].join('\n');
+    }
+  }
+
+  const firstname = input.firstname || linkedin.profile?.firstname || parsedName.firstname;
+  const lastname = input.lastname || linkedin.profile?.lastname || parsedName.lastname;
+  const jobtitle = input.jobtitle || linkedin.profile?.jobtitle || '';
+  const companyName = input.company || linkedin.profile?.company || inferred.company;
+  const companyDomain = inferred.domain;
+
+  if (!companyName) {
+    return `I found the email (${email}) but could not determine the company from LinkedIn or the email domain. Please provide the company name.`;
+  }
+
+  const partial = { linkedinUrl: linkedin.url || '' };
+  try {
+    const linkedinProperties = await getExistingContactProperties(
+      ['linkedin___profile', 'hs_linkedin_url', 'linkedin_profile_url'],
+      ['linkedin___profile', 'hs_linkedin_url']
+    );
+    const linkedinProps = Object.fromEntries(linkedinProperties.map((propertyName) => [propertyName, linkedin.url || '']));
+    const contactType = await resolveContactTypeValue();
+    const baseContactProps = compactProperties({
+      email,
+      firstname,
+      lastname,
+      jobtitle,
+      company: companyName,
+      contact_type: contactType,
+      erp,
+      lead_source: leadSource,
+      hubspot_owner_id: owner.id,
+      ...linkedinProps,
+    });
+
+    const existingContact = await findContactByEmail(email);
+    const explicitKeys = new Set([
+      ...['firstname', 'lastname', 'jobtitle', 'company', 'erp', 'lead_source'].filter((key) => input[key]),
+      ...linkedinProperties.filter(() => input.linkedin_url),
+    ]);
+    const contactProps = existingContact
+      ? mergeExistingContactUpdate({
+          proposed: baseContactProps,
+          existingProperties: existingContact.properties || {},
+          explicitKeys,
+        })
+      : {
+          ...baseContactProps,
+          lifecyclestage: 'lead',
+          hs_lead_status: '',
+        };
+
+    let contactRes;
+    if (existingContact && Object.keys(contactProps).length === 0) {
+      contactRes = existingContact;
+    } else if (existingContact) {
+      contactRes = await hubspotRequest(`/crm/v3/objects/contacts/${encodeURIComponent(existingContact.id)}`, 'PATCH', { properties: contactProps });
+    } else {
+      contactRes = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: contactProps });
+    }
+    const contactId = requireHubSpotObjectId(contactRes, existingContact ? 'HubSpot contact update' : 'HubSpot contact create');
+    partial.contactId = contactId;
+
+    const companyResult = await findOrCreateCompany(companyName, companyDomain);
+    const companyId = requireHubSpotObjectId(companyResult.record, companyResult.created ? 'HubSpot company create' : 'HubSpot company search');
+    partial.companyId = companyId;
+
+    const dealName = input.dealname || `${companyName} - New Deal`;
+    const dealProps = compactProperties({
+      dealname: dealName,
+      pipeline: TRUEWIND_HUBSPOT.pipeline,
+      dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
+      hubspot_owner_id: owner.id,
+      deal_source: leadSource,
+      erp,
+      amount: input.amount === undefined || input.amount === null ? '' : String(input.amount),
+      closedate: input.closedate || '',
+    });
+    const existingDeal = await findExistingDeal(dealName);
+    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
+    const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
+    partial.dealId = dealId;
+
+    await createHubSpotAssociation('contacts', contactId, 'companies', companyId, TRUEWIND_HUBSPOT.contactToCompanyAssociationTypeId);
+    await createHubSpotAssociation('deals', dealId, 'contacts', contactId, TRUEWIND_HUBSPOT.dealToContactAssociationTypeId);
+    await createHubSpotAssociation('deals', dealId, 'companies', companyId, TRUEWIND_HUBSPOT.dealToCompanyAssociationTypeId);
+
+    const conversionProps = { hs_lead_status: 'Converted' };
+    if (shouldSetLifecycleToOpportunity(existingContact?.properties?.lifecyclestage)) {
+      conversionProps.lifecyclestage = 'opportunity';
+    }
+    await hubspotRequest(`/crm/v3/objects/contacts/${encodeURIComponent(contactId)}`, 'PATCH', {
+      properties: conversionProps,
+    });
+
+    return formatProspectWorkflowResponse({
+      linkedinUrl: linkedin.url || '',
+      linkedinError: linkedin.error || '',
+      contact: {
+        id: contactId,
+        name: [firstname, lastname].filter(Boolean).join(' ') || email,
+        jobtitle,
+      },
+      company: {
+        id: companyId,
+        name: companyName,
+        created: companyResult.created,
+      },
+      deal: {
+        id: dealId,
+        name: dealName,
+        created: !existingDeal,
+      },
+      owner,
+      leadSource,
+    });
+  } catch (err) {
+    return formatWorkflowError(err, partial);
+  }
 }
 
 // ============================================================
@@ -273,6 +919,30 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'hubspot_push_truewind_prospect',
+    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, converts the contact, and returns exact IDs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Prospect email. Required.' },
+        context: { type: 'string', description: 'Original Slack request and relevant thread context for lead source deduction.' },
+        channel_id: { type: 'string', description: 'Slack channel_id from Slack metadata for write authorization, if available.' },
+        slack_user_id: { type: 'string', description: 'Slack user_id from Slack metadata for owner mapping, if available.' },
+        owner_name: { type: 'string', description: 'Explicit owner name only if the user specified one.' },
+        firstname: { type: 'string', description: 'Optional first name if already known.' },
+        lastname: { type: 'string', description: 'Optional last name if already known.' },
+        company: { type: 'string', description: 'Optional company name if already known or if email domain is generic.' },
+        jobtitle: { type: 'string', description: 'Optional title if already known.' },
+        linkedin_url: { type: 'string', description: 'Optional LinkedIn profile URL if the user already supplied it or selected a disambiguated match.' },
+        erp: { type: 'string', description: 'Optional ERP value. Leave unset unless specified.' },
+        lead_source: { type: 'string', description: 'Optional lead source only if explicitly known. Otherwise the tool deduces it from context.' },
+        amount: { type: 'number', description: 'Optional deal amount if specified.' },
+        closedate: { type: 'string', description: 'Optional close date if specified, in HubSpot-compatible date format.' },
+      },
+      required: ['email'],
     },
   },
   // --- HubSpot write tools ---
@@ -451,6 +1121,9 @@ async function executeTool(name, input) {
       const owners = (res.results || []).map(o => ({ id: o.id, email: o.email, firstName: o.firstName, lastName: o.lastName }));
       return JSON.stringify(owners);
     }
+    if (name === 'hubspot_push_truewind_prospect') {
+      return await runTruewindHubSpotProspectWorkflow(input);
+    }
 
     // --- HubSpot write ---
     if (name === 'hubspot_create_contact') {
@@ -587,10 +1260,35 @@ After successfully appending, respond with EXACTLY this and nothing else:
 ## HubSpot
 You have access to HubSpot CRM. You can search contacts, companies, deals, meetings, and other objects. You can also look up owners (team members) by ID. Use hubspot_list_owners to map owner IDs to names when reporting.
 
+### Truewind prospect push workflow
+When someone asks you to add, push, create, or update a prospect/lead/opportunity/deal in HubSpot, use hubspot_push_truewind_prospect. Do not manually chain the low-level HubSpot write tools unless the user asks for a custom one-off update.
+
+Rules enforced by the backend tool:
+- Contact first, deal second. Contact is the anchor record.
+- Email is required. If email is missing, ask for it.
+- Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
+- The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to opportunity / Converted.
+- Pass the full Slack request/thread in the context field so the backend can deduce lead source.
+- Pass channel_id and slack_user_id from Slack metadata when present. The backend uses them for HubSpot write authorization and owner mapping. It looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
+- Never ask for deal stage, owner, ERP, name/title, or lead source unless the backend tool explicitly needs clarification.
+- Never say done without actual contact and deal IDs from the tool result. If the tool fails, show the exact error.
+
+Lead source deduction:
+- "met at [conference/event]" -> Event
+- "reached out" or "contacted" -> Outbound - Sales Sourced List
+- "they contacted us" or "inbound" -> Self serve
+- "webinar" -> Webinar
+- "referred by" -> Referral
+- default -> Outbound - Sales Sourced List
+
 Key owner IDs:
 - Xavier Marco: 89305622
-- Caitlyn Mathews: 84547075
 - Mercedes Chien: 87811681
+- Alex Lee: 559564379
+- Aidan Gleghorn: 89053735
+- Noah Salah: 90960689
+- Jenilee Chen: 91143842
+- Sarah Elix: 84547076
 
 ## Grain
 You have access to Grain meeting transcripts. You can list recent recordings and get full details including summaries, participants, transcript text, and transcript links. Use this when asked about customer calls, meeting notes, or transcripts.
@@ -623,7 +1321,7 @@ function selectClaudeModelForMessages(messages) {
     .join('\n')
     .toLowerCase();
 
-  const highIntent = /\b(review|analy[sz]e|analysis|strategy|strategic|planning|debug|troubleshoot|root cause|investigate|architecture|design|compare|evaluate|recommend|recommendation|decide|decision|tradeoff|risk|risks|complex|deep|think hard|think deeply|implementation|proposal|prioriti[sz]e|roadmap)\b/.test(text);
+  const highIntent = /\b(review|analy[sz]e|analysis|strategy|strategic|planning|debug|troubleshoot|root cause|investigate|architecture|design|compare|evaluate|recommend|recommendation|decide|decision|tradeoff|risk|risks|complex|deep|think hard|think deeply|implementation|proposal|prioriti[sz]e|roadmap|hubspot|prospect|opportunit(?:y|ies)|deal|crm)\b/.test(text);
   const multiStepAsk = /\b(step by step|multi-step|multiple steps|end to end|from scratch)\b/.test(text);
   const longContext = text.length > Number(process.env.CLAUDE_HIGH_CONTEXT_CHARS || 3000);
   const longThread = messages.filter((message) => message.role === 'user').length >= Number(process.env.CLAUDE_HIGH_THREAD_MESSAGES || 5);
@@ -649,6 +1347,21 @@ function selectClaudeModelForMessages(messages) {
 // ============================================================
 function stripMention(text) {
   return text.replace(/<@[A-Z0-9]+>/g, '').trim();
+}
+
+async function getSlackUserEmail(slackUserId) {
+  if (!slackUserId) return '';
+  const tokens = [process.env.SLACK_BOT_TOKEN, process.env.SLACK_USER_TOKEN].filter(Boolean);
+  for (const token of tokens) {
+    try {
+      const result = await app.client.users.info({ token, user: slackUserId });
+      const email = result.user?.profile?.email || '';
+      if (email) return email;
+    } catch (err) {
+      console.error(`Could not fetch Slack user email for ${slackUserId}: ${err.message}`);
+    }
+  }
+  return '';
 }
 
 // Returns { messages, parentTs } where parentTs is the timestamp of the first/parent message
@@ -715,7 +1428,7 @@ function mergeMessages(messages) {
   return merged;
 }
 
-async function handleMessage(text, threadTs, channel, isThread, say) {
+async function handleMessage(text, threadTs, channel, isThread, say, slackUserId = '') {
   const cleanText = stripMention(text);
   if (!cleanText) return;
 
@@ -736,7 +1449,8 @@ async function handleMessage(text, threadTs, channel, isThread, say) {
   // Use the actual parent message timestamp for the date, not the reply timestamp
   const threadDate = new Date(parseFloat(parentTs) * 1000).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
   const lastMsg = messages[messages.length - 1];
-  lastMsg.content += `\n\n[Slack metadata: channel_id=${channel}, thread_ts=${parentTs}, thread_date=${threadDate}]`;
+  const slackUserPart = slackUserId ? `, slack_user_id=${slackUserId}` : '';
+  lastMsg.content += `\n\n[Slack metadata: channel_id=${channel}, thread_ts=${parentTs}, thread_date=${threadDate}${slackUserPart}]`;
 
   const selectedModel = selectClaudeModelForMessages(messages);
   console.log(`Claude model selected: ${selectedModel.model} tier=${selectedModel.tier} reason=${selectedModel.reason}`);
@@ -801,7 +1515,7 @@ app.event('app_mention', async ({ event, say }) => {
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
   console.log(`app_mention: thread_ts=${event.thread_ts}, ts=${event.ts}, isThread=${isThread}`);
-  await handleMessage(event.text, threadTs, event.channel, isThread, say);
+  await handleMessage(event.text, threadTs, event.channel, isThread, say, event.user || '');
 });
 
 // Respond to DMs
@@ -810,7 +1524,7 @@ app.event('message', async ({ event, say }) => {
   if (event.bot_id || event.subtype) return;
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
-  await handleMessage(event.text, threadTs, event.channel, isThread, say);
+  await handleMessage(event.text, threadTs, event.channel, isThread, say, event.user || '');
 });
 
 // ============================================================
@@ -1584,6 +2298,7 @@ function scheduleDailyProgress() {
   console.log('Slack bot is running in socket mode');
   console.log(`  Google Sheets: ready`);
   console.log(`  HubSpot: ${HUBSPOT_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
+  console.log(`  Firecrawl: ${FIRECRAWL_API_KEY ? 'ready' : 'NOT CONFIGURED'}`);
   console.log(`  Grain: ${GRAIN_API_TOKEN ? 'ready' : 'NOT CONFIGURED'}`);
 
   // Schedule daily discovery digest
