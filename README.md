@@ -71,7 +71,7 @@ The workflow first tries to match the Slack tagger's Slack email to a HubSpot ow
 
 ## Daily Lead Progress Slack Post (Railway)
 
-The Railway Slack bot posts the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property:
+The Railway Slack bot posts the report to `#gtm-general` at 6:07 PM Pacific on Sunday and Monday-Friday. Counts come from HubSpot deals created from Monday 00:00 Pacific through the report run time in the active pipeline. Obvious test/internal deals are skipped, and duplicate normalized deal names are counted once before grouping by the configured deal source property. When duplicate normalized deal names exist, the report keeps the most complete deal for reporting fields, preferring records with populated `deal_source`, owner, amount, close date, and stage; created date is only the tie-breaker.
 
 - `deal_source` starting with `Inbound` counts as Inbound.
 - `deal_source` starting with `Outbound` counts as Outbound, including values like `Outbound - Event`.
