@@ -13,7 +13,7 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const { App } = require('@slack/bolt');
+const { App: SlackBoltApp } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk').default;
 const { google } = require('googleapis');
 const {
@@ -78,6 +78,9 @@ const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '43974586';
 const TRUEWIND_HUBSPOT = {
   pipeline: '105321581',
   mqlDealStage: '1307720553',
+  convertedLeadStatus: 'MQL',
+  defaultLeadStatus: 'No one has contacted them',
+  defaultOutboundLeadSource: 'Outbound - Sales Sourced List',
   defaultOwnerId: '89305622',
   defaultOwnerName: 'Xavier Marco',
   contactToCompanyAssociationTypeId: 279,
@@ -114,6 +117,7 @@ function parseSlackOwnerMap() {
 
 const SLACK_TO_HUBSPOT_OWNER = parseSlackOwnerMap();
 const hubspotContactPropertyCache = new Map();
+const hubspotPropertyCache = new Map();
 
 function parseDelimitedEnvSet(name) {
   return new Set(String(process.env[name] || '').split(',').map((value) => value.trim()).filter(Boolean));
@@ -122,6 +126,22 @@ function parseDelimitedEnvSet(name) {
 const HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS');
 const HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS');
 const HUBSPOT_WRITE_REQUIRE_AUTH = process.env.HUBSPOT_WRITE_REQUIRE_AUTH !== 'false';
+
+function createSlackApp() {
+  if (require.main !== module) {
+    return {
+      client: { chat: { postMessage: async () => ({ ok: true }) } },
+      event: () => {},
+      start: async () => {},
+    };
+  }
+  return new SlackBoltApp({
+    token: process.env.SLACK_BOT_TOKEN,
+    signingSecret: process.env.SLACK_SIGNING_SECRET,
+    socketMode: true,
+    appToken: process.env.SLACK_APP_TOKEN,
+  });
+}
 
 async function hubspotRequest(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
@@ -276,11 +296,22 @@ function deduceLeadSource(contextText) {
   if (/\b(referred by|referral|referred|intro(?:duced)? by|introduction from)\b/.test(text)) return 'Referral';
   if (/\b(they contacted us|inbound|came inbound|reached out to us|contacted us)\b/.test(text)) return 'Self serve';
   if (/\b(met at|conference|event|summit|meetup|trade show|booth|expo)\b/.test(text)) return 'Event';
-  if (/\b(reached out|contacted|outbound|prospect(?:ed)?|sales sourced)\b/.test(text)) return 'Outbound - Sales Sourced List';
-  return 'Outbound - Sales Sourced List';
+  if (/\b(reached out|contacted|outbound|prospect(?:ed)?|sales sourced)\b/.test(text)) return TRUEWIND_HUBSPOT.defaultOutboundLeadSource;
+  return TRUEWIND_HUBSPOT.defaultOutboundLeadSource;
+}
+
+function resolveExplicitHubSpotOwner(input = {}) {
+  const ownerName = String(input.owner_name || input.owner || '').trim().toLowerCase();
+  if (ownerName && TRUEWIND_HUBSPOT.ownersByName[ownerName]) {
+    return { ...TRUEWIND_HUBSPOT.ownersByName[ownerName], source: 'explicit owner' };
+  }
+  return null;
 }
 
 function resolveHubSpotOwner(input = {}) {
+  const explicitOwner = resolveExplicitHubSpotOwner(input);
+  if (explicitOwner) return explicitOwner;
+
   const metadata = getSlackMetadata(input);
   const slackUserId = String(input.slack_user_id || input.slackUserId || metadata.slack_user_id || '').trim();
   const mapped = slackUserId ? SLACK_TO_HUBSPOT_OWNER[slackUserId] : null;
@@ -292,11 +323,6 @@ function resolveHubSpotOwner(input = {}) {
     if (mapped.id) return { id: String(mapped.id), name: mapped.name || `HubSpot owner ${mapped.id}`, source: 'from Slack tag' };
   }
 
-  const ownerName = String(input.owner_name || input.owner || '').trim().toLowerCase();
-  if (ownerName && TRUEWIND_HUBSPOT.ownersByName[ownerName]) {
-    return { ...TRUEWIND_HUBSPOT.ownersByName[ownerName], source: 'explicit owner' };
-  }
-
   return {
     id: TRUEWIND_HUBSPOT.defaultOwnerId,
     name: TRUEWIND_HUBSPOT.defaultOwnerName,
@@ -305,6 +331,9 @@ function resolveHubSpotOwner(input = {}) {
 }
 
 async function resolveHubSpotOwnerForProspect(input = {}) {
+  const explicitOwner = resolveExplicitHubSpotOwner(input);
+  if (explicitOwner) return explicitOwner;
+
   const metadata = getSlackMetadata(input);
   const slackUserId = String(input.slack_user_id || input.slackUserId || metadata.slack_user_id || '').trim();
   let slackUserEmail = String(input.slack_user_email || input.slackUserEmail || '').trim().toLowerCase();
@@ -354,6 +383,9 @@ function isHubSpotWriteAuthorized(input, owner) {
   const channelId = String(metadata.channel_id || '').trim();
   if (slackUserId && HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS.has(slackUserId)) {
     return { authorized: true, reason: 'allowed Slack user' };
+  }
+  if (slackUserId && SLACK_TO_HUBSPOT_OWNER[slackUserId]) {
+    return { authorized: true, reason: 'Slack user maps to HubSpot owner' };
   }
   if (channelId && HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS.has(channelId)) {
     return { authorized: true, reason: 'allowed Slack channel' };
@@ -499,7 +531,7 @@ async function getHubSpotContactProperty(propertyName) {
     return hubspotContactPropertyCache.get(propertyName);
   }
   try {
-    const property = await hubspotRequest(`/crm/v3/properties/contacts/${encodeURIComponent(propertyName)}`);
+    const property = await getHubSpotProperty('contacts', propertyName);
     hubspotContactPropertyCache.set(propertyName, property);
     return property;
   } catch (err) {
@@ -514,6 +546,62 @@ async function getHubSpotContactProperty(propertyName) {
     }
     throw err;
   }
+}
+
+async function getHubSpotProperty(objectType, propertyName) {
+  const cacheKey = `${objectType}:${propertyName}`;
+  if (hubspotPropertyCache.has(cacheKey)) return hubspotPropertyCache.get(cacheKey);
+  try {
+    const property = await hubspotRequest(`/crm/v3/properties/${encodeURIComponent(objectType)}/${encodeURIComponent(propertyName)}`);
+    hubspotPropertyCache.set(cacheKey, property);
+    return property;
+  } catch (err) {
+    if (err.statusCode === 404) {
+      hubspotPropertyCache.set(cacheKey, null);
+      return null;
+    }
+    throw err;
+  }
+}
+
+function normalizeHubSpotPropertyValue(property, value) {
+  if (value === undefined || value === null || value === '') return value;
+  const options = Array.isArray(property?.options) ? property.options : [];
+  if (options.length === 0) return value;
+
+  const stringValue = String(value);
+  if (options.some((option) => String(option.value) === stringValue)) return value;
+
+  const labelMatch = options.find((option) => String(option.label || '').toLowerCase() === stringValue.toLowerCase());
+  if (labelMatch) return labelMatch.value;
+
+  const allowed = options.map((option) => option.value).filter(Boolean).join(', ');
+  throw new Error(`Invalid HubSpot ${property.name} value "${stringValue}". Use one of: ${allowed}`);
+}
+
+function isReadOnlyHubSpotProperty(property) {
+  const metadata = property?.modificationMetadata || {};
+  return Boolean(
+    property?.readOnlyValue
+    || property?.calculated
+    || metadata.readOnlyValue
+    || metadata.readOnlyDefinition
+  );
+}
+
+async function validateHubSpotProperties(objectType, properties) {
+  const normalized = {};
+  for (const [propertyName, value] of Object.entries(properties || {})) {
+    const property = await getHubSpotProperty(objectType, propertyName);
+    if (!property) {
+      throw new Error(`Invalid HubSpot ${objectType} property "${propertyName}"`);
+    }
+    if (isReadOnlyHubSpotProperty(property)) {
+      throw new Error(`HubSpot ${objectType} property "${propertyName}" is read-only and cannot be updated`);
+    }
+    normalized[propertyName] = normalizeHubSpotPropertyValue(property, value);
+  }
+  return normalized;
 }
 
 async function getExistingContactProperties(propertyNames, fallbackPropertyNames = []) {
@@ -576,8 +664,9 @@ async function findOrCreateCompany(companyName, domain) {
   }
   if (results[0]) return { record: results[0], created: false };
 
+  const companyProps = await validateHubSpotProperties('companies', compactProperties({ name: companyName, domain }));
   const res = await hubspotRequest('/crm/v3/objects/companies', 'POST', {
-    properties: compactProperties({ name: companyName, domain }),
+    properties: companyProps,
   });
   return { record: res, created: true };
 }
@@ -733,16 +822,18 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       : {
           ...baseContactProps,
           lifecyclestage: 'lead',
-          hs_lead_status: '',
+          hs_lead_status: TRUEWIND_HUBSPOT.defaultLeadStatus,
         };
 
     let contactRes;
     if (existingContact && Object.keys(contactProps).length === 0) {
       contactRes = existingContact;
     } else if (existingContact) {
-      contactRes = await hubspotRequest(`/crm/v3/objects/contacts/${encodeURIComponent(existingContact.id)}`, 'PATCH', { properties: contactProps });
+      const validatedContactProps = await validateHubSpotProperties('contacts', contactProps);
+      contactRes = await hubspotRequest(`/crm/v3/objects/contacts/${encodeURIComponent(existingContact.id)}`, 'PATCH', { properties: validatedContactProps });
     } else {
-      contactRes = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: contactProps });
+      const validatedContactProps = await validateHubSpotProperties('contacts', contactProps);
+      contactRes = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: validatedContactProps });
     }
     const contactId = requireHubSpotObjectId(contactRes, existingContact ? 'HubSpot contact update' : 'HubSpot contact create');
     partial.contactId = contactId;
@@ -762,8 +853,9 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       amount: input.amount === undefined || input.amount === null ? '' : String(input.amount),
       closedate: input.closedate || '',
     });
+    const validatedDealProps = await validateHubSpotProperties('deals', dealProps);
     const existingDeal = await findExistingDeal(dealName);
-    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
+    const dealRes = existingDeal || await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedDealProps });
     const dealId = requireHubSpotObjectId(dealRes, 'HubSpot deal create');
     partial.dealId = dealId;
 
@@ -771,12 +863,13 @@ async function runTruewindHubSpotProspectWorkflow(input) {
     await createHubSpotAssociation('deals', dealId, 'contacts', contactId, TRUEWIND_HUBSPOT.dealToContactAssociationTypeId);
     await createHubSpotAssociation('deals', dealId, 'companies', companyId, TRUEWIND_HUBSPOT.dealToCompanyAssociationTypeId);
 
-    const conversionProps = { hs_lead_status: 'Converted' };
+    const conversionProps = { hs_lead_status: TRUEWIND_HUBSPOT.convertedLeadStatus };
     if (shouldSetLifecycleToOpportunity(existingContact?.properties?.lifecyclestage)) {
       conversionProps.lifecyclestage = 'opportunity';
     }
+    const validatedConversionProps = await validateHubSpotProperties('contacts', conversionProps);
     await hubspotRequest(`/crm/v3/objects/contacts/${encodeURIComponent(contactId)}`, 'PATCH', {
-      properties: conversionProps,
+      properties: validatedConversionProps,
     });
 
     return formatProspectWorkflowResponse({
@@ -924,7 +1017,7 @@ const TOOLS = [
   },
   {
     name: 'hubspot_push_truewind_prospect',
-    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, converts the contact, and returns exact IDs.',
+    description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
     input_schema: {
       type: 'object',
       properties: {
@@ -961,7 +1054,7 @@ const TOOLS = [
         phone: { type: 'string', description: 'Phone number' },
         properties: {
           type: 'object',
-          description: 'Additional properties as key-value pairs (e.g. lifecyclestage, contact_type, hubspot_owner_id, linkedin___profile, lead_source, enterprise_smb_industry)',
+          description: 'Writable contact properties as key-value pairs (e.g. lifecyclestage, contact_type, hubspot_owner_id, linkedin___profile, lead_source, enterprise_smb_industry). Do not include HubSpot read-only/system fields.',
         },
       },
       required: ['email'],
@@ -994,7 +1087,7 @@ const TOOLS = [
         amount: { type: 'number', description: 'Deal amount' },
         properties: {
           type: 'object',
-          description: 'Additional properties (e.g. hubspot_owner_id, closedate)',
+          description: 'Writable deal properties (e.g. hubspot_owner_id, closedate). Do not include HubSpot read-only/system fields such as hs_deal_stage_probability_shadow, notes_last_updated, or hs_object_source_detail_1.',
         },
       },
       required: ['dealname', 'dealstage'],
@@ -1135,24 +1228,28 @@ async function executeTool(name, input) {
       if (input.jobtitle) props.jobtitle = input.jobtitle;
       if (input.phone) props.phone = input.phone;
       if (input.properties) Object.assign(props, input.properties);
-      const res = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: props });
+      const validatedProps = await validateHubSpotProperties('contacts', props);
+      const res = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
     }
     if (name === 'hubspot_update_contact') {
       const contactId = encodeURIComponent(input.contact_id);
-      const res = await hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, 'PATCH', { properties: input.properties });
+      const validatedProps = await validateHubSpotProperties('contacts', input.properties || {});
+      const res = await hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, 'PATCH', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-1'));
     }
     if (name === 'hubspot_create_deal') {
       const props = { dealname: input.dealname, dealstage: input.dealstage, pipeline: input.pipeline || '105321581' };
       if (input.amount) props.amount = String(input.amount);
       if (input.properties) Object.assign(props, input.properties);
-      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: props });
+      const validatedProps = await validateHubSpotProperties('deals', props);
+      const res = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
     }
     if (name === 'hubspot_update_deal') {
       const dealId = encodeURIComponent(input.deal_id);
-      const res = await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, 'PATCH', { properties: input.properties });
+      const validatedProps = await validateHubSpotProperties('deals', input.properties || {});
+      const res = await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, 'PATCH', { properties: validatedProps });
       return JSON.stringify(formatHubSpotObjectResponse(res, '0-3'));
     }
     if (name === 'hubspot_create_association') {
@@ -1201,12 +1298,7 @@ async function executeTool(name, input) {
 // ============================================================
 // Slack app setup
 // ============================================================
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  socketMode: true,
-  appToken: process.env.SLACK_APP_TOKEN,
-});
+const app = createSlackApp();
 
 const INSTANTLY_POSITIVE_REPLY_CHANNEL = (
   process.env.INSTANTLY_POSITIVE_REPLY_SLACK_CHANNEL
@@ -1268,11 +1360,12 @@ Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
 - Email is required. If email is missing, ask for it.
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
-- The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to opportunity / Converted.
+- The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
 - Pass the full Slack request/thread in the context field so the backend can deduce lead source.
-- Pass channel_id and slack_user_id from Slack metadata when present. The backend uses them for HubSpot write authorization and owner mapping. It looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
+- Pass channel_id and slack_user_id from Slack metadata when present. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
 - Never ask for deal stage, owner, ERP, name/title, or lead source unless the backend tool explicitly needs clarification.
 - Never say done without actual contact and deal IDs from the tool result. If the tool fails, show the exact error.
+- Do not pass read-only HubSpot properties into low-level write tools. The backend validates properties before write and will reject system-managed fields such as hs_deal_stage_probability_shadow, notes_last_updated, and hs_object_source_detail_1.
 
 Lead source deduction:
 - "met at [conference/event]" -> Event
@@ -2488,7 +2581,7 @@ function scheduleDailyProgress() {
   scheduleNext();
 }
 
-(async () => {
+async function startSlackBot() {
   const shouldRunDigestCli = process.argv.includes('--run-digest');
   if (shouldRunDigestCli) {
     await runDiscoveryDigest();
@@ -2568,4 +2661,29 @@ function scheduleDailyProgress() {
   });
 
   // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
-})();
+}
+
+if (require.main === module) {
+  startSlackBot().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  TRUEWIND_HUBSPOT,
+  compactProperties,
+  deduceLeadSource,
+  executeTool,
+  formatWorkflowError,
+  getSlackMetadata,
+  hubspotPropertyCache,
+  isHubSpotWriteAuthorized,
+  isReadOnlyHubSpotProperty,
+  normalizeHubSpotPropertyValue,
+  resolveHubSpotOwner,
+  resolveHubSpotOwnerForProspect,
+  shouldSetLifecycleToOpportunity,
+  startSlackBot,
+  validateHubSpotProperties,
+};
