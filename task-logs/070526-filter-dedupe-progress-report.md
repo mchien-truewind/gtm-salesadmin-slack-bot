@@ -20,7 +20,8 @@ Update the Slack daily progress report so it still counts HubSpot deals by creat
 ## Decisions Made
 
 - Deduping is by normalized deal name rather than HubSpot company association because the existing HubSpot search query returns deals only and the user asked for a quick report-count fix.
-- The first created deal wins when duplicates normalize to the same key because the query sorts by `createdate` ascending.
+- Original implementation used first-created wins when duplicates normalize to the same key because the query sorts by `createdate` ascending.
+- Superseded correction on 2026-05-11: duplicate selection should prefer the most complete reporting record instead of earliest created. Prefer populated `deal_source`, owner, amount, close date, and stage; use created date only as a tie-breaker. This prevents a blank shell duplicate from hiding a better duplicate such as `Sound Community Services, Inc. - S1`.
 - `test` filtering uses a word-boundary regex to avoid false positives like `Attest`; `truewind` remains an internal/test exclusion.
 
 ## Mistakes, Blockers, And Fixes

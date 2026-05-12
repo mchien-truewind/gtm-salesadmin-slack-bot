@@ -2089,27 +2089,63 @@ function isObviousTestProgressDeal(deal) {
   return PROGRESS_TEST_DEAL_PATTERNS.some(pattern => pattern.test(dealName));
 }
 
+function getProgressDealCompletenessScore(deal) {
+  const properties = deal.properties || {};
+  let score = 0;
+
+  if (String(properties[PROGRESS_DEAL_SOURCE_PROPERTY] || '').trim()) score += 100;
+  if (String(properties.hubspot_owner_id || '').trim()) score += 25;
+  if (String(properties.amount || '').trim()) score += 10;
+  if (String(properties.closedate || '').trim()) score += 10;
+  if (String(properties.dealstage || '').trim()) score += 5;
+
+  return score;
+}
+
+function compareProgressDealCompleteness(candidate, current) {
+  const candidateScore = getProgressDealCompletenessScore(candidate);
+  const currentScore = getProgressDealCompletenessScore(current);
+  if (candidateScore !== currentScore) return candidateScore - currentScore;
+
+  const candidateCreated = new Date(candidate.properties?.createdate || 0).getTime();
+  const currentCreated = new Date(current.properties?.createdate || 0).getTime();
+  return currentCreated - candidateCreated;
+}
+
 function dedupeProgressDeals(deals) {
-  const kept = [];
-  const seenKeys = new Set();
+  const byKey = new Map();
   const duplicates = [];
 
   for (const deal of deals) {
     const properties = deal.properties || {};
     const key = normalizeProgressDealKey(properties.dealname) || `deal:${deal.id}`;
-    if (seenKeys.has(key)) {
-      duplicates.push({
-        id: deal.id,
-        dealname: properties.dealname || '',
-        key,
-      });
+    const existing = byKey.get(key);
+
+    if (!existing) {
+      byKey.set(key, deal);
       continue;
     }
-    seenKeys.add(key);
-    kept.push(deal);
+
+    if (compareProgressDealCompleteness(deal, existing) > 0) {
+      duplicates.push({
+        id: existing.id,
+        dealname: existing.properties?.dealname || '',
+        key,
+        replacedBy: deal.id,
+      });
+      byKey.set(key, deal);
+      continue;
+    }
+
+    duplicates.push({
+      id: deal.id,
+      dealname: properties.dealname || '',
+      key,
+      keptBy: existing.id,
+    });
   }
 
-  return { kept, duplicates };
+  return { kept: Array.from(byKey.values()), duplicates };
 }
 
 function getPacificParts(date = new Date()) {
@@ -2253,6 +2289,8 @@ async function searchProgressDeals(startDate, endDate) {
         'pipeline',
         'dealstage',
         'hubspot_owner_id',
+        'amount',
+        'closedate',
       ],
       sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
       limit: 100,
