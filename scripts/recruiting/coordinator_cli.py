@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from email.message import EmailMessage
@@ -102,6 +103,8 @@ REJECT_HARD_PATTERNS = [
     re.compile(r"(?i)\bhaven[’']?t\s+received\s+your\s+submission\b"),
     re.compile(r"(?i)\bwe\s+haven[’']?t\s+received\s+your\s+submission\b"),
     re.compile(r"(?i)\bhaven[’']?t\s+heard\s+back\s+from\s+you\b.*\bclosing\s+this\s+process\b"),
+    re.compile(r"(?i)\bhaven[’']?t\s+heard\s+from\s+you\s+in\s+a\s+while\b.*\bclose\s+the\s+application\b"),
+    re.compile(r"(?i)\bgoing\s+to\s+go\s+ahead\s+and\s+close\s+the\s+application\b"),
 ]
 REJECT_SUPPORT_PATTERNS = [
     re.compile(r"(?i)\bstrong\s+pool\s+of\s+applicants\b"),
@@ -110,6 +113,9 @@ REJECT_SUPPORT_PATTERNS = [
     re.compile(r"(?i)\bglad\s+to\s+see\s+your\s+application\s+again\b"),
     re.compile(r"(?i)\bapplication\s+again\s+in\s+the\s+future\b"),
     re.compile(r"(?i)\bapplication\b.*\bat\s+this\s+time\b"),
+    re.compile(r"(?i)\bnew\s+positions\s+opening\s+up\s+often\b"),
+    re.compile(r"(?i)\banother\s+role\s+piques\s+your\s+interest\b"),
+    re.compile(r"(?i)\bopen\s+to\s+seeing\s+your\s+application\s+again\s+soon\b"),
 ]
 REJECT_EXCLUSION_PATTERNS = [
     re.compile(r"(?i)\bas\s+you\s+figure\s+out\s+your\s+next\s+steps\b"),
@@ -445,7 +451,7 @@ def load_config() -> Config:
         sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
         pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
-        slack_token=get_env_first("SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
+        slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"),
         slack_review_channel=(
             os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL_ID", "").strip()
             or os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL", "hiring-review").strip().lstrip("#")
@@ -2778,26 +2784,58 @@ def slack_enabled(config: Config) -> bool:
     return bool(config.slack_token and config.slack_review_channel)
 
 
-def load_slack_posted_threads(path: Path) -> set[str]:
+def load_slack_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return set()
+        return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return set()
+        return {}
     if isinstance(payload, list):
-        return {str(item).strip() for item in payload if str(item).strip()}
+        return {"posted_thread_ids": [str(item).strip() for item in payload if str(item).strip()]}
     if isinstance(payload, dict):
-        raw_items = payload.get("posted_thread_ids", [])
-        if isinstance(raw_items, list):
-            return {str(item).strip() for item in raw_items if str(item).strip()}
+        return payload
+    return {}
+
+
+def save_slack_state(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_slack_posted_threads(path: Path) -> set[str]:
+    payload = load_slack_state(path)
+    raw_items = payload.get("posted_thread_ids", [])
+    if isinstance(raw_items, list):
+        return {str(item).strip() for item in raw_items if str(item).strip()}
     return set()
 
 
 def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"posted_thread_ids": sorted(thread_ids)}
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    payload = load_slack_state(path)
+    payload["posted_thread_ids"] = sorted(thread_ids)
+    save_slack_state(path, payload)
+
+
+def load_last_weekly_active_review_at(path: Path) -> datetime | None:
+    payload = load_slack_state(path)
+    raw = str(payload.get("last_weekly_active_review_at", "") or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def save_last_weekly_active_review_at(path: Path, dt: datetime) -> None:
+    payload = load_slack_state(path)
+    payload["last_weekly_active_review_at"] = iso(dt.astimezone(timezone.utc))
+    save_slack_state(path, payload)
 
 
 def load_recent_slack_posted_threads(config: Config, client: SlackClient, channel_id: str) -> set[str]:
@@ -2955,6 +2993,111 @@ def collect_review_candidates_for_slack(
     return candidates
 
 
+def collect_active_candidates_for_weekly_slack(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> list[dict[str, str]]:
+    properties_schema = database_schema.get("properties", {})
+    title_prop_name = resolve_title_property_name(properties_schema, prop_map.candidate_name)
+    candidates: list[dict[str, str]] = []
+    for page in notion.query_pages({"page_size": 100}):
+        props = page.get("properties", {})
+        status = notion_prop_value(props.get(prop_map.status, {})).strip() or "Awaiting Decision"
+        if status_is_terminal(status):
+            continue
+        candidates.append(
+            {
+                "candidate_name": notion_prop_value(props.get(title_prop_name, {})).strip() or "Unknown",
+                "role": notion_prop_value(props.get(prop_map.role, {})).strip() or "Unknown",
+                "status": status,
+                "notion_url": notion_page_url(page.get("id", "")),
+                "date_first_entered": notion_prop_value(props.get(prop_map.date_first_entered, {})).strip(),
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            (item.get("status", "") or "").lower(),
+            item.get("date_first_entered", ""),
+            item.get("candidate_name", ""),
+        )
+    )
+    return candidates
+
+
+def post_weekly_active_candidates_digest(
+    config: Config,
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> tuple[int, int]:
+    if not slack_enabled(config):
+        return 0, 0
+
+    candidates = collect_active_candidates_for_weekly_slack(notion, database_schema, prop_map)
+    if not candidates:
+        return 0, 0
+
+    last_posted_at = load_last_weekly_active_review_at(config.slack_state_file)
+    now_utc = now_local(config.timezone_name).astimezone(timezone.utc)
+    if last_posted_at and now_utc - last_posted_at < timedelta(days=WEEKLY_REVIEW_INTERVAL_DAYS):
+        return 0, len(candidates)
+
+    client = SlackClient(config.slack_token)
+    try:
+        channel_id = client.resolve_channel_id(config.slack_review_channel)
+    except Exception:
+        return 0, len(candidates)
+
+    mention_user_id = config.slack_mention_user_id
+    if not mention_user_id:
+        try:
+            mention_user_id = (client.auth_test().get("user_id", "") or "").strip()
+        except Exception:
+            mention_user_id = ""
+    mention_prefix = f"<@{mention_user_id}> " if mention_user_id else ""
+
+    counts = Counter(candidate.get("status", "Awaiting Decision") for candidate in candidates)
+    summary = ", ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
+    lines = [
+        f"* <{candidate['notion_url']}|{candidate['candidate_name']}> | {candidate['status']} | {candidate['role']}"
+        if candidate.get("notion_url")
+        else f"* {candidate['candidate_name']} | {candidate['status']} | {candidate['role']}"
+        for candidate in candidates
+    ]
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{mention_prefix}Weekly ATS follow-up: {len(candidates)} non-terminal candidates still need review.",
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Status summary:* {summary}"}},
+    ]
+    for idx in range(0, len(lines), 15):
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(lines[idx : idx + 15])},
+            }
+        )
+
+    fallback_text = (
+        f"{mention_prefix}Weekly ATS follow-up: {len(candidates)} non-terminal candidates still need review. "
+        f"{summary}"
+    )
+    try:
+        client.post_message(channel_id, fallback_text, blocks)
+    except Exception:
+        return 0, len(candidates)
+
+    save_last_weekly_active_review_at(config.slack_state_file, now_utc)
+    return 1, len(candidates)
+
+
 def sync_slack_decisions(
     config: Config,
     notion: NotionClient,
@@ -3087,36 +3230,47 @@ def sync_slack_decisions(
             if not page:
                 forwards_skipped_missing += 1
                 continue
-            if thread_forward_already_sent(
-                gmail_service,
-                sender_email=config.from_email,
-                recipient_email=config.forward_to_email,
-                thread_id=thread_id,
-            ):
-                forwards_skipped_existing += 1
-                continue
 
             page_props = page.get("properties", {})
-            candidate_name = notion_prop_value(page_props.get(title_prop_name, {})).strip() or "Candidate"
-            candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
-            role_values = notion_prop_values(page_props.get(prop.role, {}))
-            role = ", ".join(role_values) if role_values else notion_prop_value(page_props.get(prop.role, {})).strip()
-            notion_url = notion_page_url(page.get("id", ""))
-            resume_url = notion_prop_value(page_props.get(prop.resume_url, {})).strip()
+            existing_status = notion_prop_value(page_props.get(prop.status, {})).strip()
+            if status_is_terminal(existing_status):
+                continue
 
-            forward_candidate_thread_to_recipient(
+            forward_sent = thread_forward_already_sent(
                 gmail_service,
                 sender_email=config.from_email,
                 recipient_email=config.forward_to_email,
                 thread_id=thread_id,
-                candidate_name=candidate_name,
-                candidate_email=candidate_email,
-                role=role or "Unknown",
-                notion_url=notion_url,
-                resume_url=resume_url,
-                internal_domains=internal_domains,
             )
-            forwards_sent += 1
+            if forward_sent:
+                forwards_skipped_existing += 1
+            else:
+                candidate_name = notion_prop_value(page_props.get(title_prop_name, {})).strip() or "Candidate"
+                candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
+                role_values = notion_prop_values(page_props.get(prop.role, {}))
+                role = ", ".join(role_values) if role_values else notion_prop_value(page_props.get(prop.role, {})).strip()
+                notion_url = notion_page_url(page.get("id", ""))
+                resume_url = notion_prop_value(page_props.get(prop.resume_url, {})).strip()
+
+                forward_candidate_thread_to_recipient(
+                    gmail_service,
+                    sender_email=config.from_email,
+                    recipient_email=config.forward_to_email,
+                    thread_id=thread_id,
+                    candidate_name=candidate_name,
+                    candidate_email=candidate_email,
+                    role=role or "Unknown",
+                    notion_url=notion_url,
+                    resume_url=resume_url,
+                    internal_domains=internal_domains,
+                )
+                forwards_sent += 1
+
+            if prop.status in properties and existing_status != "N/A":
+                notion.update_page(
+                    page["id"],
+                    {prop.status: build_notion_value(properties[prop.status], "N/A")},
+                )
 
     return (
         updated,
@@ -3142,8 +3296,9 @@ def require_notion_property(
 
 ROLE_OPTIONS = ("BDR", "Growth Generalist", "AE", "Other")
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
-STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process")
-TERMINAL_STATUSES = {"rejected"}
+STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A")
+TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a"}
+WEEKLY_REVIEW_INTERVAL_DAYS = 7
 
 
 def notion_prop_values(prop: dict[str, Any]) -> list[str]:
@@ -4274,7 +4429,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Non-scheduling ATS threads archived from hiring label: {non_scheduling_threads_archived}")
     print(f"Non-scheduling ATS thread archive failures: {non_scheduling_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
+    weekly_review_posts, weekly_review_candidate_count = post_weekly_active_candidates_digest(
+        config,
+        notion,
+        database_schema,
+        prop,
+    )
     print(f"No response drafts created: {no_response_drafts}")
+    print(f"Weekly ATS follow-up posts created: {weekly_review_posts}")
+    print(f"Weekly ATS follow-up candidates included: {weekly_review_candidate_count}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
 
 
