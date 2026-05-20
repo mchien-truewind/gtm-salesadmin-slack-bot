@@ -2823,24 +2823,19 @@ def save_slack_posted_threads(path: Path, thread_ids: set[str]) -> None:
     save_slack_state(path, payload)
 
 
-def load_last_weekly_active_review_at(path: Path) -> datetime | None:
+def load_weekly_active_review_slots(path: Path) -> set[str]:
     payload = load_slack_state(path)
-    raw = str(payload.get("last_weekly_active_review_at", "") or "").strip()
-    if not raw:
-        return None
-    normalized = raw.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    raw_items = payload.get("weekly_active_review_sent_slots", [])
+    if isinstance(raw_items, list):
+        return {str(item).strip() for item in raw_items if str(item).strip()}
+    return set()
 
 
-def save_last_weekly_active_review_at(path: Path, dt: datetime) -> None:
+def save_weekly_active_review_slot(path: Path, slot_key: str) -> None:
     payload = load_slack_state(path)
-    payload["last_weekly_active_review_at"] = iso(dt.astimezone(timezone.utc))
+    existing = load_weekly_active_review_slots(path)
+    existing.add(slot_key)
+    payload["weekly_active_review_sent_slots"] = sorted(existing)[-32:]
     save_slack_state(path, payload)
 
 
@@ -3032,11 +3027,48 @@ def collect_active_candidates_for_weekly_slack(
     return candidates
 
 
+def weekly_active_review_slot_key(dt: datetime) -> str:
+    local_dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    weekday_name = ATS_FOLLOW_UP_WEEKDAYS.get(local_dt.weekday(), "unknown").lower()
+    return f"{local_dt.date().isoformat()}-{weekday_name}-{ATS_FOLLOW_UP_HOUR:02d}00"
+
+
+def should_post_scheduled_weekly_active_review(dt: datetime) -> bool:
+    return dt.weekday() in ATS_FOLLOW_UP_WEEKDAYS and dt.hour == ATS_FOLLOW_UP_HOUR
+
+
+def slack_history_has_weekly_active_review_slot(
+    client: SlackClient,
+    channel_id: str,
+    slot_key: str,
+    *,
+    timezone_name: str,
+) -> bool:
+    oldest_ts = (now_local(timezone_name) - timedelta(days=8)).timestamp()
+    marker = f"{ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"
+    try:
+        messages = client.list_channel_messages(channel_id, oldest_ts)
+    except Exception:
+        return False
+    for message in messages:
+        if marker in str(message.get("text", "") or ""):
+            return True
+        for block in message.get("blocks", []) or []:
+            text = (block.get("text") or {}).get("text", "") if isinstance(block, dict) else ""
+            if marker in text:
+                return True
+    return False
+
+
 def post_weekly_active_candidates_digest(
     config: Config,
     notion: NotionClient,
     database_schema: dict[str, Any],
     prop_map: NotionPropertyMap,
+    *,
+    force: bool = False,
+    record_slot: bool = True,
+    heading: str = "ATS follow-up",
 ) -> tuple[int, int]:
     if not slack_enabled(config):
         return 0, 0
@@ -3045,15 +3077,25 @@ def post_weekly_active_candidates_digest(
     if not candidates:
         return 0, 0
 
-    last_posted_at = load_last_weekly_active_review_at(config.slack_state_file)
-    now_utc = now_local(config.timezone_name).astimezone(timezone.utc)
-    if last_posted_at and now_utc - last_posted_at < timedelta(days=WEEKLY_REVIEW_INTERVAL_DAYS):
+    now_dt = now_local(config.timezone_name)
+    slot_key = weekly_active_review_slot_key(now_dt)
+    if not force and not should_post_scheduled_weekly_active_review(now_dt):
+        return 0, len(candidates)
+    if not force and slot_key in load_weekly_active_review_slots(config.slack_state_file):
         return 0, len(candidates)
 
     client = SlackClient(config.slack_token)
     try:
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
+        return 0, len(candidates)
+    if not force and slack_history_has_weekly_active_review_slot(
+        client,
+        channel_id,
+        slot_key,
+        timezone_name=config.timezone_name,
+    ):
+        save_weekly_active_review_slot(config.slack_state_file, slot_key)
         return 0, len(candidates)
 
     mention_user_id = config.slack_mention_user_id
@@ -3078,7 +3120,7 @@ def post_weekly_active_candidates_digest(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"{mention_prefix}Weekly ATS follow-up: {len(candidates)} non-terminal candidates still need review.",
+                "text": f"{mention_prefix}{heading}: {len(candidates)} non-terminal candidates still need review.",
             },
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Status summary:* {summary}"}},
@@ -3090,17 +3132,24 @@ def post_weekly_active_candidates_digest(
                 "text": {"type": "mrkdwn", "text": "\n".join(lines[idx : idx + 15])},
             }
         )
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"{ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"}],
+        }
+    )
 
     fallback_text = (
-        f"{mention_prefix}Weekly ATS follow-up: {len(candidates)} non-terminal candidates still need review. "
-        f"{summary}"
+        f"{mention_prefix}{heading}: {len(candidates)} non-terminal candidates still need review. "
+        f"{summary} {ATS_FOLLOW_UP_SLOT_MARKER_PREFIX}{slot_key}"
     )
     try:
         client.post_message(channel_id, fallback_text, blocks)
     except Exception:
         return 0, len(candidates)
 
-    save_last_weekly_active_review_at(config.slack_state_file, now_utc)
+    if record_slot:
+        save_weekly_active_review_slot(config.slack_state_file, slot_key)
     return 1, len(candidates)
 
 
@@ -3304,7 +3353,9 @@ ROLE_OPTIONS = ("BDR", "Growth Generalist", "AE", "Other")
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A")
 TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a"}
-WEEKLY_REVIEW_INTERVAL_DAYS = 7
+ATS_FOLLOW_UP_WEEKDAYS = {2: "Wednesday", 4: "Friday"}
+ATS_FOLLOW_UP_HOUR = 17
+ATS_FOLLOW_UP_SLOT_MARKER_PREFIX = "ATS_ACTIVE_REVIEW_SLOT:"
 
 
 def notion_prop_values(prop: dict[str, Any]) -> list[str]:
@@ -4480,6 +4531,24 @@ def sync_slack_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Tenn forwards skipped (already sent): {forwards_skipped_existing}")
 
 
+def post_ats_follow_up_test_cmd(_args: argparse.Namespace) -> None:
+    config = load_config()
+    notion = NotionClient(config.notion_token, config.notion_database_id)
+    database_schema = notion.get_database()
+    prop = resolve_property_map(config.property_map, database_schema)
+    posts, candidates = post_weekly_active_candidates_digest(
+        config,
+        notion,
+        database_schema,
+        prop,
+        force=True,
+        record_slot=False,
+        heading="Test ATS follow-up",
+    )
+    print(f"Test ATS follow-up posts created: {posts}")
+    print(f"Test ATS follow-up candidates included: {candidates}")
+
+
 def run_cmd(_args: argparse.Namespace) -> None:
     ingest_cmd(_args)
     sync_slack_decisions_cmd(_args)
@@ -4579,6 +4648,8 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "slack_proceed_reactions": sorted(config.slack_proceed_reactions),
         "slack_reject_reactions": sorted(config.slack_reject_reactions),
         "slack_forward_reactions": sorted(config.slack_forward_reactions),
+        "ats_follow_up_weekdays": sorted(ATS_FOLLOW_UP_WEEKDAYS.values()),
+        "ats_follow_up_hour": ATS_FOLLOW_UP_HOUR,
         "forward_to_email": config.forward_to_email,
         "reject_delay_hours": config.reject_delay_hours,
         "no_response_wait_days": config.no_response_wait_days,
@@ -4628,6 +4699,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sync Proceed/Reject decisions from Slack reactions into Notion",
     )
     slack_sync_parser.set_defaults(func=sync_slack_decisions_cmd)
+
+    follow_up_test_parser = subparsers.add_parser(
+        "post-ats-follow-up-test",
+        help="Post the non-terminal ATS Slack digest immediately without consuming a scheduled slot",
+    )
+    follow_up_test_parser.set_defaults(func=post_ats_follow_up_test_cmd)
 
     run_parser = subparsers.add_parser(
         "run",
