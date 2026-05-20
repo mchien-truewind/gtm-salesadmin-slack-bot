@@ -894,13 +894,19 @@ def get_docling_converter() -> Any | None:
 
     _DOCLING_CHECKED = True
     try:
-        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
     except Exception:
         _DOCLING_CONVERTER = None
         return None
 
     try:
-        _DOCLING_CONVERTER = DocumentConverter()
+        pdf_options = PdfPipelineOptions()
+        pdf_options.ocr_options = TesseractCliOcrOptions(lang=["eng"], tesseract_cmd="tesseract")
+        _DOCLING_CONVERTER = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_options)}
+        )
     except Exception:
         _DOCLING_CONVERTER = None
     return _DOCLING_CONVERTER
