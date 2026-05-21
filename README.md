@@ -384,4 +384,4 @@ Recommended repository variables:
 Behavior:
 - Runs every 10 minutes (`*/10 * * * *`) regardless of laptop sleep.
 - You can also trigger it manually from GitHub Actions via **Run workflow**.
-- Reject drafts are auto-sent only after the Gmail draft is at least 48 hours old (`RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS`) and the `Hi {{first name}},` greeting matches strong email, resume, or LinkedIn profile-name evidence.
+- Reject drafts are auto-sent only after the Gmail draft is at least 48 hours old (`RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS`), the `Hi {{first name}},` greeting matches strong email/resume/LinkedIn profile-name evidence, and an external verifier subagent (`RECRUITING_NAME_VERIFIER_PROVIDER`) explicitly approves. If the verifier fails or rejects, the draft is not sent and Slack is notified with the candidate email.

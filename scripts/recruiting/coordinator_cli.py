@@ -178,6 +178,10 @@ class Config:
     no_response_template: str
     reject_delay_hours: int
     reject_draft_auto_send_age_hours: int
+    name_verifier_provider: str
+    name_verifier_model: str
+    anthropic_api_key: str
+    openai_api_key: str
     no_response_wait_days: int
     assignment_keywords: set[str]
     sent_status_lookback_days: int
@@ -447,6 +451,10 @@ def load_config() -> Config:
         ),
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
         reject_draft_auto_send_age_hours=parse_env_int("RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS", 48),
+        name_verifier_provider=os.getenv("RECRUITING_NAME_VERIFIER_PROVIDER", "anthropic").strip().lower(),
+        name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-3-5-haiku-latest").strip(),
+        anthropic_api_key=get_env_first("RECRUITING_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        openai_api_key=get_env_first("RECRUITING_OPENAI_API_KEY", "OPENAI_API_KEY"),
         no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
         assignment_keywords=parse_csv_set(
             os.getenv("RECRUITING_ASSIGNMENT_KEYWORDS", ""), default=DEFAULT_ASSIGNMENT_KEYWORDS
@@ -2154,6 +2162,182 @@ def run_rejection_name_verification_agent(
     return False, greeting_first_name, "; ".join(expected_summary) or "no email/resume/linkedin name evidence"
 
 
+def summarize_name_evidence(evidence: dict[str, list[str]]) -> str:
+    parts = []
+    for source in ("email", "resume", "linkedin", "linkedin_slug", "ats"):
+        values = evidence.get(source, [])
+        if values:
+            parts.append(f"{source}={','.join(values)}")
+    return "; ".join(parts)
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    source = (text or "").strip()
+    try:
+        parsed = json.loads(source)
+        return parsed if isinstance(parsed, dict) else {}
+    except ValueError:
+        pass
+    match = re.search(r"\{.*\}", source, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def build_name_verifier_prompt(payload: dict[str, Any]) -> str:
+    return (
+        "You are a recruiting operations verification subagent. "
+        "Decide whether it is safe to auto-send a rejection draft based only on first-name identity. "
+        "Allow only if the greeting first name matches strong evidence from the candidate's email display name, "
+        "resume name, or enriched LinkedIn profile name. Do not allow based on ATS name or LinkedIn URL slug alone. "
+        "If strong evidence is missing, ambiguous, or conflicting, reject. "
+        "Return only compact JSON with keys allow_auto_send (boolean), reason (string), "
+        "matched_sources (array), conflicts (array).\n\n"
+        f"Payload:\n{json.dumps(payload, ensure_ascii=True, sort_keys=True)}"
+    )
+
+
+def call_anthropic_name_verifier(config: Config, payload: dict[str, Any]) -> tuple[bool, str]:
+    if requests is None or not config.anthropic_api_key:
+        return False, "Anthropic verifier unavailable"
+    response = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": config.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": config.name_verifier_model or "claude-3-5-haiku-latest",
+            "max_tokens": 300,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": build_name_verifier_prompt(payload)}],
+        },
+        timeout=45,
+    )
+    if not response.ok:
+        return False, f"Anthropic verifier HTTP {response.status_code}"
+    try:
+        body = response.json()
+    except ValueError:
+        return False, "Anthropic verifier returned invalid JSON"
+    text_chunks = [
+        str(item.get("text", ""))
+        for item in body.get("content", []) or []
+        if isinstance(item, dict) and item.get("type") == "text"
+    ]
+    parsed = extract_json_object("\n".join(text_chunks))
+    return bool(parsed.get("allow_auto_send")), clean_text(str(parsed.get("reason", "") or "no reason"))
+
+
+def call_openai_name_verifier(config: Config, payload: dict[str, Any]) -> tuple[bool, str]:
+    if requests is None or not config.openai_api_key:
+        return False, "OpenAI verifier unavailable"
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {config.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": config.name_verifier_model or "gpt-4o-mini",
+            "temperature": 0,
+            "messages": [{"role": "user", "content": build_name_verifier_prompt(payload)}],
+        },
+        timeout=45,
+    )
+    if not response.ok:
+        return False, f"OpenAI verifier HTTP {response.status_code}"
+    try:
+        body = response.json()
+    except ValueError:
+        return False, "OpenAI verifier returned invalid JSON"
+    content = (
+        ((body.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        if isinstance(body.get("choices"), list)
+        else ""
+    )
+    parsed = extract_json_object(str(content))
+    return bool(parsed.get("allow_auto_send")), clean_text(str(parsed.get("reason", "") or "no reason"))
+
+
+def call_rejection_name_verifier_subagent(
+    config: Config,
+    *,
+    candidate_name: str,
+    candidate_email: str,
+    greeting_first_name: str,
+    evidence: dict[str, list[str]],
+    deterministic_allowed: bool,
+    deterministic_reason: str,
+) -> tuple[bool, str]:
+    payload = {
+        "candidate_email": candidate_email,
+        "notion_candidate_name": candidate_name,
+        "greeting_first_name": greeting_first_name,
+        "evidence": evidence,
+        "deterministic_allowed": deterministic_allowed,
+        "deterministic_reason": deterministic_reason,
+    }
+    provider = config.name_verifier_provider or "anthropic"
+    try:
+        if provider == "openai":
+            return call_openai_name_verifier(config, payload)
+        return call_anthropic_name_verifier(config, payload)
+    except Exception as exc:
+        return False, f"{provider} verifier failed: {exc.__class__.__name__}"
+
+
+def notify_rejection_name_verification_failure(
+    config: Config,
+    *,
+    draft_id: str,
+    candidate_name: str,
+    candidate_email: str,
+    greeting_first_name: str,
+    evidence_summary: str,
+    subagent_reason: str,
+    notion_url: str,
+) -> bool:
+    if not slack_enabled(config) or not draft_id:
+        return False
+    already_notified = load_rejection_name_failure_notified_drafts(config.slack_state_file)
+    if draft_id in already_notified:
+        return False
+    try:
+        client = SlackClient(config.slack_token)
+        channel_id = client.resolve_channel_id(config.slack_review_channel)
+    except Exception:
+        return False
+
+    mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
+    lines = [
+        f"{mention_prefix}Rejection draft name verification failed. Auto-send skipped.",
+        f"*Candidate:* {candidate_name}",
+        f"*Email:* `{candidate_email}`",
+        f"*Draft greeting:* `{greeting_first_name or '(missing)'}`",
+        f"*Subagent reason:* {subagent_reason or 'No reason returned'}",
+        f"*Evidence:* {evidence_summary or 'No strong email/resume/LinkedIn name evidence'}",
+    ]
+    if notion_url:
+        lines.append(f"*ATS:* <{notion_url}|Open Notion row>")
+    text = "\n".join(lines)
+    try:
+        client.post_message(
+            channel_id,
+            f"Rejection draft name verification failed for {candidate_email}",
+            [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+        )
+    except Exception:
+        return False
+    save_rejection_name_failure_notified_draft(config.slack_state_file, draft_id)
+    return True
+
+
 def thread_forward_already_sent(
     gmail_service,
     *,
@@ -3076,6 +3260,22 @@ def save_weekly_active_review_slot(path: Path, slot_key: str) -> None:
     existing = load_weekly_active_review_slots(path)
     existing.add(slot_key)
     payload["weekly_active_review_sent_slots"] = sorted(existing)[-32:]
+    save_slack_state(path, payload)
+
+
+def load_rejection_name_failure_notified_drafts(path: Path) -> set[str]:
+    payload = load_slack_state(path)
+    raw_items = payload.get("rejection_name_failure_notified_draft_ids", [])
+    if isinstance(raw_items, list):
+        return {str(item).strip() for item in raw_items if str(item).strip()}
+    return set()
+
+
+def save_rejection_name_failure_notified_draft(path: Path, draft_id: str) -> None:
+    payload = load_slack_state(path)
+    existing = load_rejection_name_failure_notified_drafts(path)
+    existing.add(draft_id)
+    payload["rejection_name_failure_notified_draft_ids"] = sorted(existing)[-256:]
     save_slack_state(path, payload)
 
 
@@ -4653,16 +4853,39 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         linkedin_url=linkedin_url,
                         pdl_api_key=config.pdl_api_key,
                     )
-                    name_ok, greeting_first_name, expected_first_name = run_rejection_name_verification_agent(
+                    deterministic_ok, greeting_first_name, deterministic_reason = run_rejection_name_verification_agent(
                         draft_body=draft_body,
                         evidence=name_evidence,
                     )
+                    subagent_ok, subagent_reason = call_rejection_name_verifier_subagent(
+                        config,
+                        candidate_name=candidate_name,
+                        candidate_email=candidate_email,
+                        greeting_first_name=greeting_first_name,
+                        evidence=name_evidence,
+                        deterministic_allowed=deterministic_ok,
+                        deterministic_reason=deterministic_reason,
+                    )
+                    name_ok = deterministic_ok and subagent_ok
                     if not name_ok:
                         reject_drafts_auto_send_skipped_name += 1
+                        failure_reason = (
+                            f"deterministic={deterministic_reason}; subagent={subagent_reason}"
+                        )
+                        notify_rejection_name_verification_failure(
+                            config,
+                            draft_id=reject_draft_id,
+                            candidate_name=candidate_name,
+                            candidate_email=candidate_email,
+                            greeting_first_name=greeting_first_name,
+                            evidence_summary=summarize_name_evidence(name_evidence),
+                            subagent_reason=failure_reason,
+                            notion_url=notion_page_url(page.get("id", "")),
+                        )
                         print(
                             "Reject draft auto-send skipped (first-name mismatch): "
                             f"{candidate_name} <{candidate_email}> draft='{greeting_first_name}' "
-                            f"expected='{expected_first_name}'"
+                            f"reason='{failure_reason}'"
                         )
                     else:
                         sent_message_id = send_gmail_draft(gmail_service, reject_draft_id)
@@ -4962,6 +5185,11 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "forward_to_email": config.forward_to_email,
         "reject_delay_hours": config.reject_delay_hours,
         "reject_draft_auto_send_age_hours": config.reject_draft_auto_send_age_hours,
+        "name_verifier_provider": config.name_verifier_provider,
+        "name_verifier_model": config.name_verifier_model,
+        "name_verifier_configured": bool(
+            config.anthropic_api_key if config.name_verifier_provider != "openai" else config.openai_api_key
+        ),
         "no_response_wait_days": config.no_response_wait_days,
         "assignment_keywords": sorted(config.assignment_keywords),
         "sent_status_lookback_days": config.sent_status_lookback_days,
