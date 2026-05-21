@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import unicodedata
 import zipfile
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -176,6 +177,7 @@ class Config:
     scheduling_template: str
     no_response_template: str
     reject_delay_hours: int
+    reject_draft_auto_send_age_hours: int
     no_response_wait_days: int
     assignment_keywords: set[str]
     sent_status_lookback_days: int
@@ -444,6 +446,7 @@ def load_config() -> Config:
             os.getenv("RECRUITING_NO_RESPONSE_TEMPLATE", "").strip() or DEFAULT_NO_RESPONSE_TEMPLATE
         ),
         reject_delay_hours=parse_env_int("RECRUITING_REJECT_DELAY_HOURS", 24),
+        reject_draft_auto_send_age_hours=parse_env_int("RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS", 48),
         no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
         assignment_keywords=parse_csv_set(
             os.getenv("RECRUITING_ASSIGNMENT_KEYWORDS", ""), default=DEFAULT_ASSIGNMENT_KEYWORDS
@@ -1912,6 +1915,73 @@ def create_reply_draft(
         .execute()
     )
     return created.get("id", "")
+
+
+def get_gmail_draft(gmail_service, draft_id: str) -> dict[str, Any] | None:
+    if not draft_id:
+        return None
+    try:
+        return gmail_service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    except Exception:
+        return None
+
+
+def gmail_draft_created_at(draft: dict[str, Any]) -> datetime | None:
+    raw = str((draft.get("message") or {}).get("internalDate", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def gmail_draft_body_text(draft: dict[str, Any]) -> str:
+    message = draft.get("message") or {}
+    if not isinstance(message, dict):
+        return ""
+    return extract_message_body_text(message).strip()
+
+
+def send_gmail_draft(gmail_service, draft_id: str) -> str:
+    if not draft_id:
+        return ""
+    try:
+        sent = gmail_service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
+    except Exception:
+        return ""
+    return sent.get("id", "")
+
+
+def extract_greeting_first_name(body_text: str) -> str:
+    match = re.match(r"(?is)^\s*hi\s+([^,\n\r]+)\s*,", body_text or "")
+    if not match:
+        return ""
+    return clean_text(match.group(1))
+
+
+def normalize_first_name_for_verification(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", clean_text(value))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z]", "", ascii_text.lower())
+
+
+def verify_rejection_draft_first_name(
+    *,
+    draft_body: str,
+    candidate_name: str,
+    candidate_email: str,
+) -> tuple[bool, str, str]:
+    greeting_first_name = extract_greeting_first_name(draft_body)
+    expected_first_name = extract_first_name(candidate_name, candidate_email)
+    if not greeting_first_name or not expected_first_name:
+        return False, greeting_first_name, expected_first_name
+    return (
+        normalize_first_name_for_verification(greeting_first_name)
+        == normalize_first_name_for_verification(expected_first_name),
+        greeting_first_name,
+        expected_first_name,
+    )
 
 
 def thread_forward_already_sent(
@@ -3978,6 +4048,10 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     proceed_drafts = 0
     reject_scheduled = 0
     reject_drafts = 0
+    reject_drafts_auto_sent = 0
+    reject_drafts_auto_send_skipped_young = 0
+    reject_drafts_auto_send_skipped_name = 0
+    reject_drafts_auto_send_skipped_missing = 0
     reject_marked_sent = 0
     manual_reject_marked = 0
     reject_threads_archived = 0
@@ -4388,7 +4462,60 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         properties_schema[prop.decision_time], iso(decision_time)
                     )
 
-            if not reject_send_at:
+            if reject_draft_id and current_status == "reject drafted":
+                draft = get_gmail_draft(gmail_service, reject_draft_id)
+                draft_created_at = gmail_draft_created_at(draft or {})
+                now_utc = now.astimezone(timezone.utc)
+                if not draft:
+                    reject_drafts_auto_send_skipped_missing += 1
+                elif not draft_created_at:
+                    reject_drafts_auto_send_skipped_missing += 1
+                elif now_utc - draft_created_at < timedelta(hours=config.reject_draft_auto_send_age_hours):
+                    reject_drafts_auto_send_skipped_young += 1
+                else:
+                    draft_body = gmail_draft_body_text(draft)
+                    name_ok, greeting_first_name, expected_first_name = verify_rejection_draft_first_name(
+                        draft_body=draft_body,
+                        candidate_name=candidate_name,
+                        candidate_email=candidate_email,
+                    )
+                    if not name_ok:
+                        reject_drafts_auto_send_skipped_name += 1
+                        print(
+                            "Reject draft auto-send skipped (first-name mismatch): "
+                            f"{candidate_name} <{candidate_email}> draft='{greeting_first_name}' "
+                            f"expected='{expected_first_name}'"
+                        )
+                    else:
+                        sent_message_id = send_gmail_draft(gmail_service, reject_draft_id)
+                        if sent_message_id:
+                            reject_drafts_auto_sent += 1
+                            current_status = "rejected"
+                            if prop.status in properties_schema:
+                                update_payload[prop.status] = build_notion_value(
+                                    properties_schema[prop.status], "Rejected"
+                                )
+                            if prop.reject_draft_id in properties_schema:
+                                update_payload[prop.reject_draft_id] = build_notion_value(
+                                    properties_schema[prop.reject_draft_id], ""
+                                )
+                            if prop.reject_send_at in properties_schema:
+                                update_payload[prop.reject_send_at] = build_notion_value(
+                                    properties_schema[prop.reject_send_at], ""
+                                )
+                            archive_labels = [hiring_label_id]
+                            if pipeline_label_id:
+                                archive_labels.append(pipeline_label_id)
+                            archived_count, archive_failures = remove_labels_from_threads(
+                                gmail_service,
+                                thread_ids=related_thread_ids,
+                                label_ids=archive_labels,
+                            )
+                            reject_threads_archived += archived_count
+                            reject_archive_failures += archive_failures
+                        else:
+                            reject_drafts_auto_send_skipped_missing += 1
+            elif not reject_send_at:
                 reject_send_at = decision_time + timedelta(hours=config.reject_delay_hours)
                 reject_scheduled += 1
                 if prop.reject_send_at in properties_schema:
@@ -4477,6 +4604,10 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Proceed drafts created: {proceed_drafts}")
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
+    print(f"Reject drafts auto-sent: {reject_drafts_auto_sent}")
+    print(f"Reject drafts auto-send skipped (younger than threshold): {reject_drafts_auto_send_skipped_young}")
+    print(f"Reject drafts auto-send skipped (first-name mismatch): {reject_drafts_auto_send_skipped_name}")
+    print(f"Reject drafts auto-send skipped (missing draft): {reject_drafts_auto_send_skipped_missing}")
     print(f"Reject records marked sent: {reject_marked_sent}")
     print(f"Manual rejection sends auto-marked: {manual_reject_marked}")
     print(f"Rejected threads archived from ATS labels: {reject_threads_archived}")
@@ -4652,6 +4783,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "ats_follow_up_hour": ATS_FOLLOW_UP_HOUR,
         "forward_to_email": config.forward_to_email,
         "reject_delay_hours": config.reject_delay_hours,
+        "reject_draft_auto_send_age_hours": config.reject_draft_auto_send_age_hours,
         "no_response_wait_days": config.no_response_wait_days,
         "assignment_keywords": sorted(config.assignment_keywords),
         "sent_status_lookback_days": config.sent_status_lookback_days,

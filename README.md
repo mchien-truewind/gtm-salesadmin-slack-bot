@@ -384,3 +384,4 @@ Recommended repository variables:
 Behavior:
 - Runs every 10 minutes (`*/10 * * * *`) regardless of laptop sleep.
 - You can also trigger it manually from GitHub Actions via **Run workflow**.
+- Reject drafts are auto-sent only after the Gmail draft is at least 48 hours old (`RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS`) and the draft starts with the expected `Hi {{first name}},` greeting.
