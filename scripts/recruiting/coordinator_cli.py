@@ -1541,6 +1541,32 @@ def enrich_title_company_from_linkedin(linkedin_url: str, pdl_api_key: str) -> t
     return title, company
 
 
+def enrich_name_from_linkedin(linkedin_url: str, pdl_api_key: str) -> str:
+    if not linkedin_url or not pdl_api_key or requests is None:
+        return ""
+
+    endpoint = "https://api.peopledatalabs.com/v5/person/enrich"
+    params = {
+        "api_key": pdl_api_key,
+        "profile": linkedin_url,
+        "min_likelihood": 2,
+    }
+
+    try:
+        response = requests.get(endpoint, params=params, timeout=30)
+    except Exception:
+        return ""
+    if not response.ok:
+        return ""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return clean_candidate_name(str(data.get("full_name", "") or data.get("name", "") or ""))
+
+
 US_KEYWORDS = {
     "usa",
     "u.s.",
@@ -1966,22 +1992,166 @@ def normalize_first_name_for_verification(value: str) -> str:
     return re.sub(r"[^a-z]", "", ascii_text.lower())
 
 
-def verify_rejection_draft_first_name(
+def first_name_from_display_name(value: str) -> str:
+    cleaned = clean_candidate_name(value)
+    if not cleaned:
+        return ""
+    return extract_first_name(cleaned, "")
+
+
+def first_name_from_linkedin_url(value: str) -> str:
+    normalized = normalize_linkedin_url(value)
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        return ""
+    slug = path_parts[-1]
+    tokens = [token for token in re.split(r"[-_.%0-9]+", slug) if token and len(token) >= 2]
+    if not tokens:
+        return ""
+    return tokens[0].capitalize()
+
+
+def likely_resume_name_lines(resume_text: str) -> list[str]:
+    lines = [normalize_resume_line(line) for line in split_resume_lines(resume_text)]
+    candidates: list[str] = []
+    for line in lines[:12]:
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(token in lowered for token in {"resume", "curriculum", "experience", "education", "linkedin", "email"}):
+            continue
+        if re.search(r"[@:/]|(?:\+?\d[\d\s().-]{6,})", line):
+            continue
+        words = re.findall(r"[A-Za-z][A-Za-z'’-]+", line)
+        if 1 <= len(words) <= 4 and sum(1 for word in words if word[:1].isupper()) >= 1:
+            candidates.append(" ".join(words))
+    return candidates[:3]
+
+
+def first_names_from_resume_text(resume_text: str) -> list[str]:
+    return [extract_first_name(line, "") for line in likely_resume_name_lines(resume_text)]
+
+
+def candidate_email_display_first_names(
+    gmail_service,
     *,
-    draft_body: str,
+    thread_ids: list[str],
+    candidate_email: str,
+) -> list[str]:
+    names: list[str] = []
+    normalized_candidate_email = normalize_email(candidate_email)
+    for thread_id in thread_ids:
+        try:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        except Exception:
+            continue
+        for message in sorted_thread_messages(thread):
+            headers = header_map(message)
+            for header_name in ("from", "reply-to", "x-original-from", "x-original-sender"):
+                display_name, address = parseaddr(headers.get(header_name, ""))
+                if normalize_email(address) != normalized_candidate_email:
+                    continue
+                first_name = first_name_from_display_name(display_name)
+                if first_name:
+                    names.append(first_name)
+    return list(dict.fromkeys(names))
+
+
+def resume_first_names_from_threads(gmail_service, *, thread_ids: list[str]) -> list[str]:
+    names: list[str] = []
+    for thread_id in thread_ids:
+        try:
+            thread = gmail_service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+        except Exception:
+            continue
+        resume_reference = extract_primary_resume_part_from_thread(thread)
+        if not resume_reference:
+            continue
+        message_id, part = resume_reference
+        filename = (part.get("filename") or "resume").strip() or "resume"
+        raw = gmail_message_attachment_bytes(gmail_service, message_id, part)
+        if not raw:
+            continue
+        names.extend(first_names_from_resume_text(extract_resume_text(filename, raw)))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def build_rejection_first_name_evidence(
+    gmail_service,
+    *,
+    thread_ids: list[str],
     candidate_name: str,
     candidate_email: str,
+    linkedin_url: str,
+    pdl_api_key: str,
+) -> dict[str, list[str]]:
+    evidence: dict[str, list[str]] = {
+        "email": candidate_email_display_first_names(
+            gmail_service,
+            thread_ids=thread_ids,
+            candidate_email=candidate_email,
+        ),
+        "resume": resume_first_names_from_threads(gmail_service, thread_ids=thread_ids),
+        "linkedin": [],
+        "linkedin_slug": [],
+        "ats": [],
+    }
+    linkedin_profile_name = enrich_name_from_linkedin(linkedin_url, pdl_api_key)
+    linkedin_first_name = extract_first_name(linkedin_profile_name, "") if linkedin_profile_name else ""
+    if linkedin_first_name:
+        evidence["linkedin"].append(linkedin_first_name)
+    linkedin_slug_first_name = first_name_from_linkedin_url(linkedin_url)
+    if linkedin_slug_first_name:
+        evidence["linkedin_slug"].append(linkedin_slug_first_name)
+    ats_first_name = extract_first_name(candidate_name, candidate_email)
+    if ats_first_name:
+        evidence["ats"].append(ats_first_name)
+    return {source: list(dict.fromkeys(values)) for source, values in evidence.items()}
+
+
+def run_rejection_name_verification_agent(
+    *,
+    draft_body: str,
+    evidence: dict[str, list[str]],
 ) -> tuple[bool, str, str]:
     greeting_first_name = extract_greeting_first_name(draft_body)
-    expected_first_name = extract_first_name(candidate_name, candidate_email)
-    if not greeting_first_name or not expected_first_name:
-        return False, greeting_first_name, expected_first_name
-    return (
-        normalize_first_name_for_verification(greeting_first_name)
-        == normalize_first_name_for_verification(expected_first_name),
-        greeting_first_name,
-        expected_first_name,
-    )
+    normalized_greeting = normalize_first_name_for_verification(greeting_first_name)
+    if not normalized_greeting:
+        return False, greeting_first_name, "missing greeting"
+
+    strong_sources = ("email", "resume", "linkedin")
+    strong_expected: list[str] = []
+    for source in strong_sources:
+        strong_expected.extend(evidence.get(source, []))
+    normalized_strong = {
+        normalize_first_name_for_verification(name): name
+        for name in strong_expected
+        if normalize_first_name_for_verification(name)
+    }
+    if len(normalized_strong) > 1:
+        expected_summary = []
+        for source in ("email", "resume", "linkedin", "linkedin_slug", "ats"):
+            values = evidence.get(source, [])
+            if values:
+                expected_summary.append(f"{source}={','.join(values)}")
+        return False, greeting_first_name, "conflicting strong evidence: " + "; ".join(expected_summary)
+    if normalized_greeting in normalized_strong:
+        return True, greeting_first_name, f"{normalized_strong[normalized_greeting]} (email/resume/linkedin)"
+
+    ats_expected = [
+        name for name in evidence.get("ats", []) if normalize_first_name_for_verification(name)
+    ]
+    expected_summary = []
+    for source in ("email", "resume", "linkedin", "linkedin_slug", "ats"):
+        values = evidence.get(source, [])
+        if values:
+            expected_summary.append(f"{source}={','.join(values)}")
+    if not expected_summary and ats_expected:
+        expected_summary.append(f"ats={','.join(ats_expected)}")
+    return False, greeting_first_name, "; ".join(expected_summary) or "no email/resume/linkedin name evidence"
 
 
 def thread_forward_already_sent(
@@ -4088,6 +4258,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
         candidate_roles = page_role_values(page_props, prop)
         uses_custom_gpt_assignment = bool(CUSTOM_GPT_FIRST_ROUND_ROLES.intersection(candidate_roles))
         candidate_name = notion_prop_value(page_props.get(prop.candidate_name, {})).strip() or "Candidate"
+        linkedin_url = notion_prop_value(page_props.get(prop.linkedin_url, {})).strip()
 
         candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
         thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
@@ -4474,10 +4645,17 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     reject_drafts_auto_send_skipped_young += 1
                 else:
                     draft_body = gmail_draft_body_text(draft)
-                    name_ok, greeting_first_name, expected_first_name = verify_rejection_draft_first_name(
-                        draft_body=draft_body,
+                    name_evidence = build_rejection_first_name_evidence(
+                        gmail_service,
+                        thread_ids=related_thread_ids,
                         candidate_name=candidate_name,
                         candidate_email=candidate_email,
+                        linkedin_url=linkedin_url,
+                        pdl_api_key=config.pdl_api_key,
+                    )
+                    name_ok, greeting_first_name, expected_first_name = run_rejection_name_verification_agent(
+                        draft_body=draft_body,
+                        evidence=name_evidence,
                     )
                     if not name_ok:
                         reject_drafts_auto_send_skipped_name += 1
