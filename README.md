@@ -251,7 +251,9 @@ Workflow:
 - Ingest candidate emails + resumes from Gmail label.
 - Require subject format: `ROLE - CANDIDATE NAME` where `ROLE` is `BDR` or `Growth Generalist`.
 - Require subject prefix: `[hiring@]` before role/name.
+- Also ingest recruiter-sourced candidate submissions from `RECRUITING_RECRUITER_SENDER_EMAILS` without requiring the `[hiring@]` subject format.
 - Upload resumes to Google Drive folder and store resume links in Notion.
+- Set `Source` to `Inbound` for normal `[hiring@]` applicants and `Superposition` for recruiter submissions from Sam.
 - Set one `Career Stage` dropdown value (`Early`, `Mid`, `Late`).
 - Set `Role` column from subject (`BDR` / `Growth Generalist`).
 - Extract and store `LinkedIn URL`.

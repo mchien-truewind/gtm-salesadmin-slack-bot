@@ -142,6 +142,7 @@ _DOCLING_CHECKED = False
 class NotionPropertyMap:
     candidate_name: str = "Candidate Name"
     email: str = "Email"
+    source: str = "Source"
     role: str = "Role"
     resume_url: str = "Resume URL"
     career_stage: str = "Career Stage"
@@ -170,6 +171,7 @@ class Config:
     gmail_label_name: str
     gmail_query: str
     gmail_max_messages: int
+    recruiter_sender_emails: set[str]
     hiring_alias: str
     from_email: str
     proceed_template: str
@@ -391,6 +393,7 @@ def load_config() -> Config:
     property_map = NotionPropertyMap(
         candidate_name=os.getenv("RECRUITING_NOTION_PROP_CANDIDATE_NAME", "Candidate Name").strip(),
         email=os.getenv("RECRUITING_NOTION_PROP_EMAIL", "Email").strip(),
+        source=os.getenv("RECRUITING_NOTION_PROP_SOURCE", "Source").strip(),
         role=(
             os.getenv("RECRUITING_NOTION_PROP_ROLE_AT_TRUEWIND", "").strip()
             or os.getenv("RECRUITING_NOTION_PROP_ROLE", "").strip()
@@ -439,6 +442,10 @@ def load_config() -> Config:
         gmail_label_name=os.getenv("RECRUITING_GMAIL_LABEL", "hiring@").strip(),
         gmail_query=gmail_query,
         gmail_max_messages=parse_env_int("RECRUITING_GMAIL_MAX_MESSAGES", 250),
+        recruiter_sender_emails=parse_csv_set(
+            os.getenv("RECRUITING_RECRUITER_SENDER_EMAILS", ""),
+            default="sam.k@hitruewind.com",
+        ),
         hiring_alias=os.getenv("RECRUITING_HIRING_ALIAS", "").strip().lower(),
         from_email=from_email,
         proceed_template=(os.getenv("RECRUITING_PROCEED_TEMPLATE", "").strip() or DEFAULT_PROCEED_TEMPLATE),
@@ -3790,6 +3797,9 @@ def require_notion_property(
 
 
 ROLE_OPTIONS = ("BDR", "Growth Generalist", "AE", "Other")
+SOURCE_OPTIONS = ("Inbound", "Superposition")
+SOURCE_INBOUND = "Inbound"
+SOURCE_SUPERPOSITION = "Superposition"
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A")
 TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a"}
@@ -3875,6 +3885,41 @@ def ensure_status_property_schema(
     return notion.update_database({status_name: {"select": {"options": updated_options}}})
 
 
+def ensure_source_property_schema(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+) -> dict[str, Any]:
+    properties_schema = database_schema.get("properties", {})
+    source_name = prop_map.source
+    source_schema = properties_schema.get(source_name)
+    option_payload = [{"name": name} for name in SOURCE_OPTIONS]
+    if not source_schema:
+        return notion.update_database({source_name: {"select": {"options": option_payload}}})
+
+    source_type = source_schema.get("type")
+    if source_type == "select":
+        existing_options = [
+            {
+                "name": (item.get("name") or "").strip(),
+                "color": item.get("color", "default") or "default",
+            }
+            for item in (source_schema.get("select", {}) or {}).get("options", []) or []
+            if (item.get("name") or "").strip()
+        ]
+        existing_names = {item["name"] for item in existing_options}
+        missing = [name for name in SOURCE_OPTIONS if name not in existing_names]
+        if not missing:
+            return database_schema
+        updated_options = existing_options + [{"name": name, "color": "default"} for name in missing]
+        return notion.update_database({source_name: {"select": {"options": updated_options}}})
+
+    if source_type == "rich_text":
+        return notion.update_database({source_name: {"select": {"options": option_payload}}})
+
+    return database_schema
+
+
 def resolve_title_property_name(properties_schema: dict[str, Any], preferred: str) -> str:
     if preferred in properties_schema and properties_schema[preferred].get("type") == "title":
         return preferred
@@ -3905,6 +3950,11 @@ def resolve_property_map(prop_map: NotionPropertyMap, database_schema: dict[str,
             properties_schema,
             prop_map.candidate_name,
             ["Candidate Name", "Name"],
+        ),
+        source=resolve_property_name(
+            properties_schema,
+            prop_map.source,
+            ["Source"],
         ),
         role=resolve_property_name(
             properties_schema,
@@ -3985,6 +4035,7 @@ def upsert_candidate_page(
     *,
     candidate_name: str,
     candidate_email: str,
+    source: str,
     role: str,
     resume_url: str,
     career_stage: str,
@@ -4007,6 +4058,12 @@ def upsert_candidate_page(
     if page:
         # Existing ATS rows are manually curated in Notion. Avoid overwriting
         # profile fields during subsequent sync cycles.
+        props = page.get("properties", {})
+        existing_source = notion_prop_value(props.get(prop_map.source, {})).strip()
+        if not existing_source and prop_map.source in properties_schema:
+            built_source = build_notion_value(properties_schema[prop_map.source], source)
+            if built_source is not None:
+                notion.update_page(page["id"], {prop_map.source: built_source})
         return page["id"], False
 
     role_values: list[str] = [role] if role in ROLE_OPTIONS else []
@@ -4014,6 +4071,7 @@ def upsert_candidate_page(
     base_values: dict[str, Any] = {
         title_prop_name: candidate_name,
         prop_map.email: candidate_email,
+        prop_map.source: source,
         prop_map.role: role_values or role,
         prop_map.resume_url: resume_url,
         prop_map.career_stage: career_stage,
@@ -4042,6 +4100,52 @@ def upsert_candidate_page(
     return created["id"], True
 
 
+def backfill_missing_source_values(
+    notion: NotionClient,
+    database_schema: dict[str, Any],
+    prop_map: NotionPropertyMap,
+    gmail_service: Any,
+    *,
+    recruiter_sender_emails: set[str],
+) -> int:
+    properties_schema = database_schema.get("properties", {})
+    if prop_map.source not in properties_schema:
+        return 0
+
+    source_schema = properties_schema[prop_map.source]
+    updates = 0
+    for page in notion.query_pages({"page_size": 100}):
+        props = page.get("properties", {})
+        if notion_prop_value(props.get(prop_map.source, {})).strip():
+            continue
+
+        source = SOURCE_INBOUND
+        thread_id = notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip()
+        if thread_id:
+            try:
+                thread = gmail_service.users().threads().get(
+                    userId="me",
+                    id=thread_id,
+                    format="metadata",
+                    metadataHeaders=["From"],
+                ).execute()
+            except Exception:
+                thread = {}
+            for message in sorted_thread_messages(thread):
+                sender_email = normalize_email(parseaddr(header_map(message).get("from", ""))[1])
+                if sender_is_recruiter_submission(sender_email, recruiter_sender_emails):
+                    source = SOURCE_SUPERPOSITION
+                    break
+
+        built_source = build_notion_value(source_schema, source)
+        if built_source is None:
+            continue
+        notion.update_page(page["id"], {prop_map.source: built_source})
+        updates += 1
+
+    return updates
+
+
 def parse_candidate_from_message(
     message: dict[str, Any],
     *,
@@ -4054,6 +4158,79 @@ def parse_candidate_from_message(
     )
     subject = headers.get("subject", "").strip()
     return candidate_name, candidate_email, subject
+
+
+EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b")
+
+
+def sender_is_recruiter_submission(sender_email: str, recruiter_sender_emails: set[str]) -> bool:
+    return normalize_email(sender_email) in {normalize_email(item) for item in recruiter_sender_emails}
+
+
+def candidate_name_near_email(text: str, candidate_email: str) -> str:
+    if not text or not candidate_email:
+        return ""
+    idx = text.lower().find(candidate_email.lower())
+    if idx < 0:
+        return ""
+    before = text[max(0, idx - 160) : idx]
+    patterns = [
+        r"(?i)(?:candidate|name|applicant|from|contact)\s*[:\-]\s*([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})\s*$",
+        r"([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){0,3})\s*(?:<|\()?\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, before)
+        if match:
+            return clean_candidate_name(match.group(1))
+    return ""
+
+
+def parse_recruiter_candidate_from_thread(
+    thread: dict[str, Any],
+    *,
+    recruiter_sender_emails: set[str],
+    internal_domains: set[str],
+) -> tuple[str, str, str, str] | None:
+    messages = sorted_thread_messages(thread)
+    if not messages:
+        return None
+
+    recruiter_messages: list[dict[str, Any]] = []
+    for message in messages:
+        headers = header_map(message)
+        sender_email = normalize_email(parseaddr(headers.get("from", ""))[1])
+        if sender_is_recruiter_submission(sender_email, recruiter_sender_emails):
+            recruiter_messages.append(message)
+    if not recruiter_messages:
+        return None
+
+    message = recruiter_messages[0]
+    headers = header_map(message)
+    subject = headers.get("subject", "").strip()
+    body = "\n".join(extract_message_body_text(item) for item in recruiter_messages)
+    candidate_email = ""
+    excluded_emails = {normalize_email(item) for item in recruiter_sender_emails}
+    for email in EMAIL_RE.findall(body):
+        normalized = normalize_email(email)
+        if normalized in excluded_emails:
+            continue
+        if email_domain(normalized) in internal_domains:
+            continue
+        candidate_email = normalized
+        break
+
+    candidate_name = candidate_name_near_email(body, candidate_email)
+    if not candidate_name:
+        parsed_subject = clean_text(subject)
+        parsed_subject = re.sub(r"(?i)\b(?:fwd|fw|re)\s*:\s*", "", parsed_subject)
+        parsed_subject = re.sub(r"(?i)\b(?:candidate|applicant|application|resume|intro|introduction)\b", "", parsed_subject)
+        parsed_subject = re.sub(r"(?i)\b(?:bdr|sdr|ae|account executive|growth generalist|gtm associate|growth associate)\b", "", parsed_subject)
+        candidate_name = clean_candidate_name(parsed_subject.strip(" :-|"))
+    if not candidate_name and candidate_email:
+        candidate_name = candidate_name_from_email(candidate_email)
+
+    role = canonicalize_truewind_role(f"{subject}\n{body}")
+    return candidate_name, candidate_email, role, subject
 
 
 def email_domain(value: str) -> str:
@@ -4111,6 +4288,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     prop_map = resolve_property_map(config.property_map, database_schema)
     database_schema = ensure_role_property_schema(notion, database_schema, prop_map)
     database_schema = ensure_status_property_schema(notion, database_schema, prop_map)
+    database_schema = ensure_source_property_schema(notion, database_schema, prop_map)
     prop_map = resolve_property_map(config.property_map, database_schema)
 
     gmail_service = ensure_google_service(
@@ -4138,7 +4316,16 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     label_id = gmail_label_id(gmail_service, config.gmail_label_name)
     labeled_messages = list_label_messages(gmail_service, label_id, config.gmail_query, config.gmail_max_messages)
     subject_messages = list_messages_matching_query(gmail_service, config.gmail_query, config.gmail_max_messages)
-    messages = merge_gmail_message_refs(labeled_messages, subject_messages)
+    recruiter_messages: list[dict[str, Any]] = []
+    for sender_email in sorted(config.recruiter_sender_emails):
+        recruiter_messages.extend(
+            list_messages_matching_query(
+                gmail_service,
+                f"from:{sender_email}",
+                config.gmail_max_messages,
+            )
+        )
+    messages = merge_gmail_message_refs(labeled_messages, subject_messages, recruiter_messages)
 
     processed = 0
     created = 0
@@ -4167,21 +4354,31 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             skipped += 1
             continue
 
-        application_message = select_application_message_from_thread(
-            thread, internal_domains=internal_domains
-        )
-        if application_message is None:
-            skipped += 1
-            continue
-
-        candidate_name, candidate_email, subject = parse_candidate_from_message(
-            application_message,
+        recruiter_candidate = parse_recruiter_candidate_from_thread(
+            thread,
+            recruiter_sender_emails=config.recruiter_sender_emails,
             internal_domains=internal_domains,
         )
-        candidate_domain = email_domain(candidate_email)
-        if candidate_domain in internal_domains:
-            skipped += 1
-            continue
+        ats_source = SOURCE_SUPERPOSITION if recruiter_candidate else SOURCE_INBOUND
+        if recruiter_candidate:
+            candidate_name, candidate_email, recruiter_role, subject = recruiter_candidate
+            application_message = sorted_thread_messages(thread)[0]
+        else:
+            application_message = select_application_message_from_thread(
+                thread, internal_domains=internal_domains
+            )
+            if application_message is None:
+                skipped += 1
+                continue
+
+            candidate_name, candidate_email, subject = parse_candidate_from_message(
+                application_message,
+                internal_domains=internal_domains,
+            )
+            candidate_domain = email_domain(candidate_email)
+            if candidate_domain in internal_domains:
+                skipped += 1
+                continue
         if should_auto_archive_sender(candidate_email):
             remove_labels_from_thread(gmail_service, thread_id=thread_id, label_ids=[label_id])
             skipped += 1
@@ -4189,22 +4386,18 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         thread_body_text = "\n".join(extract_message_body_text(msg) for msg in thread_messages)
 
-        parsed_subject = parse_required_subject(subject, candidate_name)
-        if not parsed_subject:
-            skipped += 1
-            subject_format_skipped += 1
-            continue
-        role, subject_candidate_name = parsed_subject
-        candidate_name = subject_candidate_name
+        if recruiter_candidate:
+            role = recruiter_role
+        else:
+            parsed_subject = parse_required_subject(subject, candidate_name)
+            if not parsed_subject:
+                skipped += 1
+                subject_format_skipped += 1
+                continue
+            role, subject_candidate_name = parsed_subject
+            candidate_name = subject_candidate_name
         if role == "Unknown":
             role = canonicalize_truewind_role(thread_body_text)
-
-        if not candidate_email:
-            skipped += 1
-            continue
-        if config.hiring_alias and candidate_email == config.hiring_alias:
-            skipped += 1
-            continue
 
         resume_reference = extract_primary_resume_part_from_thread(thread)
         resume_part: dict[str, Any] | None = None
@@ -4222,6 +4415,30 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             resume_text = extract_resume_text(filename, raw)
         elif not resume_link and role == "Unknown":
             # If there is no resume content and no role signal, this is likely a non-applicant thread.
+            skipped += 1
+            continue
+
+        if not candidate_email and resume_text:
+            excluded_emails = {normalize_email(item) for item in config.recruiter_sender_emails}
+            for email in EMAIL_RE.findall(resume_text):
+                normalized = normalize_email(email)
+                if normalized in excluded_emails:
+                    continue
+                if email_domain(normalized) in internal_domains:
+                    continue
+                candidate_email = normalized
+                break
+        if (not candidate_name or candidate_name == "Unknown") and resume_text:
+            resume_names = likely_resume_name_lines(resume_text)
+            if resume_names:
+                candidate_name = clean_candidate_name(resume_names[0])
+        if not candidate_email:
+            skipped += 1
+            continue
+        if recruiter_candidate and not candidate_name:
+            skipped += 1
+            continue
+        if config.hiring_alias and candidate_email == config.hiring_alias:
             skipped += 1
             continue
 
@@ -4325,6 +4542,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             prop_map,
             candidate_name=candidate_name,
             candidate_email=candidate_email,
+            source=ats_source,
             role=role,
             resume_url=resume_url,
             career_stage=stage,
@@ -4344,8 +4562,9 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             created += 1
             created_candidates.append(
                 {
-                "candidate_name": candidate_name,
-                "role": role,
+                    "candidate_name": candidate_name,
+                    "source": ats_source,
+                    "role": role,
                     "current_title": current_title,
                     "company": company,
                     "career_stage": stage,
@@ -4358,6 +4577,14 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
             )
         else:
             updated += 1
+
+    source_backfilled = backfill_missing_source_values(
+        notion,
+        database_schema,
+        prop_map,
+        gmail_service,
+        recruiter_sender_emails=config.recruiter_sender_emails,
+    )
 
     if slack_enabled(config):
         running_in_github_actions = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
@@ -4374,6 +4601,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
     print(f"Processed messages: {processed}")
     print(f"Created Notion records: {created}")
     print(f"Updated Notion records: {updated}")
+    print(f"Backfilled Source values: {source_backfilled}")
     print(f"Skipped messages: {skipped}")
     print(f"Skipped (subject format mismatch): {subject_format_skipped}")
     if slack_enabled(config):
@@ -5133,6 +5361,7 @@ def schema_check_cmd(_args: argparse.Namespace) -> None:
     required = [
         title_prop_name,
         prop_map.email,
+        prop_map.source,
         prop_map.role,
         prop_map.resume_url,
         prop_map.career_stage,
@@ -5170,6 +5399,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "gmail_label": config.gmail_label_name,
         "gmail_query": config.gmail_query,
         "gmail_max_messages": config.gmail_max_messages,
+        "recruiter_sender_emails": sorted(config.recruiter_sender_emails),
         "from_email": config.from_email,
         "drive_folder_id_configured": bool(config.drive_folder_id),
         "slack_enabled": slack_enabled(config),
