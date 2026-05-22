@@ -134,7 +134,7 @@ const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
   U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
   U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
   U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
-  U0ABULY5TEK: { id: '87811681', name: 'Mercedes Chien' },
+  U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
 };
 
 function parseSlackOwnerMap() {

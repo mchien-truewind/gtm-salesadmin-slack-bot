@@ -203,7 +203,7 @@ function testGtmSlackUsersMapToHubSpotOwners() {
     ['U09QC3B292R', '84547076', 'Sarah Elix'],
     ['U04BPMPR29G', '559564379', 'Alex Lee'],
     ['U0B4MRN83FE', '92555980', 'Amy Vetter'],
-    ['U0ABULY5TEK', '87811681', 'Mercedes Chien'],
+    ['U0ABULY5TEK', '91143842', 'Jenilee Chen'],
   ];
 
   for (const [slackUserId, hubspotOwnerId, name] of expectedMappings) {
