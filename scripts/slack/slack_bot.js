@@ -31,6 +31,7 @@ const {
   formatEmptyDiscoveryDigestMessage,
   formatGrainTranscriptText,
   formatNoShowMeetingLabel,
+  getGrainParticipantEmails,
   getGrainRecordingId,
   getGrainRecordingStartMs,
   getGrainRecordingTitle,
@@ -74,6 +75,24 @@ const DEFAULT_HTTP_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 30
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || process.env.FIRECRAWL_KEY;
 const FIRECRAWL_API_BASE = (process.env.FIRECRAWL_API_BASE || 'https://api.firecrawl.dev/v1').replace(/\/$/, '');
 const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '43974586';
+const HUBSPOT_ACTIVITY_PROPERTIES = {
+  meetings: ['hs_meeting_title', 'hs_meeting_body', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hs_activity_type', 'hs_timestamp', 'hubspot_owner_id'],
+  calls: ['hs_call_title', 'hs_call_body', 'hs_call_disposition', 'hs_call_duration', 'hs_timestamp', 'hubspot_owner_id', 'hs_call_from_number', 'hs_call_to_number'],
+  emails: ['hs_email_subject', 'hs_email_text', 'hs_email_html', 'hs_email_from_email', 'hs_email_to_email', 'hs_timestamp', 'hubspot_owner_id'],
+  notes: ['hs_note_body', 'hs_timestamp', 'hubspot_owner_id'],
+  tasks: ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_task_priority', 'hs_timestamp', 'hubspot_owner_id'],
+};
+const HUBSPOT_OBJECT_TYPE_IDS = {
+  contacts: '0-1',
+  companies: '0-2',
+  deals: '0-3',
+  tickets: '0-5',
+  calls: '0-48',
+  emails: '0-49',
+  meetings: '0-47',
+  notes: '0-46',
+  tasks: '0-27',
+};
 
 const TRUEWIND_HUBSPOT = {
   pipeline: '105321581',
@@ -93,15 +112,29 @@ const TRUEWIND_HUBSPOT = {
     mercedes: { id: '87811681', name: 'Mercedes Chien' },
     'alex lee': { id: '559564379', name: 'Alex Lee' },
     alex: { id: '559564379', name: 'Alex Lee' },
+    'amy vetter': { id: '92555980', name: 'Amy Vetter' },
+    amy: { id: '92555980', name: 'Amy Vetter' },
     'aidan gleghorn': { id: '89053735', name: 'Aidan Gleghorn' },
     aidan: { id: '89053735', name: 'Aidan Gleghorn' },
     'noah salah': { id: '90960689', name: 'Noah Salah' },
     noah: { id: '90960689', name: 'Noah Salah' },
     'jenilee chen': { id: '91143842', name: 'Jenilee Chen' },
     jenilee: { id: '91143842', name: 'Jenilee Chen' },
+    'brendan moody': { id: '91143844', name: 'Brendan Moody' },
+    brendan: { id: '91143844', name: 'Brendan Moody' },
     'sarah elix': { id: '84547076', name: 'Sarah Elix' },
     sarah: { id: '84547076', name: 'Sarah Elix' },
   },
+};
+
+const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
+  U0ATZSNCE5T: { id: '91143842', name: 'Jenilee Chen' },
+  U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
+  U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
+  U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
+  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
+  U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
+  U0ABULY5TEK: { id: '87811681', name: 'Mercedes Chien' },
 };
 
 function parseSlackOwnerMap() {
@@ -115,7 +148,10 @@ function parseSlackOwnerMap() {
   }
 }
 
-const SLACK_TO_HUBSPOT_OWNER = parseSlackOwnerMap();
+const SLACK_TO_HUBSPOT_OWNER = {
+  ...DEFAULT_SLACK_TO_HUBSPOT_OWNER,
+  ...parseSlackOwnerMap(),
+};
 const hubspotContactPropertyCache = new Map();
 const hubspotPropertyCache = new Map();
 
@@ -700,6 +736,252 @@ async function createHubSpotAssociation(fromType, fromId, toType, toId, associat
     'PUT',
     [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId }]
   );
+}
+
+function normalizeDateInput(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const parsed = new Date(raw);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : '';
+}
+
+function parseGrainSearchDateRange(dateRange = {}) {
+  if (typeof dateRange === 'string') {
+    const trimmed = dateRange.trim();
+    if (!trimmed) return {};
+    const [startRaw, endRaw] = trimmed.split(/\s*(?:to|\.\.|,)\s*/i);
+    return {
+      start: normalizeDateInput(startRaw),
+      end: normalizeDateInput(endRaw),
+    };
+  }
+  if (!dateRange || typeof dateRange !== 'object') return {};
+  return {
+    start: normalizeDateInput(dateRange.start || dateRange.start_date || dateRange.after),
+    end: normalizeDateInput(dateRange.end || dateRange.end_date || dateRange.before),
+  };
+}
+
+function getGrainRecordingSearchText(recording) {
+  const participants = (recording?.participants || recording?.attendees || recording?.people || [])
+    .map((participant) => [
+      participant?.name,
+      participant?.email,
+      participant?.email_address,
+      participant?.company,
+      participant?.organization,
+    ].filter(Boolean).join(' '))
+    .join(' ');
+  return normalizeDigestText([
+    getGrainRecordingTitle(recording),
+    recording?.description,
+    recording?.calendar_event?.title,
+    recording?.calendar_event?.description,
+    participants,
+  ].filter(Boolean).join(' '));
+}
+
+function grainRecordingMatchesSearch(recording, { companyName = '', participantEmail = '', start = '', end = '' } = {}) {
+  const startMs = getGrainRecordingStartMs(recording);
+  const lowerBound = start ? new Date(start).getTime() : 0;
+  const upperBound = end ? new Date(end).getTime() : 0;
+  if (lowerBound && startMs && startMs < lowerBound) return false;
+  if (upperBound && startMs && startMs > upperBound) return false;
+
+  const normalizedCompany = normalizeDigestText(companyName);
+  const normalizedEmail = normalizeEmail(participantEmail);
+  const text = getGrainRecordingSearchText(recording);
+  const participantEmails = getGrainParticipantEmails(recording);
+
+  if ((lowerBound || upperBound) && !startMs) return false;
+  if (normalizedEmail && !participantEmails.includes(normalizedEmail) && !text.includes(normalizedEmail)) {
+    return false;
+  }
+  if (normalizedCompany) {
+    const companyTokens = normalizedCompany.split(/[^a-z0-9]+/).filter(token => token.length >= 3);
+    if (companyTokens.length && !companyTokens.every(token => text.includes(token))) return false;
+  }
+  return Boolean(normalizedCompany || normalizedEmail || start || end);
+}
+
+async function searchGrainRecordings(input = {}) {
+  if (!GRAIN_API_TOKEN) return { error: 'Grain not configured' };
+
+  const dateRange = parseGrainSearchDateRange(input.date_range || input.dateRange || {});
+  const search = {
+    companyName: input.company_name || input.companyName || '',
+    participantEmail: input.participant_email || input.participantEmail || '',
+    start: dateRange.start || '',
+    end: dateRange.end || '',
+  };
+  if (!search.companyName && !search.participantEmail && !search.start && !search.end) {
+    return { error: 'Provide company_name, participant_email, or date_range' };
+  }
+
+  const recordings = [];
+  let cursor = '';
+  const maxPagesRaw = Number(input.max_pages || process.env.GRAIN_SEARCH_MAX_PAGES || 20);
+  const pageSizeRaw = Number(input.page_size || process.env.GRAIN_SEARCH_PAGE_SIZE || 100);
+  const maxPages = Number.isFinite(maxPagesRaw) && maxPagesRaw > 0 ? Math.floor(maxPagesRaw) : 20;
+  const pageSizeNumber = Number.isFinite(pageSizeRaw) && pageSizeRaw > 0 ? Math.min(Math.floor(pageSizeRaw), 100) : 100;
+  const pageSize = String(pageSizeNumber);
+  let stoppedBecauseOfPageLimit = false;
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams({ limit: pageSize });
+    if (cursor && !cursor.startsWith('http')) params.set('cursor', cursor);
+    const endpoint = cursor && cursor.startsWith('http') ? cursor : `/recordings?${params}`;
+    const payload = await grainRequest(endpoint);
+    if (payload?.error) return { error: payload.error };
+
+    const { items, cursor: nextCursor, hasMore } = parseListItems(payload);
+    recordings.push(...items);
+    if (!hasMore || !nextCursor || items.length === 0) break;
+    if (page === maxPages - 1) {
+      stoppedBecauseOfPageLimit = true;
+      break;
+    }
+    cursor = nextCursor;
+  }
+
+  const limit = Math.min(Number(input.limit || 25), 50);
+  const matches = dedupeGrainRecordings(recordings)
+    .filter(recording => grainRecordingMatchesSearch(recording, search))
+    .sort((a, b) => getGrainRecordingStartMs(b) - getGrainRecordingStartMs(a))
+    .slice(0, limit);
+  return {
+    matches,
+    searched: recordings.length,
+    search,
+    coverage: {
+      method: 'client-side scan of accessible Grain recordings',
+      max_pages: maxPages,
+      page_size: pageSizeNumber,
+      truncated: stoppedBecauseOfPageLimit,
+      warning: stoppedBecauseOfPageLimit
+        ? 'Grain recording scan reached GRAIN_SEARCH_MAX_PAGES before exhausting available recordings. Results may be incomplete; state this limitation.'
+        : '',
+    },
+  };
+}
+
+function hubSpotObjectType(type) {
+  return HUBSPOT_OBJECT_TYPE_IDS[type] || type;
+}
+
+async function fetchHubSpotAssociationIds(fromType, fromId, toType, maxRecords = 500) {
+  const ids = [];
+  let after = '';
+  let truncated = false;
+  while (ids.length < maxRecords) {
+    const params = new URLSearchParams({ limit: String(Math.min(500, maxRecords - ids.length)) });
+    if (after) params.set('after', after);
+    const res = await hubspotRequest(`/crm/v4/objects/${hubSpotObjectType(fromType)}/${encodeURIComponent(fromId)}/associations/${hubSpotObjectType(toType)}?${params}`);
+    ids.push(...(res.results || []).map(item => String(item.toObjectId || item.id || '').trim()).filter(Boolean));
+    after = res.paging?.next?.after || '';
+    if (!after) break;
+  }
+  if (after) truncated = true;
+  return { ids, truncated };
+}
+
+function chunkArray(values, size) {
+  const chunks = [];
+  for (let i = 0; i < values.length; i += size) chunks.push(values.slice(i, i + size));
+  return chunks;
+}
+
+async function batchReadHubSpotObjects(objectType, ids, properties) {
+  const records = [];
+  for (const chunk of chunkArray(ids, 100)) {
+    const result = await hubspotRequest(`/crm/v3/objects/${hubSpotObjectType(objectType)}/batch/read`, 'POST', {
+      properties,
+      inputs: chunk.map(id => ({ id })),
+    });
+    records.push(...(result.results || []));
+  }
+  return records;
+}
+
+function parseBatchAssociationResults(result) {
+  const map = new Map();
+  for (const row of result?.results || []) {
+    const fromId = String(row.from?.id || row.fromObjectId || row.from?.fromObjectId || '').trim();
+    const toItems = Array.isArray(row.to) ? row.to : (Array.isArray(row.toObjectIds) ? row.toObjectIds : []);
+    const ids = toItems.map(item => String(item.toObjectId || item.id || item).trim()).filter(Boolean);
+    if (fromId) map.set(fromId, ids);
+  }
+  return map;
+}
+
+async function fetchBatchActivityContexts(type, ids) {
+  const contexts = new Map(ids.map(id => [id, {}]));
+  for (const toType of ['contacts', 'companies']) {
+    try {
+      for (const chunk of chunkArray(ids, 100)) {
+        const result = await hubspotRequest(`/crm/v4/associations/${hubSpotObjectType(type)}/${hubSpotObjectType(toType)}/batch/read`, 'POST', {
+          inputs: chunk.map(id => ({ id })),
+        });
+        const associatedByFromId = parseBatchAssociationResults(result);
+        for (const id of chunk) {
+          contexts.get(id)[toType] = { ids: associatedByFromId.get(id) || [], truncated: false };
+        }
+      }
+    } catch (err) {
+      for (const id of ids) {
+        contexts.get(id)[toType] = { error: err.message };
+      }
+    }
+  }
+  return contexts;
+}
+
+async function getHubSpotAssociatedActivities(input = {}) {
+  const dealId = String(input.deal_id || input.dealId || '').trim();
+  if (!dealId) return { error: 'deal_id is required' };
+
+  const requestedTypes = Array.isArray(input.activity_types) && input.activity_types.length
+    ? input.activity_types
+    : Object.keys(HUBSPOT_ACTIVITY_PROPERTIES);
+  const activityTypes = requestedTypes
+    .map(type => String(type || '').trim().toLowerCase())
+    .filter(type => HUBSPOT_ACTIVITY_PROPERTIES[type]);
+  const maxPerTypeRaw = Number(input.limit_per_type || 500);
+  const maxPerType = Number.isFinite(maxPerTypeRaw) && maxPerTypeRaw > 0 ? Math.min(Math.floor(maxPerTypeRaw), 500) : 500;
+  const activities = {};
+  const coverage = {};
+
+  for (const type of activityTypes) {
+    try {
+      const { ids, truncated } = await fetchHubSpotAssociationIds('deals', dealId, type, maxPerType);
+      coverage[type] = {
+        associated_count_returned: ids.length,
+        truncated,
+        warning: truncated ? `More than ${maxPerType} associated ${type} exist; returned the first ${maxPerType}.` : '',
+      };
+      activities[type] = [];
+      const activityIds = ids.slice(0, maxPerType);
+      const [records, activityContexts] = await Promise.all([
+        batchReadHubSpotObjects(type, activityIds, HUBSPOT_ACTIVITY_PROPERTIES[type]),
+        fetchBatchActivityContexts(type, activityIds),
+      ]);
+      const recordsById = new Map(records.map(record => [String(record.id || '').trim(), record]));
+      for (const id of activityIds) {
+        const record = recordsById.get(id) || { id, properties: {} };
+        activities[type].push({
+          id: String(record.id || id),
+          object_type: type,
+          url: hubspotRecordUrl(record.objectTypeId || HUBSPOT_OBJECT_TYPE_IDS[type] || type, record.id || id),
+          associations: activityContexts.get(id) || {},
+          properties: record.properties || {},
+        });
+      }
+    } catch (err) {
+      activities[type] = { error: err.message };
+      coverage[type] = { error: err.message };
+    }
+  }
+
+  return { deal_id: dealId, activities, coverage };
 }
 
 function mergeExistingContactUpdate({ proposed, existingProperties, explicitKeys }) {
@@ -1437,6 +1719,23 @@ const TOOLS = [
       required: ['from_type', 'from_id', 'to_type'],
     },
   },
+  {
+    name: 'hubspot_get_associated_activities',
+    description: 'Get HubSpot meetings, calls, emails, notes, and tasks associated to a deal. Use this for deal notes or summarize-the-deal requests before synthesizing the recap.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string', description: 'HubSpot deal ID' },
+        activity_types: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional activity types. Defaults to meetings, calls, emails, notes, and tasks.',
+        },
+        limit_per_type: { type: 'number', description: 'Max associated records to fetch per activity type (default 500, max 500). The response includes coverage.truncated if this cap is reached.' },
+      },
+      required: ['deal_id'],
+    },
+  },
   // --- Grain tools ---
   {
     name: 'grain_list_recordings',
@@ -1445,6 +1744,27 @@ const TOOLS = [
       type: 'object',
       properties: {
         limit: { type: 'number', description: 'Max recordings to return (default 10, max 50)' },
+      },
+    },
+  },
+  {
+    name: 'grain_search_recordings',
+    description: 'Search Grain recordings by company name, participant email, and/or date range. Use this for deal notes and deal summaries to find all relevant customer recordings before calling grain_get_recording for each match.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_name: { type: 'string', description: 'Company or account name to match against recording titles, event metadata, and participants.' },
+        participant_email: { type: 'string', description: 'Participant email to match exactly against Grain participants.' },
+        date_range: {
+          type: 'object',
+          properties: {
+            start_date: { type: 'string', description: 'Optional inclusive start date/time.' },
+            end_date: { type: 'string', description: 'Optional inclusive end date/time.' },
+          },
+          description: 'Optional date range for recordings.',
+        },
+        limit: { type: 'number', description: 'Max matches to return (default 25, max 50)' },
+        max_pages: { type: 'number', description: 'Optional max Grain recording-list pages to scan. The response includes coverage.truncated if the scan hits this cap.' },
       },
     },
   },
@@ -1608,6 +1928,11 @@ async function executeTool(name, input = {}) {
       const res = await hubspotRequest(`/crm/v4/objects/${input.from_type}/${input.from_id}/associations/${input.to_type}`);
       return JSON.stringify(res.results || []);
     }
+    if (name === 'hubspot_get_associated_activities') {
+      const result = await getHubSpotAssociatedActivities(input);
+      if (result.error) return `Error: ${result.error}`;
+      return JSON.stringify(result);
+    }
 
     // --- Grain ---
     if (name === 'grain_list_recordings') {
@@ -1622,6 +1947,22 @@ async function executeTool(name, input = {}) {
         participants: recording.participants || recording.attendees,
         transcript_url: getGrainRecordingUrl(recording),
       })));
+    }
+    if (name === 'grain_search_recordings') {
+      const result = await searchGrainRecordings(input);
+      if (result.error) return `Error: ${result.error}`;
+      return JSON.stringify({
+        searched: result.searched,
+        search: result.search,
+        coverage: result.coverage,
+        results: result.matches.map(recording => ({
+          id: getGrainRecordingId(recording),
+          title: getGrainRecordingTitle(recording),
+          date: getGrainRecordingStartMs(recording) ? new Date(getGrainRecordingStartMs(recording)).toISOString() : '',
+          participants: recording.participants || recording.attendees,
+          transcript_url: getGrainRecordingUrl(recording),
+        })),
+      });
     }
     if (name === 'grain_get_recording') {
       const detail = await fetchGrainRecordingDetail({ id: input.recording_id });
@@ -1709,6 +2050,43 @@ When the current message itself is a structured request to create a new deal wit
 When someone asks you to add, push, create, or update a prospect/lead/opportunity/deal in HubSpot, use hubspot_push_truewind_prospect. Do not manually chain the low-level HubSpot write tools unless the user asks for a custom one-off update.
 When someone asks you to add a note to an existing HubSpot deal/contact/company, use hubspot_create_note. If they give a company or deal name instead of an ID, search HubSpot first, choose the unambiguous matching record, then call hubspot_create_note with the matching record ID. Never say you lack a note tool; hubspot_create_note is available. Do not invent or share standalone note record URLs. HubSpot notes are activities on CRM records, so share the attached deal/contact/company record URL returned by the tool.
 
+### Deal notes and deal summaries
+When someone asks for "deal notes", "summarize the deal", "deal recap", or a similar recap for a company/deal, you are responsible for creating a comprehensive synthesis from available systems. Do not expect manual AE documentation, and do not say "no notes available" if Grain recordings or HubSpot activities exist.
+
+Required process:
+1. Find the deal in HubSpot by company/deal name using hubspot_search. If multiple deals match, choose only if unambiguous; otherwise ask a concise clarification.
+2. Get the deal details, including dealname, dealstage, amount, closedate, hubspot_owner_id, pipeline, hs_lastmodifieddate, createdate, and days-in-stage fields when available.
+3. Get all associated contacts with hubspot_get_associations, then hubspot_get each contact for firstname, lastname, email, jobtitle, company, phone, lastmodifieddate, and recent conversion/engagement fields when available.
+4. Get all associated HubSpot activity with hubspot_get_associated_activities for meetings, calls, emails, notes, and tasks. Even when a meeting has no internal notes, use participant, timing, title, and outcome context.
+5. Search Grain recordings with grain_search_recordings by company_name and by each associated contact's participant_email. Use a reasonable date_range if the deal has a createdate or close window. This tool scans accessible Grain recordings and returns coverage metadata; if Grain search is unavailable, returns an error, or coverage.truncated is true, explicitly state that limitation and do not present missing recordings as definitive.
+6. For every relevant Grain match, call grain_get_recording and read the transcript_text, summary, participants, and transcript_url. Extract pain points, requirements, objections, budget, timeline, competitors, technical requirements, decision criteria, and next steps from the transcript. Never rely only on recording titles.
+7. Synthesize patterns across HubSpot and Grain. Do not merely list raw activities.
+
+Deal recap output format:
+**Deal Snapshot**
+- Stage, amount, close date, owner, days in current stage when available.
+
+**Key Stakeholders & Engagement**
+- All contacts, roles, meeting participation frequency, and last interaction.
+
+**Current Situation**
+- Current status from latest activity and Grain conversations, last meeting discussion, and pending decisions.
+
+**Pain Points & Requirements**
+- Specific problems, must-have capabilities, and success criteria from transcripts.
+
+**Risks & Blockers**
+- Concerns, competitors, budget/approval challenges, and technical limits raised.
+
+**Deal Momentum**
+- Positive signals, negative/stalling signals, and engagement trend.
+
+**Immediate Action Items**
+- Next steps, owners/people to involve, upcoming meetings, deadlines.
+
+**Conversation History**
+- Chronological HubSpot and Grain history. Include Grain links for recordings and concise key points for emails/calls/meetings.
+
 Rules enforced by the backend tool:
 - Contact first, deal second. Contact is the anchor record.
 - Email is required. If email is missing, ask for it.
@@ -1733,9 +2111,11 @@ Key owner IDs:
 - Xavier Marco: 89305622
 - Mercedes Chien: 87811681
 - Alex Lee: 559564379
+- Amy Vetter: 92555980
 - Aidan Gleghorn: 89053735
 - Noah Salah: 90960689
 - Jenilee Chen: 91143842
+- Brendan Moody: 91143844
 - Sarah Elix: 84547076
 
 ## Grain
@@ -3065,6 +3445,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  TOOLS,
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
   classifyProgressDealSource,
@@ -3074,13 +3455,17 @@ module.exports = {
   extractStructuredBlockField,
   formatProspectWorkflowResponse,
   formatWorkflowError,
+  getSystemPrompt,
   getSlackMetadata,
+  grainRecordingMatchesSearch,
+  hubSpotObjectType,
   hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   normalizeHubSpotPropertyValue,
+  parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
   resolveHubSpotOwner,

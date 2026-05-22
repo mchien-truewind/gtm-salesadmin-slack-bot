@@ -12,6 +12,7 @@ process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
 });
 
 const {
+  TOOLS,
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
   classifyProgressDealSource,
@@ -19,11 +20,15 @@ const {
   executeTool,
   extractStructuredBlockField,
   formatProspectWorkflowResponse,
+  getSystemPrompt,
+  grainRecordingMatchesSearch,
+  hubSpotObjectType,
   hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
+  parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
   resolveHubSpotOwner,
@@ -190,9 +195,102 @@ async function testExplicitOwnerOverridesSlackMapping() {
   );
 }
 
+function testGtmSlackUsersMapToHubSpotOwners() {
+  const expectedMappings = [
+    ['U0ATZSNCE5T', '91143842', 'Jenilee Chen'],
+    ['U0AURH4KMRN', '91143844', 'Brendan Moody'],
+    ['U0AKMHVCJMA', '89305622', 'Xavier Marco'],
+    ['U09QC3B292R', '84547076', 'Sarah Elix'],
+    ['U04BPMPR29G', '559564379', 'Alex Lee'],
+    ['U0B4MRN83FE', '92555980', 'Amy Vetter'],
+    ['U0ABULY5TEK', '87811681', 'Mercedes Chien'],
+  ];
+
+  for (const [slackUserId, hubspotOwnerId, name] of expectedMappings) {
+    const owner = resolveHubSpotOwner({ slack_user_id: slackUserId });
+    assert.deepStrictEqual(owner, { id: hubspotOwnerId, name, source: 'from Slack tag' });
+    assert.deepStrictEqual(
+      isHubSpotWriteAuthorized({ slack_user_id: slackUserId }, owner),
+      { authorized: true, reason: 'Slack user maps to HubSpot owner' },
+    );
+  }
+}
+
 function testLeadSourceDefaultsToOutbound() {
   assert.strictEqual(deduceLeadSource('please create this outbound deal'), 'Outbound - Sales Sourced List');
   assert.strictEqual(deduceLeadSource(''), 'Outbound - Sales Sourced List');
+}
+
+function testDealNotesPromptAndTools() {
+  const toolNames = new Set(TOOLS.map((tool) => tool.name));
+  assert.strictEqual(toolNames.has('grain_search_recordings'), true);
+  assert.strictEqual(toolNames.has('grain_get_recording'), true);
+  assert.strictEqual(toolNames.has('hubspot_get_associated_activities'), true);
+  assert.strictEqual(hubSpotObjectType('meetings'), '0-47');
+  assert.strictEqual(hubSpotObjectType('calls'), '0-48');
+  assert.strictEqual(hubSpotObjectType('emails'), '0-49');
+  assert.strictEqual(hubSpotObjectType('tasks'), '0-27');
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'grain_search_recordings').input_schema.properties.max_pages.description,
+    /coverage\.truncated/,
+  );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_get_associated_activities').input_schema.properties.limit_per_type.description,
+    /coverage\.truncated/,
+  );
+
+  const prompt = getSystemPrompt();
+  assert.match(prompt, /Deal notes and deal summaries/);
+  assert.match(prompt, /Do not expect manual AE documentation/);
+  assert.match(prompt, /Never rely only on recording titles/);
+  assert.match(prompt, /coverage\.truncated/);
+  assert.match(prompt, /Pain Points & Requirements/);
+  assert.match(prompt, /Risks & Blockers/);
+}
+
+function testGrainSearchFilteringHelpers() {
+  assert.deepStrictEqual(
+    parseGrainSearchDateRange({ start_date: '2026-05-01', end_date: '2026-05-31' }),
+    { start: '2026-05-01T00:00:00.000Z', end: '2026-05-31T00:00:00.000Z' },
+  );
+
+  const recording = {
+    title: 'Sound Community Services discovery',
+    start_time: '2026-05-10T17:00:00.000Z',
+    participants: [
+      { name: 'Susan Hunter', email: 'susan@soundct.org', company: 'Sound Community Services' },
+      { name: 'Sarah Elix', email: 'sarah@trytruewind.com' },
+    ],
+  };
+
+  assert.strictEqual(
+    grainRecordingMatchesSearch(recording, {
+      companyName: 'Sound Community Services',
+      participantEmail: 'susan@soundct.org',
+      start: '2026-05-01T00:00:00.000Z',
+      end: '2026-05-31T00:00:00.000Z',
+    }),
+    true,
+  );
+  assert.strictEqual(
+    grainRecordingMatchesSearch(recording, {
+      companyName: 'Unrelated Company',
+      participantEmail: 'susan@soundct.org',
+    }),
+    false,
+  );
+  assert.strictEqual(
+    grainRecordingMatchesSearch(
+      { title: 'Sound Community Services discovery', participants: [{ email: 'susan@soundct.org' }] },
+      {
+        companyName: 'Sound Community Services',
+        participantEmail: 'susan@soundct.org',
+        start: '2026-05-01T00:00:00.000Z',
+        end: '2026-05-31T00:00:00.000Z',
+      },
+    ),
+    false,
+  );
 }
 
 function testDailyProgressUsesDealSourceProperty() {
@@ -259,7 +357,10 @@ async function run() {
   testStructuredNotesCanBeMultiline();
   testDealNoteBodyEscapesAndIncludesFields();
   await testExplicitOwnerOverridesSlackMapping();
+  testGtmSlackUsersMapToHubSpotOwners();
   testLeadSourceDefaultsToOutbound();
+  testDealNotesPromptAndTools();
+  testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();
 }
