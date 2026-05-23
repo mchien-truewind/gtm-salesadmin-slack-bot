@@ -22,6 +22,7 @@ const {
   formatProspectWorkflowResponse,
   getSystemPrompt,
   grainRecordingMatchesSearch,
+  hubSpotPipelineEndpoint,
   hubSpotObjectType,
   hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
@@ -31,6 +32,7 @@ const {
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   validateHubSpotProperties,
@@ -221,11 +223,31 @@ function testLeadSourceDefaultsToOutbound() {
   assert.strictEqual(deduceLeadSource(''), 'Outbound - Sales Sourced List');
 }
 
+function testDealOwnerResolution() {
+  assert.deepStrictEqual(
+    resolveDealHubSpotOwner({ owner_name: 'Sarah Elix', company: 'Acme' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' }),
+    { id: '84547076', name: 'Sarah Elix', source: 'explicit deal owner' },
+  );
+  assert.deepStrictEqual(
+    resolveDealHubSpotOwner({ owner_name: 'Mercedes Chien', company: 'Acme' }, { id: '89305622', name: 'Xavier Marco', source: 'from Slack tag' }),
+    { id: '89305622', name: 'Xavier Marco', source: 'requester is deal owner' },
+  );
+  const hashed = resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' });
+  assert.ok(['84547076', '89305622'].includes(hashed.id));
+  assert.deepStrictEqual(
+    resolveDealHubSpotOwner({ company: 'Hash Co', email: 'buyer@hashco.com' }, { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' }),
+    hashed,
+  );
+}
+
 function testDealNotesPromptAndTools() {
   const toolNames = new Set(TOOLS.map((tool) => tool.name));
   assert.strictEqual(toolNames.has('grain_search_recordings'), true);
   assert.strictEqual(toolNames.has('grain_get_recording'), true);
   assert.strictEqual(toolNames.has('hubspot_get_associated_activities'), true);
+  assert.strictEqual(toolNames.has('hubspot_get_pipeline'), true);
+  assert.strictEqual(hubSpotPipelineEndpoint(), '/crm/v3/pipelines/deals/105321581');
+  assert.strictEqual(hubSpotPipelineEndpoint('custom pipeline'), '/crm/v3/pipelines/deals/custom%20pipeline');
   assert.strictEqual(hubSpotObjectType('meetings'), '0-47');
   assert.strictEqual(hubSpotObjectType('calls'), '0-48');
   assert.strictEqual(hubSpotObjectType('emails'), '0-49');
@@ -238,6 +260,10 @@ function testDealNotesPromptAndTools() {
     TOOLS.find((tool) => tool.name === 'hubspot_get_associated_activities').input_schema.properties.limit_per_type.description,
     /coverage\.truncated/,
   );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_get_pipeline').input_schema.properties.pipeline_id.description,
+    /105321581/,
+  );
 
   const prompt = getSystemPrompt();
   assert.match(prompt, /Deal notes and deal summaries/);
@@ -246,6 +272,7 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /coverage\.truncated/);
   assert.match(prompt, /Pain Points & Requirements/);
   assert.match(prompt, /Risks & Blockers/);
+  assert.match(prompt, /hubspot_get_pipeline/);
 }
 
 function testGrainSearchFilteringHelpers() {
@@ -326,7 +353,8 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
     contact: { id: '221459934275', name: 'Deepak Rana', jobtitle: '' },
     company: { id: '54941778205', name: 'ThinkScan', created: false },
     deal: { id: '60316278406', name: 'ThinkScan - New Deal', created: true },
-    owner: { name: 'Xavier Marco', source: 'explicit owner' },
+    contactOwner: { id: '91143842', name: 'Jenilee Chen', source: 'from Slack tag' },
+    dealOwner: { id: '89305622', name: 'Xavier Marco', source: 'company split between Sarah/Xavier' },
     leadSource: 'Referral',
     note: { id: '12345' },
   });
@@ -334,6 +362,8 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
   assert.match(response, /Deal link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/60316278406/);
   assert.match(response, /Contact link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-1\/221459934275/);
   assert.match(response, /Company link: https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-2\/54941778205/);
+  assert.match(response, /Contact owner: Jenilee Chen \(from Slack tag\)/);
+  assert.match(response, /Deal owner: Xavier Marco \(company split between Sarah\/Xavier\)/);
   assert.match(response, /Note added to deal: 12345/);
 
   const failedNoteResponse = formatProspectWorkflowResponse({
@@ -359,6 +389,7 @@ async function run() {
   await testExplicitOwnerOverridesSlackMapping();
   testGtmSlackUsersMapToHubSpotOwners();
   testLeadSourceDefaultsToOutbound();
+  testDealOwnerResolution();
   testDealNotesPromptAndTools();
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();

@@ -105,6 +105,10 @@ const TRUEWIND_HUBSPOT = {
   defaultOutboundLeadSource: 'Outbound - Sales Sourced List',
   defaultOwnerId: '89305622',
   defaultOwnerName: 'Xavier Marco',
+  dealOwnerIds: {
+    sarah: '84547076',
+    xavier: '89305622',
+  },
   contactToCompanyAssociationTypeId: 279,
   dealToContactAssociationTypeId: 3,
   dealToCompanyAssociationTypeId: 341,
@@ -380,6 +384,42 @@ function resolveHubSpotOwner(input = {}) {
   };
 }
 
+function isAllowedDealOwner(owner = {}) {
+  const ownerId = String(owner.id || '').trim();
+  return ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.sarah || ownerId === TRUEWIND_HUBSPOT.dealOwnerIds.xavier;
+}
+
+function stableOwnerHash(value) {
+  const text = String(value || '').trim().toLowerCase();
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function resolveDealHubSpotOwner(input = {}, requesterOwner = null) {
+  const explicitOwner = resolveExplicitHubSpotOwner(input);
+  if (explicitOwner && isAllowedDealOwner(explicitOwner)) {
+    return { ...explicitOwner, source: 'explicit deal owner' };
+  }
+  if (requesterOwner && isAllowedDealOwner(requesterOwner)) {
+    return { ...requesterOwner, source: 'requester is deal owner' };
+  }
+
+  const assignmentKey = [
+    input.company,
+    input.company_name,
+    input.dealname,
+    input.email,
+    input.context,
+  ].filter(Boolean).join('|');
+  const useSarah = stableOwnerHash(assignmentKey) % 2 === 0;
+  return useSarah
+    ? { id: TRUEWIND_HUBSPOT.dealOwnerIds.sarah, name: 'Sarah Elix', source: 'company split between Sarah/Xavier' }
+    : { id: TRUEWIND_HUBSPOT.dealOwnerIds.xavier, name: 'Xavier Marco', source: 'company split between Sarah/Xavier' };
+}
+
 async function resolveHubSpotOwnerForProspect(input = {}) {
   const explicitOwner = resolveExplicitHubSpotOwner(input);
   if (explicitOwner) return explicitOwner;
@@ -406,6 +446,14 @@ async function resolveHubSpotOwnerForProspect(input = {}) {
   }
 
   return resolveHubSpotOwner(input);
+}
+
+async function resolveRequesterHubSpotOwnerForProspect(input = {}) {
+  return resolveHubSpotOwnerForProspect({
+    ...input,
+    owner_name: '',
+    owner: '',
+  });
 }
 
 function getSlackMetadata(input = {}) {
@@ -871,6 +919,11 @@ function hubSpotObjectType(type) {
   return HUBSPOT_OBJECT_TYPE_IDS[type] || type;
 }
 
+function hubSpotPipelineEndpoint(pipelineId = TRUEWIND_HUBSPOT.pipeline) {
+  const id = String(pipelineId || TRUEWIND_HUBSPOT.pipeline).trim() || TRUEWIND_HUBSPOT.pipeline;
+  return `/crm/v3/pipelines/deals/${encodeURIComponent(id)}`;
+}
+
 async function fetchHubSpotAssociationIds(fromType, fromId, toType, maxRecords = 500) {
   const ids = [];
   let after = '';
@@ -1149,8 +1202,9 @@ async function runStructuredDealCreateWorkflow(input) {
     return 'Error: missing Company. No HubSpot deal was created.';
   }
 
-  const owner = resolveHubSpotOwner({ owner_name: input.owner_name, context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
-  const authorization = isHubSpotWriteAuthorized(input, owner);
+  const contactOwner = resolveHubSpotOwner({ context: input.context, slack_user_id: input.slack_user_id, channel_id: input.channel_id });
+  const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
+  const authorization = isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
     return `Error: not authorized to write to HubSpot: ${authorization.reason}. No HubSpot deal was created.`;
   }
@@ -1171,7 +1225,7 @@ async function runStructuredDealCreateWorkflow(input) {
         lastname: nameParts.lastname,
         company: companyName,
         lead_source: leadSource,
-        hubspot_owner_id: owner.id,
+        hubspot_owner_id: contactOwner.id,
       }));
       contactRes = await hubspotRequest('/crm/v3/objects/contacts', 'POST', { properties: contactProps });
     }
@@ -1187,7 +1241,7 @@ async function runStructuredDealCreateWorkflow(input) {
       dealname: dealName,
       pipeline: TRUEWIND_HUBSPOT.pipeline,
       dealstage: input.dealstage || TRUEWIND_HUBSPOT.mqlDealStage,
-      hubspot_owner_id: owner.id,
+      hubspot_owner_id: dealOwner.id,
       deal_source: leadSource,
     }));
     const dealRes = await hubspotRequest('/crm/v3/objects/deals', 'POST', { properties: dealProps });
@@ -1250,6 +1304,8 @@ function shouldSetLifecycleToOpportunity(currentLifecycleStage) {
 }
 
 function formatProspectWorkflowResponse(summary) {
+  const contactOwner = summary.contactOwner || summary.owner || {};
+  const dealOwner = summary.dealOwner || summary.owner || contactOwner;
   const linkedinLine = summary.linkedinUrl
     ? `✓ LinkedIn found: ${summary.linkedinUrl}`
     : `✓ LinkedIn found: not found; used email/company fallback${summary.linkedinError ? ` (${summary.linkedinError})` : ''}`;
@@ -1265,9 +1321,15 @@ function formatProspectWorkflowResponse(summary) {
     `Deal link: ${dealUrl}`,
     `✓ Company ${summary.company.created ? 'created' : 'matched'}: ${summary.company.name} (ID: ${summary.company.id})`,
     `Company link: ${companyUrl}`,
-    `✓ Owner: ${summary.owner.name} (${summary.owner.source})`,
     `✓ Lead source: ${summary.leadSource}`,
   ];
+  if (contactOwner.name && dealOwner.name && (contactOwner.id !== dealOwner.id || contactOwner.name !== dealOwner.name)) {
+    lines.splice(-1, 0, `✓ Contact owner: ${contactOwner.name} (${contactOwner.source})`);
+    lines.splice(-1, 0, `✓ Deal owner: ${dealOwner.name} (${dealOwner.source})`);
+  } else if (dealOwner.name || contactOwner.name) {
+    const owner = dealOwner.name ? dealOwner : contactOwner;
+    lines.splice(-1, 0, `✓ Owner: ${owner.name} (${owner.source})`);
+  }
   if (summary.note?.id) {
     lines.push(`✓ Note added to deal: ${summary.note.id}`);
   } else if (summary.note?.error) {
@@ -1285,8 +1347,9 @@ async function runTruewindHubSpotProspectWorkflow(input) {
   const context = input.context || input.context_text || input.notes || '';
   const parsedName = parseNameFromEmail(email);
   const inferred = inferCompanyFromEmail(email);
-  const owner = await resolveHubSpotOwnerForProspect(input);
-  const authorization = isHubSpotWriteAuthorized(input, owner);
+  const contactOwner = await resolveRequesterHubSpotOwnerForProspect(input);
+  const dealOwner = resolveDealHubSpotOwner(input, contactOwner);
+  const authorization = isHubSpotWriteAuthorized(input, contactOwner);
   if (!authorization.authorized) {
     return `Not authorized to write to HubSpot: ${authorization.reason}. Ask an admin to set HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS or HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS, or map your Slack account to a HubSpot owner.`;
   }
@@ -1338,7 +1401,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       contact_type: contactType,
       erp,
       lead_source: leadSource,
-      hubspot_owner_id: owner.id,
+      hubspot_owner_id: contactOwner.id,
       ...linkedinProps,
     });
 
@@ -1381,7 +1444,7 @@ async function runTruewindHubSpotProspectWorkflow(input) {
       dealname: dealName,
       pipeline: TRUEWIND_HUBSPOT.pipeline,
       dealstage: TRUEWIND_HUBSPOT.mqlDealStage,
-      hubspot_owner_id: owner.id,
+      hubspot_owner_id: dealOwner.id,
       deal_source: leadSource,
       erp,
       amount: input.amount === undefined || input.amount === null ? '' : String(input.amount),
@@ -1440,7 +1503,8 @@ async function runTruewindHubSpotProspectWorkflow(input) {
         name: dealName,
         created: !existingDeal,
       },
-      owner,
+      contactOwner,
+      dealOwner,
       leadSource,
       note: noteSummary,
     });
@@ -1564,6 +1628,16 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'hubspot_get_pipeline',
+    description: 'Get HubSpot pipeline configuration with stage names and IDs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pipeline_id: { type: 'string', description: 'Pipeline ID (default: 105321581 for Active Pipeline)' },
+      },
     },
   },
   {
@@ -1854,6 +1928,15 @@ async function executeTool(name, input = {}) {
       const owners = (res.results || []).map(o => ({ id: o.id, email: o.email, firstName: o.firstName, lastName: o.lastName }));
       return JSON.stringify(owners);
     }
+    if (name === 'hubspot_get_pipeline') {
+      const res = await hubspotRequest(hubSpotPipelineEndpoint(input.pipeline_id));
+      return JSON.stringify({
+        id: res.id,
+        label: res.label,
+        displayOrder: res.displayOrder,
+        stages: res.stages || [],
+      });
+    }
     if (name === 'hubspot_push_truewind_prospect') {
       return await runTruewindHubSpotProspectWorkflow(input);
     }
@@ -2095,6 +2178,7 @@ Rules enforced by the backend tool:
 - Email is required. If email is missing, ask for it.
 - Company is required, but the tool can infer it from LinkedIn or a non-generic email domain. Only ask if the tool says company is unclear.
 - The tool searches Firecrawl for LinkedIn, stores the LinkedIn URL in Truewind's writable HubSpot LinkedIn contact property, creates or updates the contact, creates or matches a deal in pipeline 105321581 at MQL stage 1307720553, creates contact-company, deal-contact, and deal-company associations, then updates the contact to lifecycle opportunity and lead status internal value MQL (HubSpot label Converted).
+- When you need current Active Pipeline stage names or IDs, call hubspot_get_pipeline with pipeline_id 105321581 instead of relying on hardcoded stage labels.
 - Pass the full Slack request/thread in the context field so the backend can deduce lead source.
 - If the request includes notes, referral context, meeting-booked text, or deal/prospect type, pass notes, meeting_booked, and type into hubspot_push_truewind_prospect. The backend creates a HubSpot note object associated to the deal, contact, and company and reports the note ID or exact note error.
 - Pass channel_id and slack_user_id from Slack metadata on every HubSpot write tool call. The backend uses them for HubSpot write authorization and owner mapping. If the user explicitly names an owner, pass owner_name; explicit owner_name overrides Slack owner mapping. Otherwise it looks up the Slack user's HubSpot owner by Slack email, then uses any configured Slack mapping, otherwise defaults to Xavier.
@@ -3609,6 +3693,7 @@ module.exports = {
   getSystemPrompt,
   getSlackMetadata,
   grainRecordingMatchesSearch,
+  hubSpotPipelineEndpoint,
   hubSpotObjectType,
   hubspotPrimaryAssociatedRecordUrl,
   hubspotPropertyCache,
@@ -3619,6 +3704,7 @@ module.exports = {
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  resolveDealHubSpotOwner,
   runLeadStatusSyncForSlack,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
