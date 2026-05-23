@@ -375,6 +375,7 @@ Workflow:
 - Also ingest recruiter-sourced candidate submissions from `RECRUITING_RECRUITER_SENDER_EMAILS` without requiring the `[hiring@]` subject format.
 - Upload resumes to Google Drive folder and store resume links in Notion.
 - Set `Source` to `Inbound` for normal `[hiring@]` applicants and `Superposition` for recruiter submissions from Sam.
+- Skip new-applicant Slack review posts for `Superposition` candidates because they are already vetted.
 - Set one `Career Stage` dropdown value (`Early`, `Mid`, `Late`).
 - Set `Role` column from subject (`BDR` / `Growth Generalist`).
 - Extract and store `LinkedIn URL`.
@@ -425,7 +426,7 @@ Use `.env.recruiting.example` as the reference.
 4. Ensure People Data Labs API key is set for LinkedIn enrichment:
 - `PDL_API` (or `PDL_API_KEY`)
 5. Configure Slack review channel integration:
-- `SLACK_BOT_TOKEN` (or `SLACK_USER_TOKEN`)
+- `SLACK_BOT_TOKEN` (preferred; `SLACK_USER_TOKEN` is only a fallback)
 - `RECRUITING_SLACK_REVIEW_CHANNEL=hiring-review`
 - Optional: `RECRUITING_SLACK_REVIEW_CHANNEL_ID=<channel-id>` (recommended to avoid extra Slack API lookups)
 - Invite the Slack app/user token identity to `#hiring-review`
@@ -491,7 +492,7 @@ Required repository secrets:
 - `NOTION_ATS_DB_ID`
 - `GOOGLE_DRIVE_FOLDER_ATS`
 - `RECRUITING_FROM_EMAIL`
-- `SLACK_BOT_TOKEN` or `SLACK_USER_TOKEN`
+- `SLACK_BOT_TOKEN` (preferred) or `SLACK_USER_TOKEN`
 - `GOOGLE_GMAIL_CREDENTIALS_JSON`
 - `GOOGLE_GMAIL_TOKEN_JSON`
 - `GOOGLE_DRIVE_CREDENTIALS_JSON`
@@ -509,3 +510,4 @@ Behavior:
 - You can also trigger it manually from GitHub Actions via **Run workflow**.
 - Reject drafts are auto-sent only after the Gmail draft is at least 48 hours old (`RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS`), the `Hi {{first name}},` greeting matches strong email/resume/LinkedIn profile-name evidence, and an external verifier subagent (`RECRUITING_NAME_VERIFIER_PROVIDER`) explicitly approves. If the verifier fails or rejects, the draft is not sent and Slack is notified with the candidate email.
 - Railway recruiting worker builds should use `Dockerfile.recruiting`; the root `Dockerfile` is for the Slackbot service.
+- The ATS follow-up digest posts daily at 5 PM Pacific for non-terminal candidates, excluding `Reject Pending`.

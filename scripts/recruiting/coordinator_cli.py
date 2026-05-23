@@ -469,7 +469,7 @@ def load_config() -> Config:
         sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
         pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
-        slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"),
+        slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
         slack_review_channel=(
             os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL_ID", "").strip()
             or os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL", "hiring-review").strip().lstrip("#")
@@ -3327,6 +3327,9 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
     mention_prefix = f"<@{mention_user_id}> " if mention_user_id else ""
 
     for candidate in candidates:
+        if clean_text(candidate.get("source", "")).lower() == SOURCE_SUPERPOSITION.lower():
+            continue
+
         thread_id = candidate.get("thread_id", "").strip()
         if not thread_id:
             failed += 1
@@ -3416,6 +3419,9 @@ def collect_review_candidates_for_slack(
         status = notion_prop_value(props.get(prop_map.status, {})).strip().lower()
         if status and status != "awaiting decision":
             continue
+        source = notion_prop_value(props.get(prop_map.source, {})).strip()
+        if clean_text(source).lower() == SOURCE_SUPERPOSITION.lower():
+            continue
 
         thread_id = notion_prop_value(props.get(prop_map.gmail_thread_id, {})).strip()
         if not thread_id:
@@ -3424,6 +3430,7 @@ def collect_review_candidates_for_slack(
         candidates.append(
             {
                 "candidate_name": notion_prop_value(props.get(title_prop_name, {})).strip() or "Unknown",
+                "source": source,
                 "role": notion_prop_value(props.get(prop_map.role, {})).strip() or "Unknown",
                 "current_title": notion_prop_value(props.get(prop_map.current_title, {})).strip() or "Unknown",
                 "company": notion_prop_value(props.get(prop_map.company, {})).strip() or "Unknown",
@@ -3453,6 +3460,8 @@ def collect_active_candidates_for_weekly_slack(
         props = page.get("properties", {})
         status = notion_prop_value(props.get(prop_map.status, {})).strip() or "Awaiting Decision"
         if status_is_terminal(status):
+            continue
+        if should_exclude_from_active_digest(status):
             continue
         candidates.append(
             {
@@ -3515,7 +3524,7 @@ def post_weekly_active_candidates_digest(
     *,
     force: bool = False,
     record_slot: bool = True,
-    heading: str = "ATS follow-up",
+    heading: str = "Daily ATS follow-up",
 ) -> tuple[int, int]:
     if not slack_enabled(config):
         return 0, 0
@@ -3803,7 +3812,16 @@ SOURCE_SUPERPOSITION = "Superposition"
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
 STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A")
 TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a"}
-ATS_FOLLOW_UP_WEEKDAYS = {2: "Wednesday", 4: "Friday"}
+ATS_DIGEST_EXCLUDED_STATUSES = {"reject pending"}
+ATS_FOLLOW_UP_WEEKDAYS = {
+    0: "Monday",
+    1: "Tuesday",
+    2: "Wednesday",
+    3: "Thursday",
+    4: "Friday",
+    5: "Saturday",
+    6: "Sunday",
+}
 ATS_FOLLOW_UP_HOUR = 17
 ATS_FOLLOW_UP_SLOT_MARKER_PREFIX = "ATS_ACTIVE_REVIEW_SLOT:"
 
@@ -3822,6 +3840,10 @@ def notion_prop_values(prop: dict[str, Any]) -> list[str]:
 
 def status_is_terminal(status: str) -> bool:
     return clean_text(status).lower() in TERMINAL_STATUSES
+
+
+def should_exclude_from_active_digest(status: str) -> bool:
+    return clean_text(status).lower() in ATS_DIGEST_EXCLUDED_STATUSES
 
 
 def page_role_values(page_props: dict[str, Any], prop_map: NotionPropertyMap) -> set[str]:
@@ -5246,15 +5268,15 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Non-scheduling ATS threads archived from hiring label: {non_scheduling_threads_archived}")
     print(f"Non-scheduling ATS thread archive failures: {non_scheduling_archive_failures}")
     print(f"In Process records marked from pipeline label: {in_process_marked}")
-    weekly_review_posts, weekly_review_candidate_count = post_weekly_active_candidates_digest(
+    daily_review_posts, daily_review_candidate_count = post_weekly_active_candidates_digest(
         config,
         notion,
         database_schema,
         prop,
     )
     print(f"No response drafts created: {no_response_drafts}")
-    print(f"Weekly ATS follow-up posts created: {weekly_review_posts}")
-    print(f"Weekly ATS follow-up candidates included: {weekly_review_candidate_count}")
+    print(f"Daily ATS follow-up posts created: {daily_review_posts}")
+    print(f"Daily ATS follow-up candidates included: {daily_review_candidate_count}")
     print(f"Scheduling drafts created: {scheduling_drafts}")
 
 
@@ -5412,6 +5434,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "slack_forward_reactions": sorted(config.slack_forward_reactions),
         "ats_follow_up_weekdays": sorted(ATS_FOLLOW_UP_WEEKDAYS.values()),
         "ats_follow_up_hour": ATS_FOLLOW_UP_HOUR,
+        "ats_follow_up_excluded_statuses": sorted(ATS_DIGEST_EXCLUDED_STATUSES),
         "forward_to_email": config.forward_to_email,
         "reject_delay_hours": config.reject_delay_hours,
         "reject_draft_auto_send_age_hours": config.reject_draft_auto_send_age_hours,
