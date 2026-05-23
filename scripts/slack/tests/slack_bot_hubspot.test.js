@@ -272,7 +272,15 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /coverage\.truncated/);
   assert.match(prompt, /Pain Points & Requirements/);
   assert.match(prompt, /Risks & Blockers/);
-  assert.match(prompt, /hubspot_get_pipeline/);
+  assert.match(prompt, /HubSpot stage verification rule/);
+  assert.match(prompt, /ALWAYS call hubspot_get_pipeline with pipeline_id 105321581/);
+  assert.match(prompt, /Deal stages, stage names, or stage movements/);
+  assert.match(prompt, /Pipeline summaries or deal counts by stage/);
+  assert.match(prompt, /Any mention of S1, S2, S3, S4, S5, MQL, SQL, POC, Proposal/);
+  assert.match(prompt, /Questions about "where is \[deal name\]", deal status, or the current state of an opportunity/);
+  assert.match(prompt, /The only source of truth for stage configuration is the real-time API response from hubspot_get_pipeline/);
+  assert.match(prompt, /Critical HubSpot data freshness/);
+  assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
 }
 
 function testGrainSearchFilteringHelpers() {
