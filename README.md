@@ -427,6 +427,7 @@ Use `.env.recruiting.example` as the reference.
 - `PDL_API` (or `PDL_API_KEY`)
 5. Configure Slack review channel integration:
 - `SLACK_BOT_TOKEN` (preferred; `SLACK_USER_TOKEN` is only a fallback)
+- Optional: `SLACK_USER_TOKEN` can still be used for private-channel history/reaction reads while bot token handles posts.
 - `RECRUITING_SLACK_REVIEW_CHANNEL=hiring-review`
 - Optional: `RECRUITING_SLACK_REVIEW_CHANNEL_ID=<channel-id>` (recommended to avoid extra Slack API lookups)
 - Invite the Slack app/user token identity to `#hiring-review`

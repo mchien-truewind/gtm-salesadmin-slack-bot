@@ -190,6 +190,7 @@ class Config:
     pipeline_label_name: str
     pdl_api_key: str
     slack_token: str
+    slack_post_token: str
     slack_review_channel: str
     slack_mention_user_id: str
     slack_history_lookback_days: int
@@ -469,7 +470,13 @@ def load_config() -> Config:
         sent_status_lookback_days=parse_env_int("RECRUITING_SENT_STATUS_LOOKBACK_DAYS", 5),
         pipeline_label_name=os.getenv("RECRUITING_GMAIL_PIPELINE_LABEL", "hiring-pipeline").strip(),
         pdl_api_key=get_env_first("PDL_API", "PDL_API_KEY"),
-        slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_BOT_TOKEN", "SLACK_USER_TOKEN"),
+        slack_token=get_env_first("RECRUITING_SLACK_TOKEN", "SLACK_USER_TOKEN", "SLACK_BOT_TOKEN"),
+        slack_post_token=get_env_first(
+            "RECRUITING_SLACK_POST_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "RECRUITING_SLACK_TOKEN",
+            "SLACK_USER_TOKEN",
+        ),
         slack_review_channel=(
             os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL_ID", "").strip()
             or os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL", "hiring-review").strip().lstrip("#")
@@ -2310,13 +2317,13 @@ def notify_rejection_name_verification_failure(
     subagent_reason: str,
     notion_url: str,
 ) -> bool:
-    if not slack_enabled(config) or not draft_id:
+    if not slack_post_enabled(config) or not draft_id:
         return False
     already_notified = load_rejection_name_failure_notified_drafts(config.slack_state_file)
     if draft_id in already_notified:
         return False
     try:
-        client = SlackClient(config.slack_token)
+        client = slack_post_client(config)
         channel_id = client.resolve_channel_id(config.slack_review_channel)
     except Exception:
         return False
@@ -3221,6 +3228,14 @@ def slack_enabled(config: Config) -> bool:
     return bool(config.slack_token and config.slack_review_channel)
 
 
+def slack_post_enabled(config: Config) -> bool:
+    return bool((config.slack_post_token or config.slack_token) and config.slack_review_channel)
+
+
+def slack_post_client(config: Config) -> SlackClient:
+    return SlackClient(config.slack_post_token or config.slack_token)
+
+
 def load_slack_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -3302,10 +3317,10 @@ def load_recent_slack_posted_threads(config: Config, client: SlackClient, channe
 
 
 def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, str]]) -> tuple[int, int]:
-    if not candidates or not slack_enabled(config):
+    if not candidates or not slack_post_enabled(config):
         return 0, 0
 
-    client = SlackClient(config.slack_token)
+    client = slack_post_client(config)
     posted_threads = load_slack_posted_threads(config.slack_state_file)
     state_changed = False
     try:
@@ -3398,7 +3413,8 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
             posted += 1
             posted_threads.add(thread_id)
             state_changed = True
-        except Exception:
+        except Exception as exc:
+            print(f"Slack review post failed for thread {thread_id}: {exc}")
             failed += 1
 
     if state_changed:
@@ -3526,7 +3542,7 @@ def post_weekly_active_candidates_digest(
     record_slot: bool = True,
     heading: str = "Daily ATS follow-up",
 ) -> tuple[int, int]:
-    if not slack_enabled(config):
+    if not slack_post_enabled(config):
         return 0, 0
 
     candidates = collect_active_candidates_for_weekly_slack(notion, database_schema, prop_map)
@@ -3540,10 +3556,11 @@ def post_weekly_active_candidates_digest(
     if not force and slot_key in load_weekly_active_review_slots(config.slack_state_file):
         return 0, len(candidates)
 
-    client = SlackClient(config.slack_token)
+    client = slack_post_client(config)
     try:
         channel_id = client.resolve_channel_id(config.slack_review_channel)
-    except Exception:
+    except Exception as exc:
+        print(f"Daily ATS follow-up Slack post failed: {exc}")
         return 0, len(candidates)
     if not force and slack_history_has_weekly_active_review_slot(
         client,
@@ -3601,7 +3618,8 @@ def post_weekly_active_candidates_digest(
     )
     try:
         client.post_message(channel_id, fallback_text, blocks)
-    except Exception:
+    except Exception as exc:
+        print(f"Daily ATS follow-up Slack post failed: {exc}")
         return 0, len(candidates)
 
     if record_slot:
@@ -5425,6 +5443,7 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "from_email": config.from_email,
         "drive_folder_id_configured": bool(config.drive_folder_id),
         "slack_enabled": slack_enabled(config),
+        "slack_post_enabled": slack_post_enabled(config),
         "slack_review_channel": config.slack_review_channel,
         "slack_mention_user_configured": bool(config.slack_mention_user_id),
         "slack_history_lookback_days": config.slack_history_lookback_days,
