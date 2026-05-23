@@ -11,6 +11,7 @@ docs/logs/
 
 # Scratch
 /tmp/
+outputs/
 
 # Google Calendar helper
 .venv/
