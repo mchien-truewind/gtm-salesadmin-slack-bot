@@ -7,6 +7,7 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'test-key';
 process.env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'test-client';
 process.env.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'test-secret';
 process.env.GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || 'test-refresh';
+process.env.RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS = process.env.RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS || 'U_TEST';
 process.env.SLACK_TO_HUBSPOT_OWNER_JSON = JSON.stringify({
   U_TEST: { id: '89305622', name: 'Xavier Marco' },
 });
@@ -15,6 +16,7 @@ const {
   TOOLS,
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
+  buildRecruitingCalendarInvite,
   classifyProgressDealSource,
   deduceLeadSource,
   dealEnteredStageInRange,
@@ -30,6 +32,7 @@ const {
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
+  isRecruitingCalendarWriteAuthorized,
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
@@ -249,6 +252,7 @@ function testDealNotesPromptAndTools() {
   assert.strictEqual(toolNames.has('hubspot_get_associated_activities'), true);
   assert.strictEqual(toolNames.has('hubspot_get_pipeline'), true);
   assert.strictEqual(toolNames.has('hubspot_count_deals_entered_stage'), true);
+  assert.strictEqual(toolNames.has('recruiting_create_calendar_invite'), true);
   assert.strictEqual(hubSpotPipelineEndpoint(), '/crm/v3/pipelines/deals/105321581');
   assert.strictEqual(hubSpotPipelineEndpoint('custom pipeline'), '/crm/v3/pipelines/deals/custom%20pipeline');
   assert.strictEqual(hubSpotObjectType('meetings'), '0-47');
@@ -290,6 +294,42 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
   assert.match(prompt, /hubspot_count_deals_entered_stage/);
   assert.match(prompt, /Do not use createdate, current dealstage only, or hs_date_entered_\{stageId\}/);
+  assert.match(prompt, /Recruiting calendar scheduling/);
+  assert.match(prompt, /recruiting_create_calendar_invite/);
+}
+
+function testRecruitingCalendarInviteBuilderAndAuthorization() {
+  assert.deepStrictEqual(
+    isRecruitingCalendarWriteAuthorized({ slack_user_id: 'U_TEST' }),
+    { authorized: true, reason: 'Slack user explicitly allowed for recruiting calendar writes' },
+  );
+  assert.strictEqual(
+    isRecruitingCalendarWriteAuthorized({ slack_user_id: 'U_OTHER' }).authorized,
+    false,
+  );
+
+  const payload = buildRecruitingCalendarInvite({
+    candidate_email: 'Candidate@Example.com',
+    candidate_name: 'Casey Candidate',
+    start_datetime: '2026-05-28T14:00:00-07:00',
+    duration_minutes: 20,
+    channel_id: 'C123',
+    thread_ts: '1770000000.000100',
+  });
+
+  assert.strictEqual(payload.calendarId, 'primary');
+  assert.strictEqual(payload.conferenceDataVersion, 1);
+  assert.strictEqual(payload.sendUpdates, 'all');
+  assert.strictEqual(payload.event.summary, 'Truewind Intro Call - Casey Candidate');
+  assert.deepStrictEqual(payload.event.attendees, [{ email: 'candidate@example.com' }]);
+  assert.strictEqual(payload.event.start.dateTime, '2026-05-28T14:00:00-07:00');
+  assert.strictEqual(payload.event.end.dateTime, '2026-05-28T21:20:00Z');
+  assert.strictEqual(payload.event.conferenceData.createRequest.conferenceSolutionKey.type, 'hangoutsMeet');
+
+  assert.throws(
+    () => buildRecruitingCalendarInvite({ candidate_email: 'candidate@example.com', start_datetime: '2026-05-28T14:00:00' }),
+    /ISO datetime with timezone/,
+  );
 }
 
 function testHubSpotStageHistoryHelpers() {
@@ -461,6 +501,7 @@ async function run() {
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();
+  testRecruitingCalendarInviteBuilderAndAuthorization();
   testHubSpotStageHistoryHelpers();
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();

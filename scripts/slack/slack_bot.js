@@ -169,6 +169,14 @@ function parseDelimitedEnvSet(name) {
 const HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS');
 const HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS');
 const HUBSPOT_WRITE_REQUIRE_AUTH = process.env.HUBSPOT_WRITE_REQUIRE_AUTH !== 'false';
+const RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS');
+const RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS');
+const RECRUITING_CALENDAR_REQUIRE_AUTH = process.env.RECRUITING_CALENDAR_REQUIRE_AUTH !== 'false';
+const DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID = (
+  process.env.RECRUITING_SLACK_MENTION_USER_ID
+  || process.env.SLACK_USER_ID
+  || 'U0ABULY5TEK'
+).trim();
 
 function createSlackApp() {
   if (require.main !== module) {
@@ -228,6 +236,205 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
     req.on('error', reject);
     if (body) req.write(JSON.stringify(body));
     req.end();
+  });
+}
+
+function resolveCredentialPath(envVar, defaultPath) {
+  return path.resolve(__dirname, '../..', process.env[envVar] || defaultPath);
+}
+
+function loadJsonCredential({ jsonEnv, fileEnv, defaultFile, label }) {
+  const raw = process.env[jsonEnv];
+  if (raw && raw.trim()) {
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`Invalid ${jsonEnv}: ${err.message}`);
+    }
+  }
+
+  const credentialPath = resolveCredentialPath(fileEnv, defaultFile);
+  if (!fs.existsSync(credentialPath)) {
+    throw new Error(`Missing ${label}. Set ${jsonEnv} or ${fileEnv}, or place it at ${credentialPath}`);
+  }
+  return JSON.parse(fs.readFileSync(credentialPath, 'utf8'));
+}
+
+function createCalendarOAuthClient() {
+  const token = loadJsonCredential({
+    jsonEnv: 'GOOGLE_CALENDAR_TOKEN_JSON',
+    fileEnv: 'GOOGLE_CALENDAR_TOKEN_FILE',
+    defaultFile: 'secrets/google-calendar-token.json',
+    label: 'Google Calendar OAuth token',
+  });
+  let credentials = {};
+  try {
+    credentials = loadJsonCredential({
+      jsonEnv: 'GOOGLE_CALENDAR_CREDENTIALS_JSON',
+      fileEnv: 'GOOGLE_CALENDAR_CREDENTIALS_FILE',
+      defaultFile: 'secrets/google-calendar-credentials.json',
+      label: 'Google Calendar OAuth client credentials',
+    });
+  } catch {
+    credentials = {};
+  }
+
+  const installed = credentials.installed || credentials.web || {};
+  const clientId = token.client_id || installed.client_id || process.env.GOOGLE_CALENDAR_CLIENT_ID || process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = token.client_secret || installed.client_secret || process.env.GOOGLE_CALENDAR_CLIENT_SECRET || process.env.GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error('Missing Google Calendar OAuth client_id/client_secret in token, credentials file, or environment.');
+  }
+
+  const auth = new google.auth.OAuth2(clientId, clientSecret, 'http://localhost');
+  auth.setCredentials({
+    access_token: token.access_token || token.token,
+    refresh_token: token.refresh_token,
+    scope: token.scope,
+    token_type: token.token_type,
+    expiry_date: token.expiry_date,
+  });
+  return auth;
+}
+
+function isRecruitingCalendarWriteAuthorized(input = {}) {
+  if (!RECRUITING_CALENDAR_REQUIRE_AUTH) {
+    return { authorized: true, reason: 'calendar write auth disabled' };
+  }
+  const slackUserId = String(input.slack_user_id || input.slackUserId || '').trim();
+  const channelId = String(input.channel_id || input.channelId || '').trim();
+
+  if (slackUserId && RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS.has(slackUserId)) {
+    return { authorized: true, reason: 'Slack user explicitly allowed for recruiting calendar writes' };
+  }
+  if (
+    slackUserId
+    && RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS.size === 0
+    && slackUserId === DEFAULT_RECRUITING_CALENDAR_SLACK_USER_ID
+  ) {
+    return { authorized: true, reason: 'default recruiting Slack reviewer is allowed' };
+  }
+  if (channelId && RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS.has(channelId)) {
+    return { authorized: true, reason: 'Slack channel allowed for recruiting calendar writes' };
+  }
+  return {
+    authorized: false,
+    reason: 'Slack user/channel is not allowed for recruiting calendar writes. Set RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS or RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS.',
+  };
+}
+
+function parseCalendarIsoWithZone(value, fieldName) {
+  const text = String(value || '').trim();
+  if (!text) throw new Error(`${fieldName} is required`);
+  if (!/T/.test(text) || !/(Z|[+-]\d{2}:\d{2})$/.test(text)) {
+    throw new Error(`${fieldName} must be ISO datetime with timezone, e.g. 2026-05-28T14:00:00-07:00`);
+  }
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw new Error(`${fieldName} is not a valid datetime`);
+  return { text, date };
+}
+
+function isoWithoutMillis(date) {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+function buildRecruitingCalendarInvite(input = {}) {
+  const candidateEmail = normalizeEmail(input.candidate_email || input.email || input.attendee_email);
+  if (!isValidEmail(candidateEmail)) throw new Error('candidate_email is required and must be a valid email');
+  const candidateName = String(input.candidate_name || input.name || '').trim();
+  const start = parseCalendarIsoWithZone(input.start_datetime || input.start_at || input.start, 'start_datetime');
+  const durationMinutes = Math.min(Math.max(Number(input.duration_minutes || 20), 5), 180);
+  const end = input.end_datetime || input.end_at || input.end
+    ? parseCalendarIsoWithZone(input.end_datetime || input.end_at || input.end, 'end_datetime')
+    : { date: new Date(start.date.getTime() + durationMinutes * 60000) };
+  if (end.date <= start.date) throw new Error('end_datetime must be after start_datetime');
+
+  const timezone = String(
+    input.timezone
+    || process.env.RECRUITING_SCHEDULING_TIMEZONE
+    || process.env.GOOGLE_CALENDAR_DEFAULT_TIMEZONE
+    || 'America/Los_Angeles'
+  ).trim();
+  const calendarId = String(
+    input.calendar_id
+    || process.env.RECRUITING_CALENDAR_ID
+    || process.env.GOOGLE_CALENDAR_DEFAULT_CALENDAR_ID
+    || 'primary'
+  ).trim();
+  const sendUpdates = String(input.send_updates || process.env.GOOGLE_CALENDAR_SEND_UPDATES || 'all').trim();
+  if (!['all', 'externalOnly', 'none'].includes(sendUpdates)) {
+    throw new Error('send_updates must be all, externalOnly, or none');
+  }
+
+  const summary = String(
+    input.title
+    || input.summary
+    || `Truewind Intro Call - ${candidateName || candidateEmail}`
+  ).trim();
+  const extraAttendees = Array.isArray(input.extra_attendees)
+    ? input.extra_attendees.map(normalizeEmail).filter(isValidEmail)
+    : [];
+  const attendeeEmails = Array.from(new Set([candidateEmail, ...extraAttendees]));
+  const descriptionParts = [
+    String(input.description || '').trim(),
+    'Scheduled from Slack by Truewind recruiting coordinator.',
+  ].filter(Boolean);
+  const requestSeed = [
+    input.channel_id || '',
+    input.thread_ts || '',
+    candidateEmail,
+    start.text,
+    summary,
+  ].join('|');
+
+  return {
+    calendarId,
+    conferenceDataVersion: input.with_meet === false ? 0 : 1,
+    sendUpdates,
+    event: {
+      summary,
+      description: descriptionParts.join('\n\n'),
+      start: { dateTime: start.text, timeZone: timezone },
+      end: { dateTime: end.text || isoWithoutMillis(end.date), timeZone: timezone },
+      attendees: attendeeEmails.map((email) => ({ email })),
+      ...(input.with_meet === false ? {} : {
+        conferenceData: {
+          createRequest: {
+            requestId: crypto.createHash('sha256').update(requestSeed).digest('hex').slice(0, 32),
+            conferenceSolutionKey: { type: 'hangoutsMeet' },
+          },
+        },
+      }),
+    },
+  };
+}
+
+async function createRecruitingCalendarInvite(input = {}) {
+  const authorization = isRecruitingCalendarWriteAuthorized(input);
+  if (!authorization.authorized) {
+    return `Error: not authorized to create recruiting calendar invite: ${authorization.reason}`;
+  }
+  const payload = buildRecruitingCalendarInvite(input);
+  const calendar = google.calendar({ version: 'v3', auth: createCalendarOAuthClient() });
+  const created = await calendar.events.insert({
+    calendarId: payload.calendarId,
+    body: payload.event,
+    conferenceDataVersion: payload.conferenceDataVersion,
+    sendUpdates: payload.sendUpdates,
+  });
+  const event = created.data || {};
+  const meetUrl = (event.conferenceData?.entryPoints || [])
+    .find((entry) => entry.entryPointType === 'video')?.uri || '';
+  return JSON.stringify({
+    id: event.id || '',
+    summary: event.summary || payload.event.summary,
+    htmlLink: event.htmlLink || '',
+    meetUrl,
+    start: event.start || payload.event.start,
+    end: event.end || payload.event.end,
+    attendees: (event.attendees || payload.event.attendees || []).map((attendee) => attendee.email).filter(Boolean),
+    calendarId: payload.calendarId,
+    sendUpdates: payload.sendUpdates,
   });
 }
 
@@ -1972,6 +2179,32 @@ const TOOLS = [
       required: ['deal_id'],
     },
   },
+  // --- Recruiting calendar tools ---
+  {
+    name: 'recruiting_create_calendar_invite',
+    description: 'Create a Google Calendar invite with Google Meet for a recruiting interview. Use only when the Slack user asks to schedule/book a recruiting interview or first-round call and provides a concrete candidate email plus exact date/time. If the user gives a natural-language time, convert it to ISO with timezone before calling. Ask for missing email or exact time before using this tool.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        candidate_email: { type: 'string', description: 'Candidate email address. Required.' },
+        candidate_name: { type: 'string', description: 'Candidate name when known.' },
+        start_datetime: { type: 'string', description: 'Interview start as ISO datetime with timezone, e.g. 2026-05-28T14:00:00-07:00. Required.' },
+        end_datetime: { type: 'string', description: 'Optional end as ISO datetime with timezone. Omit to use duration_minutes.' },
+        duration_minutes: { type: 'number', description: 'Duration when end_datetime is omitted. Default 20.' },
+        title: { type: 'string', description: 'Optional calendar title. Defaults to Truewind Intro Call - candidate.' },
+        description: { type: 'string', description: 'Optional event description.' },
+        timezone: { type: 'string', description: 'IANA timezone for display, default America/Los_Angeles.' },
+        calendar_id: { type: 'string', description: 'Calendar ID. Defaults to RECRUITING_CALENDAR_ID, GOOGLE_CALENDAR_DEFAULT_CALENDAR_ID, then primary.' },
+        send_updates: { type: 'string', description: 'Google notification behavior: all, externalOnly, or none. Default all.' },
+        with_meet: { type: 'boolean', description: 'Whether to create a Google Meet link. Default true.' },
+        extra_attendees: { type: 'array', items: { type: 'string' }, description: 'Optional additional attendee emails.' },
+        channel_id: { type: 'string', description: 'Slack channel_id from metadata for calendar write authorization.' },
+        slack_user_id: { type: 'string', description: 'Slack user_id from metadata for calendar write authorization.' },
+        thread_ts: { type: 'string', description: 'Slack thread_ts from metadata for idempotent Meet request IDs.' },
+      },
+      required: ['candidate_email', 'start_datetime'],
+    },
+  },
   // --- Grain tools ---
   {
     name: 'grain_list_recordings',
@@ -2182,6 +2415,9 @@ async function executeTool(name, input = {}) {
       if (result.error) return `Error: ${result.error}`;
       return JSON.stringify(result);
     }
+    if (name === 'recruiting_create_calendar_invite') {
+      return await createRecruitingCalendarInvite(input);
+    }
 
     // --- Grain ---
     if (name === 'grain_list_recordings') {
@@ -2369,6 +2605,17 @@ Lead source deduction:
 - "webinar" -> Webinar
 - "referred by" -> Referral
 - default -> Outbound - Sales Sourced List
+
+## Recruiting calendar scheduling
+When someone asks you to schedule, book, or create an invite for a recruiting interview, first-round call, intro call, or candidate screen, use recruiting_create_calendar_invite.
+- Only use it for recruiting/interview scheduling. For customer sales meetings, do not use this tool unless the user explicitly says it is a recruiting interview.
+- Required fields: candidate email and exact start time.
+- If candidate email is missing, ask for the email.
+- If the time is ambiguous, ask for the exact date/time/timezone.
+- Convert natural language times to ISO datetime with timezone before calling the tool. Use America/Los_Angeles when the user does not specify a timezone.
+- Default duration is 20 minutes unless the user gives a different duration.
+- Pass channel_id, thread_ts, and slack_user_id from Slack metadata on every tool call.
+- Do not say the invite was created unless the tool returns a calendar event ID or link. If the tool returns an error, show that error.
 
 Key owner IDs:
 - Xavier Marco: 89305622
@@ -3859,9 +4106,11 @@ module.exports = {
   TOOLS,
   TRUEWIND_HUBSPOT,
   buildDealNoteBody,
+  buildRecruitingCalendarInvite,
   classifyProgressDealSource,
   compactProperties,
   countHubSpotDealsEnteredStage,
+  createRecruitingCalendarInvite,
   deduceLeadSource,
   dealEnteredStageInRange,
   executeTool,
@@ -3878,6 +4127,7 @@ module.exports = {
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
+  isRecruitingCalendarWriteAuthorized,
   normalizeHubSpotPropertyValue,
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
