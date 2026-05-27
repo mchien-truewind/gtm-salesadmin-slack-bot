@@ -2953,12 +2953,26 @@ function mergeMessages(messages) {
 
 function redactedToolInputForLog(name, input = {}) {
   if (name !== 'recruiting_create_calendar_invite') return JSON.stringify(input);
-  const redacted = { ...input };
-  for (const key of ['candidate_email', 'email', 'attendee_email', 'candidate_name', 'name']) {
-    if (redacted[key]) redacted[key] = '[redacted]';
-  }
-  if (Array.isArray(redacted.extra_attendees)) {
-    redacted.extra_attendees = redacted.extra_attendees.map(() => '[redacted]');
+  const allowedKeys = new Set([
+    'start_datetime',
+    'start_at',
+    'start',
+    'end_datetime',
+    'end_at',
+    'end',
+    'duration_minutes',
+    'timezone',
+    'calendar_id',
+    'send_updates',
+    'with_meet',
+  ]);
+  const redacted = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    if (allowedKeys.has(key)) {
+      redacted[key] = value;
+    } else {
+      redacted[key] = Array.isArray(value) ? value.map(() => '[redacted]') : '[redacted]';
+    }
   }
   return JSON.stringify(redacted);
 }
@@ -2967,7 +2981,7 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   const cleanText = stripMention(text);
   if (!cleanText) return;
 
-  console.log(`handleMessage: channel=${channel}, threadTs=${threadTs}, isThread=${isThread}, text="${cleanText}"`);
+  console.log(`handleMessage: channel=${channel}, threadTs=${threadTs}, isThread=${isThread}, text_chars=${cleanText.length}`);
 
   const structuredDeal = parseStructuredDealRequest(cleanText);
   if (structuredDeal) {

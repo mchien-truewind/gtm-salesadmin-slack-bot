@@ -363,9 +363,14 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
     candidate_email: 'candidate@example.com',
     candidate_name: 'Casey Candidate',
     extra_attendees: ['interviewer@example.com'],
+    title: 'Truewind Intro Call - Casey Candidate',
+    summary: 'Truewind Intro Call - Casey Candidate',
+    description: 'Talk with Casey Candidate at candidate@example.com',
+    attendees: [{ email: 'candidate@example.com' }],
     start_datetime: '2026-05-28T14:00:00-07:00',
   });
   assert.doesNotMatch(logged, /candidate@example\.com|Casey Candidate|interviewer@example\.com/);
+  assert.match(logged, /2026-05-28T14:00:00-07:00/);
   assert.match(logged, /redacted/);
 }
 
