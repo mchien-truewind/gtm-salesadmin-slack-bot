@@ -31,14 +31,17 @@ const CONFIG = {
     'https://api.calendly.com/event_types/6507e7a2-6085-4d57-8726-d5de44d5e16e',
     'https://api.calendly.com/event_types/1d5f7667-f512-4e71-aece-6737e0a9da34',
     'https://api.calendly.com/event_types/8ce8dcfa-d158-45ef-998b-1ff0a041849a',
+    'https://api.calendly.com/event_types/d7cc7703-81c0-44bb-92ae-a2ed1b99cbdd',
   ]),
   ownerByCalendlyUserUri: new Map([
     ['https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', '84547076'],
     ['https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', '89305622'],
+    ['https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b', '92555980'],
   ]),
   organizerNameByCalendlyUserUri: new Map([
     ['https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', 'Sarah Elix'],
     ['https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', 'Xavier Marco'],
+    ['https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b', 'Amy Vetter'],
   ]),
 };
 

@@ -94,6 +94,18 @@ function testAllowlistRequiresEventTypeAndHost() {
     },
   };
   assert.strictEqual(shouldProcessScheduledEvent(objectShapedEvent).ok, true);
+
+  const amyEvent = {
+    resource: {
+      event_type: 'https://api.calendly.com/event_types/d7cc7703-81c0-44bb-92ae-a2ed1b99cbdd',
+      event_memberships: [
+        { user: 'https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b' },
+      ],
+    },
+  };
+  const amyFilter = shouldProcessScheduledEvent(amyEvent);
+  assert.strictEqual(amyFilter.ok, true);
+  assert.strictEqual(amyFilter.ownerId, '92555980');
 }
 
 function testRescheduleDetection() {
@@ -191,6 +203,10 @@ function testOrganizerName() {
   assert.strictEqual(
     getOrganizerName('https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01'),
     'Sarah Elix',
+  );
+  assert.strictEqual(
+    getOrganizerName('https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b'),
+    'Amy Vetter',
   );
   assert.strictEqual(
     getOrganizerName('https://api.calendly.com/users/unknown', {
