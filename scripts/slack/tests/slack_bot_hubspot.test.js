@@ -17,6 +17,7 @@ const {
   buildDealNoteBody,
   classifyProgressDealSource,
   deduceLeadSource,
+  dealEnteredStageInRange,
   executeTool,
   extractStructuredBlockField,
   formatProspectWorkflowResponse,
@@ -29,6 +30,7 @@ const {
   hubspotRecordUrl,
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
+  parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
@@ -246,6 +248,7 @@ function testDealNotesPromptAndTools() {
   assert.strictEqual(toolNames.has('grain_get_recording'), true);
   assert.strictEqual(toolNames.has('hubspot_get_associated_activities'), true);
   assert.strictEqual(toolNames.has('hubspot_get_pipeline'), true);
+  assert.strictEqual(toolNames.has('hubspot_count_deals_entered_stage'), true);
   assert.strictEqual(hubSpotPipelineEndpoint(), '/crm/v3/pipelines/deals/105321581');
   assert.strictEqual(hubSpotPipelineEndpoint('custom pipeline'), '/crm/v3/pipelines/deals/custom%20pipeline');
   assert.strictEqual(hubSpotObjectType('meetings'), '0-47');
@@ -264,6 +267,10 @@ function testDealNotesPromptAndTools() {
     TOOLS.find((tool) => tool.name === 'hubspot_get_pipeline').input_schema.properties.pipeline_id.description,
     /105321581/,
   );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_count_deals_entered_stage').description,
+    /dealstage property history/,
+  );
 
   const prompt = getSystemPrompt();
   assert.match(prompt, /Deal notes and deal summaries/);
@@ -281,6 +288,61 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /The only source of truth for stage configuration is the real-time API response from hubspot_get_pipeline/);
   assert.match(prompt, /Critical HubSpot data freshness/);
   assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
+  assert.match(prompt, /hubspot_count_deals_entered_stage/);
+  assert.match(prompt, /Do not use createdate, current dealstage only, or hs_date_entered_\{stageId\}/);
+}
+
+function testHubSpotStageHistoryHelpers() {
+  assert.strictEqual(parseHubSpotDateBoundary('2026-01-01', 'start_date').toISOString(), '2026-01-01T08:00:00.000Z');
+  assert.strictEqual(parseHubSpotDateBoundary('2026-04-01', 'start_date').toISOString(), '2026-04-01T07:00:00.000Z');
+  assert.throws(
+    () => parseHubSpotDateBoundary('January 1, 2026', 'start_date'),
+    /ISO date\/time with timezone or YYYY-MM-DD/,
+  );
+
+  const deal = {
+    id: '123',
+    propertiesWithHistory: {
+      dealstage: [
+        { value: '1307720553', timestamp: '2026-01-03T18:00:00.000Z' },
+        { value: '190380582', timestamp: '2026-02-10T09:00:00.000Z' },
+        { value: '190380586', timestamp: '2026-03-02T12:00:00.000Z' },
+      ],
+    },
+  };
+  assert.deepStrictEqual(
+    dealEnteredStageInRange(
+      deal,
+      '190380582',
+      new Date('2026-02-01T00:00:00.000Z'),
+      new Date('2026-03-01T00:00:00.000Z'),
+    ),
+    { value: '190380582', timestamp: '2026-02-10T09:00:00.000Z', sourceType: '' },
+  );
+  assert.strictEqual(
+    dealEnteredStageInRange(
+      deal,
+      '190380582',
+      new Date('2026-03-01T00:00:00.000Z'),
+      new Date('2026-04-01T00:00:00.000Z'),
+    ),
+    null,
+  );
+  assert.strictEqual(
+    dealEnteredStageInRange(
+      {
+        id: '456',
+        properties: {
+          dealstage: '190380582',
+          hs_lastmodifieddate: '2026-02-10T09:00:00.000Z',
+        },
+      },
+      '190380582',
+      new Date('2026-02-01T00:00:00.000Z'),
+      new Date('2026-03-01T00:00:00.000Z'),
+    ),
+    null,
+  );
 }
 
 function testGrainSearchFilteringHelpers() {
@@ -399,6 +461,7 @@ async function run() {
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();
+  testHubSpotStageHistoryHelpers();
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();

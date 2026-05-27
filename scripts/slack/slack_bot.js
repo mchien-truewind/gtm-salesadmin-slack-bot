@@ -924,6 +924,150 @@ function hubSpotPipelineEndpoint(pipelineId = TRUEWIND_HUBSPOT.pipeline) {
   return `/crm/v3/pipelines/deals/${encodeURIComponent(id)}`;
 }
 
+function parseHubSpotDateBoundary(value, fieldName) {
+  const text = String(value || '').trim();
+  if (!text) throw new Error(`${fieldName} is required`);
+  if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:Z|[+-]\d{2}:\d{2}))?$/.test(text)) {
+    throw new Error(`${fieldName} must be an ISO date/time with timezone or YYYY-MM-DD`);
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const [year, month, day] = text.split('-').map(Number);
+    return pacificLocalToUtcDate(year, month, day, 0, 0, 0);
+  }
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw new Error(`${fieldName} must be a valid ISO date or YYYY-MM-DD date`);
+  return date;
+}
+
+function getHubSpotDealStageHistoryEntries(deal) {
+  const history = deal?.propertiesWithHistory?.dealstage;
+  if (Array.isArray(history)) {
+    return history
+      .map((entry) => ({
+        value: String(entry.value || '').trim(),
+        timestamp: entry.timestamp || entry.updatedAt || entry.sourceTimestamp || '',
+        sourceType: entry.sourceType || '',
+      }))
+      .filter((entry) => entry.value && entry.timestamp)
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  }
+  return [];
+}
+
+function dealEnteredStageInRange(deal, stageId, startDate, endDate) {
+  const entries = getHubSpotDealStageHistoryEntries(deal);
+  const matchingEntries = entries.filter((entry) => {
+    if (entry.value !== stageId) return false;
+    const timestamp = new Date(entry.timestamp);
+    return !Number.isNaN(timestamp.getTime()) && timestamp >= startDate && timestamp < endDate;
+  });
+  return matchingEntries[0] || null;
+}
+
+async function searchHubSpotDealsForPipeline(pipelineId, maxDeals = 10000) {
+  const deals = [];
+  let after;
+
+  while (deals.length < maxDeals) {
+    const body = {
+      filterGroups: [{
+        filters: [{ propertyName: 'pipeline', operator: 'EQ', value: pipelineId }],
+      }],
+      properties: ['dealname', 'pipeline', 'dealstage', 'createdate', 'hs_lastmodifieddate'],
+      sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
+      limit: Math.min(100, maxDeals - deals.length),
+    };
+    if (after) body.after = after;
+
+    const response = await hubspotRequest('/crm/v3/objects/deals/search', 'POST', body);
+    deals.push(...(response.results || []));
+    after = response.paging?.next?.after;
+    if (!after) break;
+  }
+
+  return {
+    deals,
+    truncated: Boolean(after),
+  };
+}
+
+async function batchReadHubSpotDealStageHistory(dealIds) {
+  const results = [];
+  const propertyHistoryBatchLimit = 50;
+  for (let i = 0; i < dealIds.length; i += propertyHistoryBatchLimit) {
+    const chunk = dealIds.slice(i, i + propertyHistoryBatchLimit);
+    const response = await hubspotRequest('/crm/v3/objects/deals/batch/read', 'POST', {
+      properties: ['dealname', 'pipeline', 'dealstage', 'createdate', 'hs_lastmodifieddate'],
+      propertiesWithHistory: ['dealstage'],
+      inputs: chunk.map((id) => ({ id })),
+    });
+    results.push(...(response.results || []));
+  }
+  return results;
+}
+
+async function countHubSpotDealsEnteredStage(input = {}) {
+  const pipelineId = String(input.pipeline_id || TRUEWIND_HUBSPOT.pipeline).trim() || TRUEWIND_HUBSPOT.pipeline;
+  const stageId = String(input.stage_id || '').trim();
+  if (!stageId) throw new Error('stage_id is required');
+  const startDate = parseHubSpotDateBoundary(input.start_date, 'start_date');
+  const endDate = parseHubSpotDateBoundary(input.end_date, 'end_date');
+  if (endDate <= startDate) throw new Error('end_date must be after start_date');
+
+  const maxDeals = Math.min(Math.max(Number(input.max_deals || 10000), 1), 10000);
+  const { deals: pipelineDeals, truncated: searchTruncated } = await searchHubSpotDealsForPipeline(pipelineId, maxDeals);
+  const dealIds = pipelineDeals.map((deal) => String(deal.id)).filter(Boolean);
+  const dealsWithHistory = await batchReadHubSpotDealStageHistory(dealIds);
+  const byId = new Map(pipelineDeals.map((deal) => [String(deal.id), deal]));
+  const matches = [];
+  const missingHistory = [];
+
+  for (const deal of dealsWithHistory) {
+    const entry = dealEnteredStageInRange(deal, stageId, startDate, endDate);
+    if (entry) {
+      const properties = deal.properties || {};
+      matches.push({
+        id: String(deal.id),
+        dealname: properties.dealname || '',
+        entered_stage_at: new Date(entry.timestamp).toISOString(),
+        current_stage_id: properties.dealstage || '',
+        createdate: properties.createdate || '',
+        url: hubspotRecordUrl('0-3', deal.id),
+      });
+      continue;
+    }
+    const fallbackDeal = byId.get(String(deal.id));
+    if (!deal?.propertiesWithHistory?.dealstage && fallbackDeal?.properties?.dealstage === stageId) {
+      missingHistory.push({
+        id: String(deal.id),
+        dealname: fallbackDeal.properties?.dealname || '',
+        current_stage_id: stageId,
+      });
+    }
+  }
+
+  matches.sort((a, b) => new Date(a.entered_stage_at).getTime() - new Date(b.entered_stage_at).getTime());
+
+  return {
+    pipeline_id: pipelineId,
+    stage_id: stageId,
+    start_date: startDate.toISOString(),
+    end_date: endDate.toISOString(),
+    count: matches.length,
+    deals_scanned: dealIds.length,
+    search_truncated: searchTruncated,
+    coverage: {
+      method: 'HubSpot dealstage property history via propertiesWithHistory=dealstage',
+      warning: searchTruncated
+        ? `Scanned the first ${dealIds.length} pipeline deals and stopped at max_deals; result may be incomplete.`
+        : '',
+      missing_history_current_stage_deals: missingHistory.length,
+    },
+    results: matches,
+    missing_history_current_stage_deals: missingHistory,
+  };
+}
+
 async function fetchHubSpotAssociationIds(fromType, fromId, toType, maxRecords = 500) {
   const ids = [];
   let after = '';
@@ -1641,6 +1785,21 @@ const TOOLS = [
     },
   },
   {
+    name: 'hubspot_count_deals_entered_stage',
+    description: 'Count deals that entered a specific HubSpot deal stage during a date range using dealstage property history. Use this for stage cohort questions such as "how many SQLs did we have in January" including deals that later moved past that stage.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pipeline_id: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581)' },
+        stage_id: { type: 'string', description: 'Exact HubSpot stage ID from hubspot_get_pipeline, e.g. SQL stage ID.' },
+        start_date: { type: 'string', description: 'Inclusive start date/time. Use ISO with timezone for business-month boundaries, e.g. 2026-02-01T00:00:00-08:00, or YYYY-MM-DD for Pacific midnight.' },
+        end_date: { type: 'string', description: 'Exclusive end date/time. Use ISO with timezone for business-month boundaries, e.g. 2026-03-01T00:00:00-08:00, or YYYY-MM-DD for Pacific midnight.' },
+        max_deals: { type: 'number', description: 'Safety cap for pipeline deals scanned (default 10000, max 10000). coverage.warning is set if truncated.' },
+      },
+      required: ['stage_id', 'start_date', 'end_date'],
+    },
+  },
+  {
     name: 'hubspot_push_truewind_prospect',
     description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, creates a HubSpot note associated to the deal/contact/company when notes are supplied, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
     input_schema: {
@@ -1937,6 +2096,10 @@ async function executeTool(name, input = {}) {
         stages: res.stages || [],
       });
     }
+    if (name === 'hubspot_count_deals_entered_stage') {
+      const result = await countHubSpotDealsEnteredStage(input);
+      return JSON.stringify(result);
+    }
     if (name === 'hubspot_push_truewind_prospect') {
       return await runTruewindHubSpotProspectWorkflow(input);
     }
@@ -2138,6 +2301,8 @@ ALWAYS call hubspot_get_pipeline with pipeline_id 105321581 at the start of any 
 - Questions about "where is [deal name]", deal status, or the current state of an opportunity.
 
 Never rely on hardcoded stage mappings, previous responses, memory, or stale prompt examples. HubSpot stage names and IDs change frequently. The only source of truth for stage configuration is the real-time API response from hubspot_get_pipeline. After fetching the pipeline configuration, use those exact stage names and IDs for all subsequent HubSpot operations in that conversation.
+
+For historical stage cohort questions like "how many SQLs did we have in January" or "how many deals entered S2 last month", first call hubspot_get_pipeline, then call hubspot_count_deals_entered_stage with the exact stage ID and date boundaries. Use Pacific business-month boundaries unless the user specifies another timezone, for example January 2026 is start_date=2026-01-01T00:00:00-08:00 and end_date=2026-02-01T00:00:00-08:00. Do not use createdate, current dealstage only, or hs_date_entered_{stageId} as the primary answer for historical stage-entry counts. The dealstage property history is the correct source for deals that have already moved past the requested stage.
 
 ### Critical HubSpot data freshness
 You MUST call the relevant HubSpot API for every HubSpot question, even if you just answered a similar question moments ago. Never say "as I mentioned" or "based on what we just discussed" for HubSpot data. Configuration, stages, owners, records, counts, and associations change constantly. Always fetch fresh data before answering or acting. No exceptions.
@@ -3696,7 +3861,9 @@ module.exports = {
   buildDealNoteBody,
   classifyProgressDealSource,
   compactProperties,
+  countHubSpotDealsEnteredStage,
   deduceLeadSource,
+  dealEnteredStageInRange,
   executeTool,
   extractStructuredBlockField,
   formatProspectWorkflowResponse,
@@ -3712,6 +3879,7 @@ module.exports = {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   normalizeHubSpotPropertyValue,
+  parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
