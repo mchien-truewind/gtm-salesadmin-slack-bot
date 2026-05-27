@@ -37,6 +37,7 @@ const {
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  redactedToolInputForLog,
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
@@ -300,11 +301,15 @@ function testDealNotesPromptAndTools() {
 
 function testRecruitingCalendarInviteBuilderAndAuthorization() {
   assert.deepStrictEqual(
-    isRecruitingCalendarWriteAuthorized({ slack_user_id: 'U_TEST' }),
+    isRecruitingCalendarWriteAuthorized({ __trusted_slack_metadata: { slack_user_id: 'U_TEST' } }),
     { authorized: true, reason: 'Slack user explicitly allowed for recruiting calendar writes' },
   );
   assert.strictEqual(
-    isRecruitingCalendarWriteAuthorized({ slack_user_id: 'U_OTHER' }).authorized,
+    isRecruitingCalendarWriteAuthorized({ slack_user_id: 'U_TEST' }).authorized,
+    false,
+  );
+  assert.strictEqual(
+    isRecruitingCalendarWriteAuthorized({ __trusted_slack_metadata: { slack_user_id: 'U_OTHER' } }).authorized,
     false,
   );
 
@@ -313,13 +318,17 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
     candidate_name: 'Casey Candidate',
     start_datetime: '2026-05-28T14:00:00-07:00',
     duration_minutes: 20,
-    channel_id: 'C123',
-    thread_ts: '1770000000.000100',
+    __trusted_slack_metadata: {
+      channel_id: 'C123',
+      slack_user_id: 'U_TEST',
+      thread_ts: '1770000000.000100',
+    },
   });
 
   assert.strictEqual(payload.calendarId, 'primary');
   assert.strictEqual(payload.conferenceDataVersion, 1);
   assert.strictEqual(payload.sendUpdates, 'all');
+  assert.match(payload.event.id, /^rc[0-9a-f]{32}$/);
   assert.strictEqual(payload.event.summary, 'Truewind Intro Call - Casey Candidate');
   assert.deepStrictEqual(payload.event.attendees, [{ email: 'candidate@example.com' }]);
   assert.strictEqual(payload.event.start.dateTime, '2026-05-28T14:00:00-07:00');
@@ -330,6 +339,18 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
     () => buildRecruitingCalendarInvite({ candidate_email: 'candidate@example.com', start_datetime: '2026-05-28T14:00:00' }),
     /ISO datetime with timezone/,
   );
+  assert.throws(
+    () => buildRecruitingCalendarInvite({ candidate_email: 'candidate@example.com', start_datetime: '2026-05-28T14:00:00-07:00', duration_minutes: 'later' }),
+    /duration_minutes must be a number/,
+  );
+
+  const logged = redactedToolInputForLog('recruiting_create_calendar_invite', {
+    candidate_email: 'candidate@example.com',
+    candidate_name: 'Casey Candidate',
+    start_datetime: '2026-05-28T14:00:00-07:00',
+  });
+  assert.doesNotMatch(logged, /candidate@example\.com|Casey Candidate/);
+  assert.match(logged, /redacted/);
 }
 
 function testHubSpotStageHistoryHelpers() {

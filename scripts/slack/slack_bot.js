@@ -297,12 +297,17 @@ function createCalendarOAuthClient() {
   return auth;
 }
 
+function trustedSlackMetadata(input = {}) {
+  return input.__trusted_slack_metadata || {};
+}
+
 function isRecruitingCalendarWriteAuthorized(input = {}) {
   if (!RECRUITING_CALENDAR_REQUIRE_AUTH) {
     return { authorized: true, reason: 'calendar write auth disabled' };
   }
-  const slackUserId = String(input.slack_user_id || input.slackUserId || '').trim();
-  const channelId = String(input.channel_id || input.channelId || '').trim();
+  const trusted = trustedSlackMetadata(input);
+  const slackUserId = String(trusted.slack_user_id || '').trim();
+  const channelId = String(trusted.channel_id || '').trim();
 
   if (slackUserId && RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS.has(slackUserId)) {
     return { authorized: true, reason: 'Slack user explicitly allowed for recruiting calendar writes' };
@@ -343,7 +348,11 @@ function buildRecruitingCalendarInvite(input = {}) {
   if (!isValidEmail(candidateEmail)) throw new Error('candidate_email is required and must be a valid email');
   const candidateName = String(input.candidate_name || input.name || '').trim();
   const start = parseCalendarIsoWithZone(input.start_datetime || input.start_at || input.start, 'start_datetime');
-  const durationMinutes = Math.min(Math.max(Number(input.duration_minutes || 20), 5), 180);
+  const durationRaw = input.duration_minutes === undefined || input.duration_minutes === null || input.duration_minutes === ''
+    ? 20
+    : Number(input.duration_minutes);
+  if (!Number.isFinite(durationRaw)) throw new Error('duration_minutes must be a number');
+  const durationMinutes = Math.min(Math.max(durationRaw, 5), 180);
   const end = input.end_datetime || input.end_at || input.end
     ? parseCalendarIsoWithZone(input.end_datetime || input.end_at || input.end, 'end_datetime')
     : { date: new Date(start.date.getTime() + durationMinutes * 60000) };
@@ -379,19 +388,22 @@ function buildRecruitingCalendarInvite(input = {}) {
     String(input.description || '').trim(),
     'Scheduled from Slack by Truewind recruiting coordinator.',
   ].filter(Boolean);
+  const trusted = trustedSlackMetadata(input);
   const requestSeed = [
-    input.channel_id || '',
-    input.thread_ts || '',
+    trusted.channel_id || '',
+    trusted.thread_ts || '',
     candidateEmail,
     start.text,
     summary,
   ].join('|');
+  const stableId = `rc${crypto.createHash('sha256').update(requestSeed).digest('hex').slice(0, 32)}`;
 
   return {
     calendarId,
     conferenceDataVersion: input.with_meet === false ? 0 : 1,
     sendUpdates,
     event: {
+      id: stableId,
       summary,
       description: descriptionParts.join('\n\n'),
       start: { dateTime: start.text, timeZone: timezone },
@@ -416,12 +428,21 @@ async function createRecruitingCalendarInvite(input = {}) {
   }
   const payload = buildRecruitingCalendarInvite(input);
   const calendar = google.calendar({ version: 'v3', auth: createCalendarOAuthClient() });
-  const created = await calendar.events.insert({
-    calendarId: payload.calendarId,
-    body: payload.event,
-    conferenceDataVersion: payload.conferenceDataVersion,
-    sendUpdates: payload.sendUpdates,
-  });
+  let created;
+  try {
+    created = await calendar.events.insert({
+      calendarId: payload.calendarId,
+      requestBody: payload.event,
+      conferenceDataVersion: payload.conferenceDataVersion,
+      sendUpdates: payload.sendUpdates,
+    });
+  } catch (err) {
+    if (err.code !== 409 && err.status !== 409) throw err;
+    created = await calendar.events.get({
+      calendarId: payload.calendarId,
+      eventId: payload.event.id,
+    });
+  }
   const event = created.data || {};
   const meetUrl = (event.conferenceData?.entryPoints || [])
     .find((entry) => entry.entryPointType === 'video')?.uri || '';
@@ -2253,8 +2274,16 @@ const TOOLS = [
 // ============================================================
 // Tool execution
 // ============================================================
-async function executeTool(name, input = {}) {
+async function executeTool(name, input = {}, runtimeContext = {}) {
   try {
+    const toolInput = {
+      ...input,
+      __trusted_slack_metadata: {
+        channel_id: runtimeContext.channel_id || '',
+        slack_user_id: runtimeContext.slack_user_id || '',
+        thread_ts: runtimeContext.thread_ts || '',
+      },
+    };
     const hubspotWriteTools = new Set([
       'hubspot_create_contact',
       'hubspot_update_contact',
@@ -2416,7 +2445,7 @@ async function executeTool(name, input = {}) {
       return JSON.stringify(result);
     }
     if (name === 'recruiting_create_calendar_invite') {
-      return await createRecruitingCalendarInvite(input);
+      return await createRecruitingCalendarInvite(toolInput);
     }
 
     // --- Grain ---
@@ -2766,6 +2795,15 @@ function mergeMessages(messages) {
   return merged;
 }
 
+function redactedToolInputForLog(name, input = {}) {
+  if (name !== 'recruiting_create_calendar_invite') return JSON.stringify(input);
+  const redacted = { ...input };
+  for (const key of ['candidate_email', 'email', 'attendee_email', 'candidate_name', 'name']) {
+    if (redacted[key]) redacted[key] = '[redacted]';
+  }
+  return JSON.stringify(redacted);
+}
+
 async function handleMessage(text, threadTs, channel, isThread, say, slackUserId = '') {
   const cleanText = stripMention(text);
   if (!cleanText) return;
@@ -2837,8 +2875,12 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
       const toolResults = [];
 
       for (const block of toolUseBlocks) {
-        console.log(`Tool call: ${block.name}(${JSON.stringify(block.input)})`);
-        const result = await executeTool(block.name, block.input);
+        console.log(`Tool call: ${block.name}(${redactedToolInputForLog(block.name, block.input)})`);
+        const result = await executeTool(block.name, block.input, {
+          channel_id: channel,
+          slack_user_id: slackUserId,
+          thread_ts: parentTs,
+        });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: block.id,
@@ -4133,6 +4175,7 @@ module.exports = {
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
   parseProgressDealSourceProperty,
+  redactedToolInputForLog,
   resolveDealHubSpotOwner,
   runLeadStatusSyncForSlack,
   resolveHubSpotOwner,
