@@ -182,6 +182,8 @@ class Config:
     reject_draft_auto_send_age_hours: int
     name_verifier_provider: str
     name_verifier_model: str
+    resume_extractor_provider: str
+    resume_extractor_model: str
     anthropic_api_key: str
     openai_api_key: str
     no_response_wait_days: int
@@ -461,6 +463,8 @@ def load_config() -> Config:
         reject_draft_auto_send_age_hours=parse_env_int("RECRUITING_REJECT_DRAFT_AUTO_SEND_AGE_HOURS", 48),
         name_verifier_provider=os.getenv("RECRUITING_NAME_VERIFIER_PROVIDER", "anthropic").strip().lower(),
         name_verifier_model=os.getenv("RECRUITING_NAME_VERIFIER_MODEL", "claude-3-5-haiku-latest").strip(),
+        resume_extractor_provider=os.getenv("RECRUITING_RESUME_EXTRACTOR_PROVIDER", "off").strip().lower(),
+        resume_extractor_model=os.getenv("RECRUITING_RESUME_EXTRACTOR_MODEL", "gpt-4.1-mini").strip(),
         anthropic_api_key=get_env_first("RECRUITING_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
         openai_api_key=get_env_first("RECRUITING_OPENAI_API_KEY", "OPENAI_API_KEY"),
         no_response_wait_days=parse_env_int("RECRUITING_NO_RESPONSE_WAIT_DAYS", 14),
@@ -1284,6 +1288,163 @@ def infer_current_title_and_company_from_resume(resume_text: str, snippet: str) 
             return candidate, "Unknown"
 
     return "Unknown", "Unknown"
+
+
+def normalize_extractor_evidence(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^\w\s]", " ", normalized.lower())
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def extractor_evidence_items(evidence: Any) -> list[str]:
+    if isinstance(evidence, str):
+        return [evidence] if evidence.strip() else []
+    if isinstance(evidence, list):
+        return [str(item) for item in evidence if str(item).strip()]
+    return []
+
+
+def extractor_evidence_matches_source(evidence: Any, source: str) -> bool:
+    evidence_items = extractor_evidence_items(evidence)
+    if not evidence_items:
+        return False
+
+    normalized_source = normalize_extractor_evidence(source)
+    if not normalized_source:
+        return False
+    for item in evidence_items:
+        cleaned = clean_text(str(item))
+        if not cleaned:
+            continue
+        if cleaned in source:
+            continue
+        normalized_item = normalize_extractor_evidence(cleaned)
+        if normalized_item and normalized_item in normalized_source:
+            continue
+        return False
+    return True
+
+
+def extractor_evidence_supports_output(title: str, company: str, evidence: Any, source: str) -> bool:
+    if not extractor_evidence_matches_source(evidence, source):
+        return False
+    normalized_title = normalize_extractor_evidence(title)
+    normalized_company = normalize_extractor_evidence(company)
+    normalized_source = normalize_extractor_evidence(source)
+    normalized_evidence = normalize_extractor_evidence(" ".join(extractor_evidence_items(evidence)))
+    if not normalized_title or not normalized_company:
+        return False
+    if normalized_title not in normalized_source or normalized_company not in normalized_source:
+        return False
+    return normalized_title in normalized_evidence and normalized_company in normalized_evidence
+
+
+def capped_resume_extractor_source(resume_text: str, snippet: str, max_chars: int = 16_000) -> str:
+    resume_part = (resume_text or "").strip()
+    snippet_part = (snippet or "").strip()
+    if not resume_part:
+        return snippet_part[:max_chars]
+    if not snippet_part:
+        return resume_part[:max_chars]
+
+    separator = "\n\nEmail snippet:\n"
+    remaining = max_chars - len(separator)
+    if remaining <= 0:
+        return resume_part[:max_chars]
+    resume_budget = min(len(resume_part), max(0, remaining - min(len(snippet_part), 2_000)))
+    snippet_budget = max(0, remaining - resume_budget)
+    return f"{resume_part[:resume_budget]}{separator}{snippet_part[:snippet_budget]}"
+
+
+def build_resume_extractor_prompt(source: str) -> str:
+    return (
+        "Extract the candidate's latest current role and company from the resume text. "
+        "Use only the provided source. Prefer explicitly current or most recent experience. "
+        "Return only strict JSON with keys latest_current_title, latest_current_company, "
+        "confidence, and evidence. confidence must be one of low, medium, high. "
+        "evidence must be a short exact quote or list of exact quotes copied from the source "
+        "that supports the extracted current role/company. If uncertain, use empty strings and low confidence.\n\n"
+        f"Source:\n{source}"
+    )
+
+
+def call_openai_resume_extractor(config: Config, resume_text: str, snippet: str) -> dict[str, Any]:
+    if requests is None or not config.openai_api_key:
+        return {}
+
+    source = capped_resume_extractor_source(resume_text, snippet)
+    if not source.strip():
+        return {}
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {config.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": config.resume_extractor_model or "gpt-4.1-mini",
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": build_resume_extractor_prompt(source)}],
+            },
+            timeout=45,
+        )
+    except Exception:
+        return {}
+    if not response.ok:
+        return {}
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+
+    content = (
+        ((body.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        if isinstance(body.get("choices"), list)
+        else ""
+    )
+    try:
+        parsed = json.loads(str(content).strip())
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    title = clean_text(str(parsed.get("latest_current_title", "") or ""))
+    company = clean_text(str(parsed.get("latest_current_company", "") or ""))
+    confidence = clean_text(str(parsed.get("confidence", "") or "")).lower()
+    evidence = parsed.get("evidence")
+    if not title or not company:
+        return {}
+    if confidence not in {"medium", "high"}:
+        return {}
+    if not extractor_evidence_supports_output(title, company, evidence, source):
+        return {}
+    return {
+        "latest_current_title": title,
+        "latest_current_company": company,
+        "confidence": confidence,
+        "evidence": evidence,
+    }
+
+
+def extract_latest_resume_role_company(config: Config, resume_text: str, snippet: str) -> tuple[str, str]:
+    provider = (config.resume_extractor_provider or "off").strip().lower()
+    if provider in {"", "off", "none", "false", "0"}:
+        return "", ""
+    if provider != "openai":
+        return "", ""
+
+    parsed = call_openai_resume_extractor(config, resume_text, snippet)
+    if not parsed:
+        return "", ""
+    return (
+        clean_text(str(parsed.get("latest_current_title", "") or "")),
+        clean_text(str(parsed.get("latest_current_company", "") or "")),
+    )
 
 
 def normalize_linkedin_url(url: str) -> str:
@@ -3333,13 +3494,7 @@ def post_candidate_reviews_to_slack(config: Config, candidates: list[dict[str, s
         state_changed = True
     posted = 0
     failed = 0
-    mention_user_id = config.slack_mention_user_id
-    if not mention_user_id:
-        try:
-            mention_user_id = (client.auth_test().get("user_id", "") or "").strip()
-        except Exception:
-            mention_user_id = ""
-    mention_prefix = f"<@{mention_user_id}> " if mention_user_id else ""
+    mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
 
     for candidate in candidates:
         if clean_text(candidate.get("source", "")).lower() == SOURCE_SUPERPOSITION.lower():
@@ -3571,13 +3726,7 @@ def post_weekly_active_candidates_digest(
         save_weekly_active_review_slot(config.slack_state_file, slot_key)
         return 0, len(candidates)
 
-    mention_user_id = config.slack_mention_user_id
-    if not mention_user_id:
-        try:
-            mention_user_id = (client.auth_test().get("user_id", "") or "").strip()
-        except Exception:
-            mention_user_id = ""
-    mention_prefix = f"<@{mention_user_id}> " if mention_user_id else ""
+    mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
 
     counts = Counter(candidate.get("status", "Awaiting Decision") for candidate in candidates)
     summary = ", ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
@@ -4487,6 +4636,7 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         stage = classify_career_stage(resume_text or snippet)
         resume_title, resume_company = infer_current_title_and_company_from_resume(resume_text, snippet)
+        extractor_title, extractor_company = extract_latest_resume_role_company(config, resume_text, snippet)
         location = classify_location(resume_text, snippet)
 
         existing_page = find_existing_candidate_page(
@@ -4529,8 +4679,8 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
         if not linkedin_url:
             fallback_url, fallback_confidence = google_search_linkedin_url(
                 candidate_name,
-                resume_company or existing_company,
-                resume_title or existing_current_title,
+                extractor_company or resume_company or existing_company,
+                extractor_title or resume_title or existing_current_title,
             )
             if fallback_url:
                 linkedin_url = fallback_url
@@ -4555,8 +4705,18 @@ def ingest_cmd(_args: argparse.Namespace) -> None:
 
         resume_title_value = resume_title if resume_title and resume_title.lower() != "unknown" else ""
         resume_company_value = resume_company if resume_company and resume_company.lower() != "unknown" else ""
-        current_title = resume_title_value or linkedin_title or existing_current_title or "Unknown"
-        company = resume_company_value or linkedin_company or existing_company or "Unknown"
+        extractor_title_value = (
+            extractor_title if extractor_title and extractor_title.lower() != "unknown" else ""
+        )
+        extractor_company_value = (
+            extractor_company if extractor_company and extractor_company.lower() != "unknown" else ""
+        )
+        current_title = (
+            extractor_title_value or resume_title_value or linkedin_title or existing_current_title or "Unknown"
+        )
+        company = (
+            extractor_company_value or resume_company_value or linkedin_company or existing_company or "Unknown"
+        )
         resume_url = existing_resume_url
         if not resume_url:
             if raw:
@@ -5461,6 +5621,11 @@ def dump_config_cmd(_args: argparse.Namespace) -> None:
         "name_verifier_model": config.name_verifier_model,
         "name_verifier_configured": bool(
             config.anthropic_api_key if config.name_verifier_provider != "openai" else config.openai_api_key
+        ),
+        "resume_extractor_provider": config.resume_extractor_provider,
+        "resume_extractor_model": config.resume_extractor_model,
+        "resume_extractor_configured": bool(
+            config.openai_api_key if config.resume_extractor_provider == "openai" else False
         ),
         "no_response_wait_days": config.no_response_wait_days,
         "assignment_keywords": sorted(config.assignment_keywords),

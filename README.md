@@ -379,7 +379,7 @@ Workflow:
 - Set one `Career Stage` dropdown value (`Early`, `Mid`, `Late`).
 - Set `Role` column from subject (`BDR` / `Growth Generalist`).
 - Extract and store `LinkedIn URL`.
-- Set `Company` and `Current Title` from LinkedIn URL enrichment (overwrites prior values when found).
+- Set `Company` and `Current Title` from LinkedIn URL enrichment, with an optional OpenAI extractor for current role/company after resume text extraction.
 - Classify `Location` as `U.S.` or `non-U.S.`.
 - Set `Date first entered` from the first email timestamp in each `hiring@` thread.
 - Post every newly-ingested candidate to Slack `#hiring-review` with resume and Notion links.
@@ -430,7 +430,15 @@ Use `.env.recruiting.example` as the reference.
 - Optional: `SLACK_USER_TOKEN` can still be used for private-channel history/reaction reads while bot token handles posts.
 - `RECRUITING_SLACK_REVIEW_CHANNEL=hiring-review`
 - Optional: `RECRUITING_SLACK_REVIEW_CHANNEL_ID=<channel-id>` (recommended to avoid extra Slack API lookups)
+- Optional: `RECRUITING_SLACK_MENTION_USER_ID=<member-user-id>` to mention Mercedes or another reviewer on new applicant posts. Leave blank to post without a mention; the bot does not fall back to mentioning itself. Do not set this to the Slack app/bot user ID.
 - Invite the Slack app/user token identity to `#hiring-review`
+6. Optionally enable OpenAI-assisted current role/company extraction:
+- Default: `RECRUITING_RESUME_EXTRACTOR_PROVIDER=off`
+- Enable with `RECRUITING_RESUME_EXTRACTOR_PROVIDER=openai`
+- Model: `RECRUITING_RESUME_EXTRACTOR_MODEL=gpt-4.1-mini`
+- API key: `RECRUITING_OPENAI_API_KEY`, falling back to `OPENAI_API_KEY` if the recruiting-specific key is unset
+
+When enabled, the extractor sends extracted resume/email snippet text to OpenAI after local resume text extraction. Raw resume files and model responses are not logged. Outputs are treated as untrusted: ungrounded or low-confidence role/company values fall back to the deterministic parser and LinkedIn enrichment behavior.
 
 ### Commands
 
