@@ -34,6 +34,8 @@ const {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
+  notionPropValue,
+  recruitingNotionPropertyMap,
   normalizeHubSpotOutcomeTracking,
   parseHubSpotAsOfBoundary,
   parseHubSpotDateBoundary,
@@ -727,6 +729,37 @@ function testProspectWorkflowResponseIncludesHubSpotLinks() {
   assert.match(failedNoteResponse, /! Note was not added: HubSpot 403: missing scope/);
 }
 
+function testRecruitingAtsToolRegistrationAndPrompt() {
+  assert.ok(TOOLS.find((tool) => tool.name === 'recruiting_list_outstanding_candidates'));
+  assert.match(getSystemPrompt(), /recruiting_list_outstanding_candidates/);
+  assert.match(getSystemPrompt(), /Notion ATS, not the HubSpot sales deal pipeline/);
+}
+
+function testRecruitingNotionPropertyHelpers() {
+  assert.strictEqual(
+    notionPropValue({ type: 'title', title: [{ plain_text: 'Ali Punjani' }] }),
+    'Ali Punjani',
+  );
+  assert.strictEqual(
+    notionPropValue({ type: 'multi_select', multi_select: [{ name: 'AE' }, { name: 'BDR' }] }),
+    'AE, BDR',
+  );
+  const map = recruitingNotionPropertyMap({
+    properties: {
+      Name: { type: 'title' },
+      'Role at Truewind': { type: 'multi_select' },
+      'Current Company': { type: 'rich_text' },
+      'Current Role': { type: 'rich_text' },
+      Status: { type: 'select' },
+    },
+  });
+  assert.strictEqual(map.candidateName, 'Name');
+  assert.strictEqual(map.role, 'Role at Truewind');
+  assert.strictEqual(map.company, 'Current Company');
+  assert.strictEqual(map.currentTitle, 'Current Role');
+  assert.strictEqual(map.status, 'Status');
+}
+
 async function run() {
   await testConvertedLeadStatusUsesInternalValue();
   await testReadOnlyDealPropertiesAreRejectedBeforeWrite();
@@ -740,6 +773,8 @@ async function run() {
   testLeadSourceDefaultsToOutbound();
   testDealOwnerResolution();
   testDealNotesPromptAndTools();
+  testRecruitingAtsToolRegistrationAndPrompt();
+  testRecruitingNotionPropertyHelpers();
   testRecruitingCalendarInviteBuilderAndAuthorization();
   await testRecruitingCalendarInviteExecuteToolAuthAndIdempotency();
   testHubSpotStageHistoryHelpers();

@@ -520,6 +520,233 @@ function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email));
 }
 
+function getEnvFirst(...names) {
+  for (const name of names) {
+    const value = String(process.env[name] || '').trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function cleanNotionText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function notionPropValue(prop = {}) {
+  const propType = prop.type;
+  if (propType === 'title') {
+    return cleanNotionText((prop.title || []).map((item) => item.plain_text || item.text?.content || '').join(''));
+  }
+  if (propType === 'rich_text') {
+    return cleanNotionText((prop.rich_text || []).map((item) => item.plain_text || item.text?.content || '').join(''));
+  }
+  if (propType === 'select') return cleanNotionText(prop.select?.name || '');
+  if (propType === 'multi_select') {
+    return (prop.multi_select || []).map((item) => cleanNotionText(item.name)).filter(Boolean).join(', ');
+  }
+  if (propType === 'email') return cleanNotionText(prop.email || '');
+  if (propType === 'url') return cleanNotionText(prop.url || '');
+  if (propType === 'phone_number') return cleanNotionText(prop.phone_number || '');
+  if (propType === 'date') return cleanNotionText(prop.date?.start || '');
+  if (propType === 'number') return prop.number === undefined || prop.number === null ? '' : String(prop.number);
+  if (propType === 'checkbox') return prop.checkbox ? 'true' : 'false';
+  return '';
+}
+
+function notionPropValues(prop = {}) {
+  if (prop.type === 'multi_select') {
+    return (prop.multi_select || []).map((item) => cleanNotionText(item.name)).filter(Boolean);
+  }
+  const value = notionPropValue(prop);
+  return value ? [value] : [];
+}
+
+function notionPageUrl(pageId = '') {
+  const cleaned = String(pageId || '').replace(/-/g, '');
+  return cleaned ? `https://www.notion.so/${cleaned}` : '';
+}
+
+function resolveNotionPropertyName(properties = {}, preferred = '', aliases = []) {
+  if (preferred && properties[preferred]) return preferred;
+  for (const alias of aliases) {
+    if (properties[alias]) return alias;
+  }
+  return preferred;
+}
+
+function resolveNotionTitlePropertyName(properties = {}, preferred = '') {
+  if (preferred && properties[preferred]?.type === 'title') return preferred;
+  const match = Object.entries(properties).find(([, schema]) => schema?.type === 'title');
+  if (!match) throw new Error('Notion ATS database must contain a title property');
+  return match[0];
+}
+
+function recruitingNotionPropertyMap(databaseSchema = {}) {
+  const properties = databaseSchema.properties || {};
+  return {
+    candidateName: resolveNotionTitlePropertyName(
+      properties,
+      process.env.RECRUITING_NOTION_PROP_CANDIDATE_NAME || 'Candidate Name'
+    ),
+    email: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_EMAIL || 'Email', ['Email']),
+    source: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_SOURCE || 'Source', ['Source']),
+    role: resolveNotionPropertyName(
+      properties,
+      process.env.RECRUITING_NOTION_PROP_ROLE_AT_TRUEWIND
+        || process.env.RECRUITING_NOTION_PROP_ROLE
+        || 'Role at Truewind',
+      ['Role at Truewind', 'Role @ Truewind', 'Role']
+    ),
+    currentTitle: resolveNotionPropertyName(
+      properties,
+      process.env.RECRUITING_NOTION_PROP_CURRENT_ROLE
+        || process.env.RECRUITING_NOTION_PROP_CURRENT_TITLE
+        || 'Current Role',
+      ['Current Role', 'Current Title', 'Title']
+    ),
+    company: resolveNotionPropertyName(
+      properties,
+      process.env.RECRUITING_NOTION_PROP_CURRENT_COMPANY
+        || process.env.RECRUITING_NOTION_PROP_COMPANY
+        || 'Current Company',
+      ['Current Company', 'Company']
+    ),
+    careerStage: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_CAREER_STAGE || 'Career Stage', ['Career Stage']),
+    location: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_LOCATION || 'Location', ['Location']),
+    linkedinUrl: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_LINKEDIN_URL || 'LinkedIn URL', ['LinkedIn URL', 'LinkedIn']),
+    resumeUrl: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_RESUME_URL || 'Resume URL', ['Resume URL', 'Resume']),
+    dateFirstEntered: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_DATE_FIRST_ENTERED || 'Date first entered', ['Date first entered']),
+    gmailThreadId: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_GMAIL_THREAD_ID || 'Gmail thread id', ['Gmail thread id']),
+    status: resolveNotionPropertyName(properties, process.env.RECRUITING_NOTION_PROP_STATUS || 'Status', ['Status']),
+  };
+}
+
+function statusIsTerminal(status) {
+  return new Set(['rejected', 'passed', 'accepted', 'n/a']).has(cleanNotionText(status).toLowerCase());
+}
+
+function shouldExcludeFromActiveAtsDigest(status) {
+  return cleanNotionText(status).toLowerCase() === 'reject pending';
+}
+
+async function notionRequest(endpoint, method = 'GET', body = null) {
+  const token = getEnvFirst('NOTION_INTERNAL_INTEGRATION_SECRET', 'NOTION_INTERNAL_INTEGRATION');
+  if (!token) throw new Error('Notion ATS is not configured. Set NOTION_INTERNAL_INTEGRATION_SECRET or NOTION_INTERNAL_INTEGRATION.');
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.notion.com',
+      path: endpoint,
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Notion-Version': process.env.NOTION_VERSION || '2022-06-28',
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        let parsed = {};
+        if (data) {
+          try { parsed = JSON.parse(data); } catch { parsed = { raw: data }; }
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`Notion ${res.statusCode}: ${parsed.message || parsed.error || data}`));
+          return;
+        }
+        resolve(parsed);
+      });
+    });
+    req.setTimeout(DEFAULT_HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Notion request timed out after ${DEFAULT_HTTP_TIMEOUT_MS}ms`));
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+async function queryAllNotionDatabasePages(databaseId, queryBody = {}) {
+  const pages = [];
+  let startCursor = '';
+  do {
+    const body = { page_size: 100, ...queryBody };
+    if (startCursor) body.start_cursor = startCursor;
+    const response = await notionRequest(`/v1/databases/${encodeURIComponent(databaseId)}/query`, 'POST', body);
+    pages.push(...(response.results || []));
+    startCursor = response.has_more ? response.next_cursor : '';
+  } while (startCursor);
+  return pages;
+}
+
+function buildRecruitingCandidateFromNotionPage(page, propMap) {
+  const props = page.properties || {};
+  const roleValues = notionPropValues(props[propMap.role]);
+  return {
+    candidate_name: notionPropValue(props[propMap.candidateName]) || 'Unknown',
+    email: notionPropValue(props[propMap.email]),
+    source: notionPropValue(props[propMap.source]),
+    role: roleValues.length ? roleValues.join(', ') : (notionPropValue(props[propMap.role]) || 'Unknown'),
+    current_title: notionPropValue(props[propMap.currentTitle]) || 'Unknown',
+    company: notionPropValue(props[propMap.company]) || 'Unknown',
+    career_stage: notionPropValue(props[propMap.careerStage]) || 'Unknown',
+    location: notionPropValue(props[propMap.location]) || 'Unknown',
+    linkedin_url: notionPropValue(props[propMap.linkedinUrl]),
+    resume_url: notionPropValue(props[propMap.resumeUrl]),
+    thread_id: notionPropValue(props[propMap.gmailThreadId]),
+    status: notionPropValue(props[propMap.status]) || 'Awaiting Decision',
+    notion_url: page.url || notionPageUrl(page.id),
+    date_first_entered: notionPropValue(props[propMap.dateFirstEntered]),
+  };
+}
+
+async function listRecruitingOutstandingCandidates(input = {}) {
+  const databaseId = getEnvFirst('NOTION_DATABASE_ID', 'NOTION_ATS_DB_ID').replace(/-/g, '');
+  if (!databaseId) throw new Error('Notion ATS database is not configured. Set NOTION_DATABASE_ID or NOTION_ATS_DB_ID.');
+  const databaseSchema = await notionRequest(`/v1/databases/${encodeURIComponent(databaseId)}`);
+  const propMap = recruitingNotionPropertyMap(databaseSchema);
+  const pages = await queryAllNotionDatabasePages(databaseId);
+  const mode = cleanNotionText(input.mode || 'active').toLowerCase();
+  const roleFilter = cleanNotionText(input.role || '').toLowerCase();
+  const statusFilter = cleanNotionText(input.status || '').toLowerCase();
+  const limit = Math.min(Math.max(Number(input.limit || 25), 1), 100);
+
+  const candidates = pages
+    .map((page) => buildRecruitingCandidateFromNotionPage(page, propMap))
+    .filter((candidate) => {
+      const status = candidate.status || 'Awaiting Decision';
+      if (mode === 'awaiting_decision') {
+        if (cleanNotionText(status).toLowerCase() !== 'awaiting decision') return false;
+        if (cleanNotionText(candidate.source).toLowerCase() === 'superposition') return false;
+        if (!candidate.thread_id) return false;
+      } else if (statusIsTerminal(status) || shouldExcludeFromActiveAtsDigest(status)) {
+        return false;
+      }
+      if (roleFilter && !cleanNotionText(candidate.role).toLowerCase().includes(roleFilter)) return false;
+      if (statusFilter && cleanNotionText(status).toLowerCase() !== statusFilter) return false;
+      return true;
+    })
+    .sort((a, b) => (
+      cleanNotionText(a.status).localeCompare(cleanNotionText(b.status))
+      || cleanNotionText(a.date_first_entered).localeCompare(cleanNotionText(b.date_first_entered))
+      || cleanNotionText(a.candidate_name).localeCompare(cleanNotionText(b.candidate_name))
+    ));
+
+  const statusSummary = {};
+  for (const candidate of candidates) {
+    statusSummary[candidate.status] = (statusSummary[candidate.status] || 0) + 1;
+  }
+  return JSON.stringify({
+    mode,
+    total: candidates.length,
+    returned: Math.min(candidates.length, limit),
+    status_summary: statusSummary,
+    candidates: candidates.slice(0, limit),
+  });
+}
+
 function titleCase(value) {
   return String(value || '')
     .replace(/[-_.]+/g, ' ')
@@ -2352,6 +2579,22 @@ const TOOLS = [
   },
   // --- Recruiting calendar tools ---
   {
+    name: 'recruiting_list_outstanding_candidates',
+    description: 'List outstanding candidates from the Notion ATS. Use for recruiting pipeline, hiring pipeline, outstanding candidates, active candidates, or candidates needing review in #hiring-review. This is separate from the HubSpot sales pipeline.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          description: 'active lists all non-terminal candidates excluding Reject Pending. awaiting_decision lists new applicant review candidates only. Default active.',
+        },
+        role: { type: 'string', description: 'Optional role filter such as AE, BDR, or Growth Generalist.' },
+        status: { type: 'string', description: 'Optional exact status filter.' },
+        limit: { type: 'number', description: 'Max candidates to return. Default 25, max 100.' },
+      },
+    },
+  },
+  {
     name: 'recruiting_create_calendar_invite',
     description: 'Create a Google Calendar invite with Google Meet for a recruiting interview. Use only when the Slack user asks to schedule/book a recruiting interview or first-round call and provides a concrete candidate email plus exact date/time. If the user gives a natural-language time, convert it to ISO with timezone before calling. Ask for missing email or exact time before using this tool.',
     input_schema: {
@@ -2598,6 +2841,9 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
       if (result.error) return `Error: ${result.error}`;
       return JSON.stringify(result);
     }
+    if (name === 'recruiting_list_outstanding_candidates') {
+      return await listRecruitingOutstandingCandidates(input);
+    }
     if (name === 'recruiting_create_calendar_invite') {
       return await createRecruitingCalendarInvite(toolInput);
     }
@@ -2792,6 +3038,12 @@ Lead source deduction:
 - default -> Outbound - Sales Sourced List
 
 ## Recruiting calendar scheduling
+For recruiting pipeline questions in #hiring-review, use recruiting_list_outstanding_candidates. The recruiting/hiring candidate pipeline is the Notion ATS, not the HubSpot sales deal pipeline.
+- "Outstanding candidates", "active candidates", "who is in the hiring pipeline", or "who still needs review" should call recruiting_list_outstanding_candidates.
+- Use mode=active by default. Use mode=awaiting_decision when the user asks specifically for new applicants needing Proceed/Reject/Forward review.
+- Summarize by status first, then list candidate name, role, status, current title/company when available, and the Notion link.
+- If the tool returns an error, show the exact error and do not answer from memory.
+
 When someone asks you to schedule, book, or create an invite for a recruiting interview, first-round call, intro call, or candidate screen, use recruiting_create_calendar_invite.
 - Only use it for recruiting/interview scheduling. For customer sales meetings, do not use this tool unless the user explicitly says it is a recruiting interview.
 - Required fields: candidate email and exact start time.
@@ -4344,6 +4596,9 @@ module.exports = {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
+  listRecruitingOutstandingCandidates,
+  notionPropValue,
+  recruitingNotionPropertyMap,
   normalizeHubSpotPropertyValue,
   normalizeHubSpotOutcomeTracking,
   parseHubSpotAsOfBoundary,
