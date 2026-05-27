@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -228,6 +229,14 @@ def build_config(**overrides) -> cli.Config:
 class SlackMentionBehaviorTests(unittest.TestCase):
     def _config(self) -> cli.Config:
         return build_config()
+
+    def test_load_config_mention_default_targets_mercedes_and_can_be_disabled(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U0ABULY5TEK")
+        with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "none"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
+        with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "U123"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U123")
 
     def test_blank_slack_mention_user_id_does_not_fallback_to_auth_test(self):
         candidate = {

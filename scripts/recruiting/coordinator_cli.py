@@ -124,6 +124,7 @@ REJECT_EXCLUSION_PATTERNS = [
 DEFAULT_DRAFT_BCC = "hiring@trytruewind.com"
 SLACK_THREAD_MARKER_PREFIX = "ATS_THREAD_ID:"
 FORWARD_THREAD_MARKER_PREFIX = "ATS_FORWARD_THREAD_ID:"
+DEFAULT_RECRUITING_SLACK_MENTION_USER_ID = "U0ABULY5TEK"
 DOCLING_PARSE_EXTENSIONS = {"pdf", "doc", "docx"}
 DEFAULT_ASSIGNMENT_KEYWORDS = (
     "assignment,case study,take-home,take home,exercise,project,"
@@ -349,6 +350,16 @@ def parse_csv_set(value: str, default: str = "") -> set[str]:
     return tokens
 
 
+def resolve_recruiting_slack_mention_user_id() -> str:
+    configured = (
+        os.getenv("RECRUITING_SLACK_MENTION_USER_ID", "").strip()
+        or os.getenv("SLACK_USER_ID", "").strip()
+    )
+    if configured.lower() in {"none", "off", "false", "0"}:
+        return ""
+    return configured or DEFAULT_RECRUITING_SLACK_MENTION_USER_ID
+
+
 def get_env_first(*names: str) -> str:
     for name in names:
         value = os.getenv(name, "").strip()
@@ -485,10 +496,7 @@ def load_config() -> Config:
             os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL_ID", "").strip()
             or os.getenv("RECRUITING_SLACK_REVIEW_CHANNEL", "hiring-review").strip().lstrip("#")
         ),
-        slack_mention_user_id=(
-            os.getenv("RECRUITING_SLACK_MENTION_USER_ID", "").strip()
-            or os.getenv("SLACK_USER_ID", "").strip()
-        ),
+        slack_mention_user_id=resolve_recruiting_slack_mention_user_id(),
         slack_history_lookback_days=parse_env_int("RECRUITING_SLACK_HISTORY_LOOKBACK_DAYS", 14),
         slack_proceed_reactions=parse_csv_set(
             os.getenv("RECRUITING_SLACK_PROCEED_REACTIONS", ""), default="white_check_mark"

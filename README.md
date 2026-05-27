@@ -430,7 +430,7 @@ Use `.env.recruiting.example` as the reference.
 - Optional: `SLACK_USER_TOKEN` can still be used for private-channel history/reaction reads while bot token handles posts.
 - `RECRUITING_SLACK_REVIEW_CHANNEL=hiring-review`
 - Optional: `RECRUITING_SLACK_REVIEW_CHANNEL_ID=<channel-id>` (recommended to avoid extra Slack API lookups)
-- Optional: `RECRUITING_SLACK_MENTION_USER_ID=<member-user-id>` to mention Mercedes or another reviewer on new applicant posts. Leave blank to post without a mention; the bot does not fall back to mentioning itself. Do not set this to the Slack app/bot user ID.
+- Optional: `RECRUITING_SLACK_MENTION_USER_ID=<member-user-id>` to mention Mercedes or another reviewer on new applicant posts. It defaults to Mercedes (`U0ABULY5TEK`) when unset. Set `none`, `off`, `false`, or `0` to post without a mention. Do not set this to the Slack app/bot user ID.
 - Invite the Slack app/user token identity to `#hiring-review`
 6. Optionally enable OpenAI-assisted current role/company extraction:
 - Default: `RECRUITING_RESUME_EXTRACTOR_PROVIDER=off`
