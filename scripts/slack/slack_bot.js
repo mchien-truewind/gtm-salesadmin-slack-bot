@@ -1167,6 +1167,25 @@ function parseHubSpotDateBoundary(value, fieldName) {
   return date;
 }
 
+function parseHubSpotAsOfBoundary(value, fieldName) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const [year, month, day] = text.split('-').map(Number);
+    const nextDate = shiftPacificDate({ year, month, day }, 1);
+    return {
+      date: pacificLocalToUtcDate(nextDate.year, nextDate.month, nextDate.day, 0, 0, 0),
+      exclusive: true,
+      input: text,
+    };
+  }
+  return {
+    date: parseHubSpotDateBoundary(text, fieldName),
+    exclusive: false,
+    input: text,
+  };
+}
+
 function getHubSpotDealStageHistoryEntries(deal) {
   const history = deal?.propertiesWithHistory?.dealstage;
   if (Array.isArray(history)) {
@@ -1190,6 +1209,111 @@ function dealEnteredStageInRange(deal, stageId, startDate, endDate) {
     return !Number.isNaN(timestamp.getTime()) && timestamp >= startDate && timestamp < endDate;
   });
   return matchingEntries[0] || null;
+}
+
+function isOnOrBeforeAsOf(timestamp, asOfBoundary) {
+  if (!asOfBoundary) return true;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return false;
+  return asOfBoundary.exclusive ? date < asOfBoundary.date : date <= asOfBoundary.date;
+}
+
+function firstOutcomeAfterEntry(deal, entry, outcomeStageIds, asOfBoundary = null) {
+  const entryDate = new Date(entry?.timestamp || entry?.entered_stage_at || '');
+  if (Number.isNaN(entryDate.getTime())) return null;
+  const outcomeSet = new Set(outcomeStageIds.map((stageId) => String(stageId || '').trim()).filter(Boolean));
+  if (!outcomeSet.size) return null;
+
+  return getHubSpotDealStageHistoryEntries(deal).find((historyEntry) => {
+    if (!outcomeSet.has(historyEntry.value)) return false;
+    const outcomeDate = new Date(historyEntry.timestamp);
+    return !Number.isNaN(outcomeDate.getTime())
+      && outcomeDate > entryDate
+      && isOnOrBeforeAsOf(historyEntry.timestamp, asOfBoundary);
+  }) || null;
+}
+
+function normalizeHubSpotOutcomeTracking(input = {}) {
+  const trackOutcomes = input.track_outcomes || input.trackOutcomes;
+  if (!trackOutcomes) return null;
+  const stages = Array.isArray(trackOutcomes.stages)
+    ? trackOutcomes.stages
+    : (Array.isArray(trackOutcomes.outcome_stages) ? trackOutcomes.outcome_stages : []);
+  const outcomeStageIds = Array.from(new Set(stages.map((stageId) => String(stageId || '').trim()).filter(Boolean)));
+  if (!outcomeStageIds.length) throw new Error('track_outcomes.stages must include at least one outcome stage ID');
+  return {
+    outcomeStageIds,
+    asOfBoundary: parseHubSpotAsOfBoundary(trackOutcomes.as_of_date || trackOutcomes.asOfDate, 'track_outcomes.as_of_date'),
+    includeDealDetails: trackOutcomes.include_deal_details === true || trackOutcomes.includeDealDetails === true,
+  };
+}
+
+function summarizeHubSpotStageCohortOutcomes(cohortDeals, outcomeTracking) {
+  if (!outcomeTracking) return null;
+  const outcomes = { still_active: 0 };
+  const dealIdsByOutcome = { still_active: [] };
+  const dealDetailsByOutcome = outcomeTracking.includeDealDetails ? { still_active: [] } : null;
+  const outcomeDays = {};
+
+  for (const stageId of outcomeTracking.outcomeStageIds) {
+    outcomes[stageId] = 0;
+    dealIdsByOutcome[stageId] = [];
+    if (dealDetailsByOutcome) dealDetailsByOutcome[stageId] = [];
+    outcomeDays[stageId] = [];
+  }
+
+  for (const cohortDeal of cohortDeals) {
+    const outcome = firstOutcomeAfterEntry(
+      cohortDeal.deal,
+      cohortDeal.entry,
+      outcomeTracking.outcomeStageIds,
+      outcomeTracking.asOfBoundary,
+    );
+    const key = outcome ? outcome.value : 'still_active';
+    outcomes[key] += 1;
+    dealIdsByOutcome[key].push(cohortDeal.id);
+
+    const detail = {
+      id: cohortDeal.id,
+      dealname: cohortDeal.dealname,
+      entered_stage_at: cohortDeal.entered_stage_at,
+      current_stage_id: cohortDeal.current_stage_id,
+      url: cohortDeal.url,
+    };
+
+    if (outcome) {
+      const entryMs = new Date(cohortDeal.entered_stage_at).getTime();
+      const outcomeMs = new Date(outcome.timestamp).getTime();
+      const daysToOutcome = (outcomeMs - entryMs) / 86400000;
+      outcomeDays[key].push(daysToOutcome);
+      Object.assign(detail, {
+        outcome_stage_id: outcome.value,
+        outcome_entered_at: new Date(outcome.timestamp).toISOString(),
+        days_to_outcome: Number(daysToOutcome.toFixed(2)),
+      });
+    }
+
+    if (dealDetailsByOutcome) dealDetailsByOutcome[key].push(detail);
+  }
+
+  const averageDaysToOutcome = {};
+  for (const [stageId, days] of Object.entries(outcomeDays)) {
+    averageDaysToOutcome[stageId] = days.length
+      ? Number((days.reduce((sum, dayCount) => sum + dayCount, 0) / days.length).toFixed(2))
+      : null;
+  }
+
+  return {
+    outcome_stage_ids: outcomeTracking.outcomeStageIds,
+    as_of_date: outcomeTracking.asOfBoundary ? outcomeTracking.asOfBoundary.input : '',
+    as_of_cutoff: outcomeTracking.asOfBoundary ? outcomeTracking.asOfBoundary.date.toISOString() : '',
+    as_of_cutoff_exclusive: outcomeTracking.asOfBoundary ? outcomeTracking.asOfBoundary.exclusive : false,
+    outcome_selection: 'first_tracked_outcome_after_entry',
+    outcomes,
+    deal_ids_by_outcome: dealIdsByOutcome,
+    average_days_to_outcome: averageDaysToOutcome,
+    ...(dealDetailsByOutcome ? { deal_details_by_outcome: dealDetailsByOutcome } : {}),
+  };
 }
 
 async function searchHubSpotDealsForPipeline(pipelineId, maxDeals = 10000) {
@@ -1241,6 +1365,7 @@ async function countHubSpotDealsEnteredStage(input = {}) {
   const startDate = parseHubSpotDateBoundary(input.start_date, 'start_date');
   const endDate = parseHubSpotDateBoundary(input.end_date, 'end_date');
   if (endDate <= startDate) throw new Error('end_date must be after start_date');
+  const outcomeTracking = normalizeHubSpotOutcomeTracking(input);
 
   const maxDeals = Math.min(Math.max(Number(input.max_deals || 10000), 1), 10000);
   const { deals: pipelineDeals, truncated: searchTruncated } = await searchHubSpotDealsForPipeline(pipelineId, maxDeals);
@@ -1249,19 +1374,22 @@ async function countHubSpotDealsEnteredStage(input = {}) {
   const byId = new Map(pipelineDeals.map((deal) => [String(deal.id), deal]));
   const matches = [];
   const missingHistory = [];
+  const cohortDeals = [];
 
   for (const deal of dealsWithHistory) {
     const entry = dealEnteredStageInRange(deal, stageId, startDate, endDate);
     if (entry) {
       const properties = deal.properties || {};
-      matches.push({
+      const match = {
         id: String(deal.id),
         dealname: properties.dealname || '',
         entered_stage_at: new Date(entry.timestamp).toISOString(),
         current_stage_id: properties.dealstage || '',
         createdate: properties.createdate || '',
         url: hubspotRecordUrl('0-3', deal.id),
-      });
+      };
+      matches.push(match);
+      cohortDeals.push({ ...match, deal, entry });
       continue;
     }
     const fallbackDeal = byId.get(String(deal.id));
@@ -1275,6 +1403,8 @@ async function countHubSpotDealsEnteredStage(input = {}) {
   }
 
   matches.sort((a, b) => new Date(a.entered_stage_at).getTime() - new Date(b.entered_stage_at).getTime());
+  cohortDeals.sort((a, b) => new Date(a.entered_stage_at).getTime() - new Date(b.entered_stage_at).getTime());
+  const outcomeSummary = summarizeHubSpotStageCohortOutcomes(cohortDeals, outcomeTracking);
 
   return {
     pipeline_id: pipelineId,
@@ -1293,6 +1423,7 @@ async function countHubSpotDealsEnteredStage(input = {}) {
     },
     results: matches,
     missing_history_current_stage_deals: missingHistory,
+    ...(outcomeSummary ? { cohort_outcomes: outcomeSummary } : {}),
   };
 }
 
@@ -2023,6 +2154,25 @@ const TOOLS = [
         start_date: { type: 'string', description: 'Inclusive start date/time. Use ISO with timezone for business-month boundaries, e.g. 2026-02-01T00:00:00-08:00, or YYYY-MM-DD for Pacific midnight.' },
         end_date: { type: 'string', description: 'Exclusive end date/time. Use ISO with timezone for business-month boundaries, e.g. 2026-03-01T00:00:00-08:00, or YYYY-MM-DD for Pacific midnight.' },
         max_deals: { type: 'number', description: 'Safety cap for pipeline deals scanned (default 10000, max 10000). coverage.warning is set if truncated.' },
+        track_outcomes: {
+          type: 'object',
+          description: 'Optional cohort outcome tracking. Use this to answer questions like "of deals that entered SQL in January, how many later became Won or Closed/Lost?" Outcomes are classified by the first tracked outcome stage entered after the cohort entry event.',
+          properties: {
+            stages: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Outcome stage IDs to track, e.g. ["1166230571", "190380587"] for Won and Closed/Lost.',
+            },
+            as_of_date: {
+              type: 'string',
+              description: 'Optional cutoff. YYYY-MM-DD means through that Pacific business date using an exclusive next-midnight Pacific cutoff; ISO date/time with timezone means up to that exact instant.',
+            },
+            include_deal_details: {
+              type: 'boolean',
+              description: 'When true, include deal-level details grouped by outcome in addition to counts and IDs.',
+            },
+          },
+        },
       },
       required: ['stage_id', 'start_date', 'end_date'],
     },
@@ -2568,6 +2718,8 @@ ALWAYS call hubspot_get_pipeline with pipeline_id 105321581 at the start of any 
 Never rely on hardcoded stage mappings, previous responses, memory, or stale prompt examples. HubSpot stage names and IDs change frequently. The only source of truth for stage configuration is the real-time API response from hubspot_get_pipeline. After fetching the pipeline configuration, use those exact stage names and IDs for all subsequent HubSpot operations in that conversation.
 
 For historical stage cohort questions like "how many SQLs did we have in January" or "how many deals entered S2 last month", first call hubspot_get_pipeline, then call hubspot_count_deals_entered_stage with the exact stage ID and date boundaries. Use Pacific business-month boundaries unless the user specifies another timezone, for example January 2026 is start_date=2026-01-01T00:00:00-08:00 and end_date=2026-02-01T00:00:00-08:00. Do not use createdate, current dealstage only, or hs_date_entered_{stageId} as the primary answer for historical stage-entry counts. The dealstage property history is the correct source for deals that have already moved past the requested stage.
+
+For true cohort conversion questions like "of the 26 SQLs from January, how many later moved to Won or Closed/Lost?", use the same hubspot_count_deals_entered_stage tool with track_outcomes.stages set to the exact Won/Lost stage IDs from hubspot_get_pipeline. Interpret cohort_outcomes.outcomes.still_active as deals that have not entered any tracked outcome stage by the as_of_date cutoff, not as deals currently in the SQL stage.
 
 ### Critical HubSpot data freshness
 You MUST call the relevant HubSpot API for every HubSpot question, even if you just answered a similar question moments ago. Never say "as I mentioned" or "based on what we just discussed" for HubSpot data. Configuration, stages, owners, records, counts, and associations change constantly. Always fetch fresh data before answering or acting. No exceptions.
@@ -4157,6 +4309,7 @@ module.exports = {
   dealEnteredStageInRange,
   executeTool,
   extractStructuredBlockField,
+  firstOutcomeAfterEntry,
   formatProspectWorkflowResponse,
   formatWorkflowError,
   getSystemPrompt,
@@ -4171,6 +4324,8 @@ module.exports = {
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
   normalizeHubSpotPropertyValue,
+  normalizeHubSpotOutcomeTracking,
+  parseHubSpotAsOfBoundary,
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
@@ -4183,5 +4338,6 @@ module.exports = {
   runStructuredDealCreateWorkflow,
   shouldSetLifecycleToOpportunity,
   startSlackBot,
+  summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
 };

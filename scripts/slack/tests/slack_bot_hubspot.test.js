@@ -22,6 +22,7 @@ const {
   dealEnteredStageInRange,
   executeTool,
   extractStructuredBlockField,
+  firstOutcomeAfterEntry,
   formatProspectWorkflowResponse,
   getSystemPrompt,
   grainRecordingMatchesSearch,
@@ -33,6 +34,8 @@ const {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
+  normalizeHubSpotOutcomeTracking,
+  parseHubSpotAsOfBoundary,
   parseHubSpotDateBoundary,
   parseGrainSearchDateRange,
   parseStructuredDealRequest,
@@ -41,6 +44,7 @@ const {
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
+  summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
 } = require('../slack_bot');
 
@@ -276,6 +280,14 @@ function testDealNotesPromptAndTools() {
     TOOLS.find((tool) => tool.name === 'hubspot_count_deals_entered_stage').description,
     /dealstage property history/,
   );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_count_deals_entered_stage').input_schema.properties.track_outcomes.description,
+    /cohort outcome tracking/,
+  );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_count_deals_entered_stage').input_schema.properties.track_outcomes.description,
+    /first tracked outcome stage/,
+  );
 
   const prompt = getSystemPrompt();
   assert.match(prompt, /Deal notes and deal summaries/);
@@ -295,6 +307,9 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /You MUST call the relevant HubSpot API for every HubSpot question/);
   assert.match(prompt, /hubspot_count_deals_entered_stage/);
   assert.match(prompt, /Do not use createdate, current dealstage only, or hs_date_entered_\{stageId\}/);
+  assert.match(prompt, /true cohort conversion questions/);
+  assert.match(prompt, /track_outcomes\.stages/);
+  assert.match(prompt, /cohort_outcomes\.outcomes\.still_active/);
   assert.match(prompt, /Recruiting calendar scheduling/);
   assert.match(prompt, /recruiting_create_calendar_invite/);
 }
@@ -360,6 +375,28 @@ function testHubSpotStageHistoryHelpers() {
     () => parseHubSpotDateBoundary('January 1, 2026', 'start_date'),
     /ISO date\/time with timezone or YYYY-MM-DD/,
   );
+  assert.deepStrictEqual(
+    normalizeHubSpotOutcomeTracking({
+      track_outcomes: {
+        stages: ['1166230571', '190380587', '1166230571'],
+        as_of_date: '2026-04-01',
+        include_deal_details: true,
+      },
+    }),
+    {
+      outcomeStageIds: ['1166230571', '190380587'],
+      asOfBoundary: {
+        date: new Date('2026-04-02T07:00:00.000Z'),
+        exclusive: true,
+        input: '2026-04-01',
+      },
+      includeDealDetails: true,
+    },
+  );
+  assert.strictEqual(parseHubSpotAsOfBoundary('2026-04-01', 'as_of_date').date.toISOString(), '2026-04-02T07:00:00.000Z');
+  assert.strictEqual(parseHubSpotAsOfBoundary('2026-04-01', 'as_of_date').exclusive, true);
+  assert.strictEqual(parseHubSpotAsOfBoundary('2026-04-01T12:30:00-07:00', 'as_of_date').date.toISOString(), '2026-04-01T19:30:00.000Z');
+  assert.strictEqual(parseHubSpotAsOfBoundary('2026-04-01T12:30:00-07:00', 'as_of_date').exclusive, false);
 
   const deal = {
     id: '123',
@@ -404,6 +441,115 @@ function testHubSpotStageHistoryHelpers() {
     ),
     null,
   );
+}
+
+function testHubSpotStageCohortOutcomes() {
+  const wonStageId = '1166230571';
+  const lostStageId = '190380587';
+  const wonDeal = {
+    id: 'won-1',
+    propertiesWithHistory: {
+      dealstage: [
+        { value: '190380582', timestamp: '2026-01-10T18:00:00.000Z' },
+        { value: wonStageId, timestamp: '2026-02-20T18:00:00.000Z' },
+      ],
+    },
+  };
+  const lateLostDeal = {
+    id: 'late-lost-1',
+    propertiesWithHistory: {
+      dealstage: [
+        { value: '190380582', timestamp: '2026-01-11T18:00:00.000Z' },
+        { value: lostStageId, timestamp: '2026-04-03T06:59:59.000Z' },
+      ],
+    },
+  };
+  const activeDeal = {
+    id: 'active-1',
+    propertiesWithHistory: {
+      dealstage: [
+        { value: '190380582', timestamp: '2026-01-12T18:00:00.000Z' },
+        { value: '190380586', timestamp: '2026-02-15T18:00:00.000Z' },
+      ],
+    },
+  };
+
+  assert.deepStrictEqual(
+    firstOutcomeAfterEntry(
+      wonDeal,
+      { timestamp: '2026-01-10T18:00:00.000Z' },
+      [wonStageId, lostStageId],
+      null,
+    ),
+    { value: wonStageId, timestamp: '2026-02-20T18:00:00.000Z', sourceType: '' },
+  );
+
+  const summary = summarizeHubSpotStageCohortOutcomes(
+    [
+      {
+        id: 'won-1',
+        dealname: 'Won Co',
+        entered_stage_at: '2026-01-10T18:00:00.000Z',
+        current_stage_id: wonStageId,
+        url: 'https://example.com/won',
+        deal: wonDeal,
+        entry: { timestamp: '2026-01-10T18:00:00.000Z' },
+      },
+      {
+        id: 'late-lost-1',
+        dealname: 'Late Lost Co',
+        entered_stage_at: '2026-01-11T18:00:00.000Z',
+        current_stage_id: lostStageId,
+        url: 'https://example.com/lost',
+        deal: lateLostDeal,
+        entry: { timestamp: '2026-01-11T18:00:00.000Z' },
+      },
+      {
+        id: 'active-1',
+        dealname: 'Active Co',
+        entered_stage_at: '2026-01-12T18:00:00.000Z',
+        current_stage_id: '190380586',
+        url: 'https://example.com/active',
+        deal: activeDeal,
+        entry: { timestamp: '2026-01-12T18:00:00.000Z' },
+      },
+    ],
+    {
+      outcomeStageIds: [wonStageId, lostStageId],
+      asOfBoundary: parseHubSpotAsOfBoundary('2026-04-01', 'track_outcomes.as_of_date'),
+      includeDealDetails: false,
+    },
+  );
+
+  assert.deepStrictEqual(summary.outcomes, {
+    still_active: 2,
+    [wonStageId]: 1,
+    [lostStageId]: 0,
+  });
+  assert.deepStrictEqual(summary.deal_ids_by_outcome[wonStageId], ['won-1']);
+  assert.deepStrictEqual(summary.deal_ids_by_outcome.still_active, ['late-lost-1', 'active-1']);
+  assert.strictEqual(summary.as_of_date, '2026-04-01');
+  assert.strictEqual(summary.as_of_cutoff_exclusive, true);
+  assert.strictEqual(summary.outcome_selection, 'first_tracked_outcome_after_entry');
+  assert.strictEqual(summary.average_days_to_outcome[wonStageId], 41);
+
+  const detailedSummary = summarizeHubSpotStageCohortOutcomes(
+    [{
+      id: 'won-1',
+      dealname: 'Won Co',
+      entered_stage_at: '2026-01-10T18:00:00.000Z',
+      current_stage_id: wonStageId,
+      url: 'https://example.com/won',
+      deal: wonDeal,
+      entry: { timestamp: '2026-01-10T18:00:00.000Z' },
+    }],
+    {
+      outcomeStageIds: [wonStageId, lostStageId],
+      asOfBoundary: null,
+      includeDealDetails: true,
+    },
+  );
+  assert.strictEqual(detailedSummary.deal_details_by_outcome[wonStageId][0].outcome_stage_id, wonStageId);
 }
 
 function testGrainSearchFilteringHelpers() {
@@ -524,6 +670,7 @@ async function run() {
   testDealNotesPromptAndTools();
   testRecruitingCalendarInviteBuilderAndAuthorization();
   testHubSpotStageHistoryHelpers();
+  testHubSpotStageCohortOutcomes();
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();
   testProspectWorkflowResponseIncludesHubSpotLinks();
