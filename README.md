@@ -391,7 +391,7 @@ Workflow:
   - `Reject` -> delayed rejection draft after 24 hours
   - After candidate reply -> propose first available 20-minute slot and draft scheduling reply
 
-No calendar event is auto-created in this flow.
+After a candidate confirms a proposed slot, the coordinator creates a Google Calendar invite with Google Meet and drafts the confirmation email.
 
 ### Setup
 
