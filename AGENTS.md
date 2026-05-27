@@ -17,6 +17,8 @@
 
 11. After pushing changes that affect the Slack/Claude bot runtime, verify Railway auto-deploy status for the pushed commit before final handoff. Use GitHub deployments/statuses when the local Railway CLI is not linked to the correct project.
 
+12. Railway account scope is folder-specific. In this repo, Railway must use the Truewind / mercedes-claude account (`mercedes@trytruewind.com`, workspace `Truewind`), not the personal account (`chienmercedes@gmail.com`). Prefer `npm run railway:truewind -- <railway args>` for Railway commands. If the guard reports the wrong account, stop and ask the user to run `railway login --browserless` and choose the Truewind / mercedes-claude account.
+
 ## Default Path (All Tasks)
 
 1. Task log
@@ -49,3 +51,4 @@
 - PR creation: `gh` (or your org's wrapper)
 - Skills sync into Codex: `./.codex/scripts/codex-skills/sync_codex_skills.sh`
 - Railway deploy verification: `gh api repos/mchien-truewind/leads-update/deployments` and then `gh api repos/mchien-truewind/leads-update/deployments/<deployment_id>/statuses`.
+- Guarded Truewind Railway CLI: `npm run railway:truewind -- <railway args>`.

@@ -11,6 +11,7 @@
     "lead-status-sync": "node scripts/slack/lead_status_sync.js",
     "lead-status-sync:dry-run": "node scripts/slack/lead_status_sync.js --dry-run --skip-slack",
     "lead-status-sync:full": "node scripts/slack/lead_status_sync.js --full",
+    "railway:truewind": "node scripts/railway-truewind.js",
     "test": "node --test"
   },
   "repository": {
