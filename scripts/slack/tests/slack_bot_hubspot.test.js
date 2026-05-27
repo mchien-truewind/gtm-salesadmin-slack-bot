@@ -362,10 +362,77 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
   const logged = redactedToolInputForLog('recruiting_create_calendar_invite', {
     candidate_email: 'candidate@example.com',
     candidate_name: 'Casey Candidate',
+    extra_attendees: ['interviewer@example.com'],
     start_datetime: '2026-05-28T14:00:00-07:00',
   });
-  assert.doesNotMatch(logged, /candidate@example\.com|Casey Candidate/);
+  assert.doesNotMatch(logged, /candidate@example\.com|Casey Candidate|interviewer@example\.com/);
   assert.match(logged, /redacted/);
+}
+
+async function testRecruitingCalendarInviteExecuteToolAuthAndIdempotency() {
+  let insertCalls = 0;
+  let getCalls = 0;
+  let insertedRequest = null;
+  const calendarService = {
+    events: {
+      insert: async (request) => {
+        insertCalls += 1;
+        insertedRequest = request;
+        const err = new Error('duplicate');
+        err.code = 409;
+        throw err;
+      },
+      get: async (request) => {
+        getCalls += 1;
+        return {
+          data: {
+            id: request.eventId,
+            summary: 'Truewind Intro Call - Casey Candidate',
+            htmlLink: 'https://calendar.google.com/event?eid=test',
+            start: { dateTime: '2026-05-28T14:00:00-07:00' },
+            end: { dateTime: '2026-05-28T21:20:00Z' },
+            attendees: [{ email: 'candidate@example.com' }],
+            conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/test' }] },
+          },
+        };
+      },
+    },
+  };
+
+  const spoofed = await executeTool('recruiting_create_calendar_invite', {
+    candidate_email: 'candidate@example.com',
+    candidate_name: 'Casey Candidate',
+    start_datetime: '2026-05-28T14:00:00-07:00',
+    slack_user_id: 'U_TEST',
+    __trusted_slack_metadata: { slack_user_id: 'U_TEST' },
+  }, { calendar_service: calendarService });
+  assert.match(spoofed, /not authorized to create recruiting calendar invite/);
+  assert.strictEqual(insertCalls, 0);
+
+  const created = await executeTool('recruiting_create_calendar_invite', {
+    candidate_email: 'candidate@example.com',
+    candidate_name: 'Casey Candidate',
+    start_datetime: '2026-05-28T14:00:00-07:00',
+    extra_attendees: ['interviewer@example.com'],
+    slack_user_id: 'U_OTHER_SHOULD_BE_IGNORED',
+  }, {
+    slack_user_id: 'U_TEST',
+    channel_id: 'C123',
+    thread_ts: '1770000000.000100',
+    calendar_service: calendarService,
+  });
+  const parsed = JSON.parse(created);
+  assert.match(parsed.id, /^rc[0-9a-f]{32}$/);
+  assert.strictEqual(parsed.meetUrl, 'https://meet.google.com/test');
+  assert.strictEqual(insertCalls, 1);
+  assert.strictEqual(getCalls, 1);
+  assert.strictEqual(insertedRequest.calendarId, 'primary');
+  assert.strictEqual(insertedRequest.requestBody.summary, 'Truewind Intro Call - Casey Candidate');
+  assert.deepStrictEqual(
+    insertedRequest.requestBody.attendees,
+    [{ email: 'candidate@example.com' }, { email: 'interviewer@example.com' }],
+  );
+  assert.strictEqual(insertedRequest.body, undefined);
 }
 
 function testHubSpotStageHistoryHelpers() {
@@ -669,6 +736,7 @@ async function run() {
   testDealOwnerResolution();
   testDealNotesPromptAndTools();
   testRecruitingCalendarInviteBuilderAndAuthorization();
+  await testRecruitingCalendarInviteExecuteToolAuthAndIdempotency();
   testHubSpotStageHistoryHelpers();
   testHubSpotStageCohortOutcomes();
   testGrainSearchFilteringHelpers();

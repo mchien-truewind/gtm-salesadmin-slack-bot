@@ -427,7 +427,7 @@ async function createRecruitingCalendarInvite(input = {}) {
     return `Error: not authorized to create recruiting calendar invite: ${authorization.reason}`;
   }
   const payload = buildRecruitingCalendarInvite(input);
-  const calendar = google.calendar({ version: 'v3', auth: createCalendarOAuthClient() });
+  const calendar = input.__calendar_service || google.calendar({ version: 'v3', auth: createCalendarOAuthClient() });
   let created;
   try {
     created = await calendar.events.insert({
@@ -2369,9 +2369,6 @@ const TOOLS = [
         send_updates: { type: 'string', description: 'Google notification behavior: all, externalOnly, or none. Default all.' },
         with_meet: { type: 'boolean', description: 'Whether to create a Google Meet link. Default true.' },
         extra_attendees: { type: 'array', items: { type: 'string' }, description: 'Optional additional attendee emails.' },
-        channel_id: { type: 'string', description: 'Slack channel_id from metadata for calendar write authorization.' },
-        slack_user_id: { type: 'string', description: 'Slack user_id from metadata for calendar write authorization.' },
-        thread_ts: { type: 'string', description: 'Slack thread_ts from metadata for idempotent Meet request IDs.' },
       },
       required: ['candidate_email', 'start_datetime'],
     },
@@ -2424,15 +2421,22 @@ const TOOLS = [
 // ============================================================
 // Tool execution
 // ============================================================
+function stripInternalToolInput(input = {}) {
+  return Object.fromEntries(
+    Object.entries(input || {}).filter(([key]) => !String(key).startsWith('__'))
+  );
+}
+
 async function executeTool(name, input = {}, runtimeContext = {}) {
   try {
     const toolInput = {
-      ...input,
+      ...stripInternalToolInput(input),
       __trusted_slack_metadata: {
         channel_id: runtimeContext.channel_id || '',
         slack_user_id: runtimeContext.slack_user_id || '',
         thread_ts: runtimeContext.thread_ts || '',
       },
+      ...(runtimeContext.calendar_service ? { __calendar_service: runtimeContext.calendar_service } : {}),
     };
     const hubspotWriteTools = new Set([
       'hubspot_create_contact',
@@ -2952,6 +2956,9 @@ function redactedToolInputForLog(name, input = {}) {
   const redacted = { ...input };
   for (const key of ['candidate_email', 'email', 'attendee_email', 'candidate_name', 'name']) {
     if (redacted[key]) redacted[key] = '[redacted]';
+  }
+  if (Array.isArray(redacted.extra_attendees)) {
+    redacted.extra_attendees = redacted.extra_attendees.map(() => '[redacted]');
   }
   return JSON.stringify(redacted);
 }
