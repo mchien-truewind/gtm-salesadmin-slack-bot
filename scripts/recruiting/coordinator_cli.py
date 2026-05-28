@@ -78,6 +78,13 @@ DEFAULT_SCHEDULING_CONFIRM_TEMPLATE = (
     "Thanks for confirming. You're booked for a 20-minute intro call on {slot_label}. "
     "Calendar invite with the Google Meet link is on the way."
 )
+DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE = (
+    "Hi {{first name}},\n\n"
+    "Haven't heard from you in a while, so I'm going to go ahead and close the application.\n\n"
+    "We are growing quickly and have new positions opening up often. Please let us know if another role "
+    "piques your interest and we'd be open to seeing your application again soon.\n\n"
+    "Mercedes"
+)
 DEFAULT_NO_RESPONSE_TEMPLATE = (
     "We haven't heard back from you and we're closing this process.\n\n"
     "We're growing quickly, though, and new roles open up often. Please keep checking our careers page "
@@ -2796,6 +2803,43 @@ def render_no_response_template(template: str, first_name: str) -> str:
     return body
 
 
+def send_reply_email(
+    gmail_service,
+    *,
+    sender_email: str,
+    to_email: str,
+    thread_id: str,
+    body_text: str,
+    subject_override: str | None = None,
+) -> str:
+    subject, replied_message_id, references = extract_last_thread_message_headers(gmail_service, thread_id)
+    reply_subject = subject_override or (subject if subject.lower().startswith("re:") else f"Re: {subject}")
+    merged_references = references if replied_message_id in references else f"{references} {replied_message_id}".strip()
+    first_name = resolve_recipient_first_name(gmail_service, thread_id, to_email)
+    body_with_greeting = apply_email_greeting(body_text, first_name)
+
+    message = EmailMessage()
+    message["From"] = sender_email
+    message["To"] = to_email
+    message["Subject"] = reply_subject
+    if replied_message_id:
+        message["In-Reply-To"] = replied_message_id
+    if merged_references:
+        message["References"] = merged_references
+    if normalize_email(to_email) != normalize_email(DEFAULT_DRAFT_BCC):
+        message["Bcc"] = DEFAULT_DRAFT_BCC
+    message.set_content(body_with_greeting)
+
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    sent = (
+        gmail_service.users()
+        .messages()
+        .send(userId="me", body={"raw": raw, "threadId": thread_id})
+        .execute()
+    )
+    return sent.get("id", "")
+
+
 def message_implies_rejection(haystack: str) -> bool:
     text = clean_text(haystack)
     if not text:
@@ -3140,6 +3184,17 @@ def any_thread_has_label(gmail_service, *, thread_ids: list[str], label_id: str)
         if thread_has_label(gmail_service, thread_id=thread_id, label_id=label_id):
             return True
     return False
+
+
+def add_business_days(start: datetime, days: int, timezone_name: str) -> datetime:
+    local_dt = start.astimezone(ZoneInfo(timezone_name))
+    current = local_dt
+    added = 0
+    while added < days:
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current.astimezone(timezone.utc)
 
 
 def remove_labels_from_thread(gmail_service, *, thread_id: str, label_ids: list[str]) -> bool:
@@ -5466,6 +5521,174 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     print(f"Scheduling drafts created: {scheduling_drafts}")
 
 
+def close_stale_custom_gpt_cmd(args: argparse.Namespace) -> None:
+    config = load_config()
+    notion = NotionClient(config.notion_token, config.notion_database_id)
+    database_schema = notion.get_database()
+    properties_schema = database_schema.get("properties", {})
+    prop = resolve_property_map(config.property_map, database_schema)
+
+    gmail_service = ensure_google_service(
+        api_name="gmail",
+        api_version="v1",
+        scopes=GMAIL_SCOPES,
+        credentials_env="GOOGLE_GMAIL_CREDENTIALS_FILE",
+        credentials_default="secrets/google-gmail-credentials.json",
+        token_env="GOOGLE_GMAIL_TOKEN_FILE",
+        token_default="secrets/google-gmail-token.json",
+        help_text="Set GOOGLE_GMAIL_CREDENTIALS_FILE or place Gmail OAuth credentials in secrets/.",
+    )
+    pages = notion.query_pages({"page_size": 100})
+    dry_run = not args.send
+    business_days = max(int(args.business_days), 0)
+    now = now_local(config.timezone_name)
+    now_utc = now.astimezone(timezone.utc)
+    message_template = args.message or DEFAULT_CUSTOM_GPT_NO_RESPONSE_REJECTION_TEMPLATE
+
+    title_prop_name = resolve_title_property_name(properties_schema, prop.candidate_name)
+    hiring_label_id = ""
+    if config.gmail_label_name:
+        try:
+            hiring_label_id = gmail_label_id(gmail_service, config.gmail_label_name)
+        except Exception:
+            hiring_label_id = ""
+    pipeline_label_id = ""
+    if config.pipeline_label_name:
+        try:
+            pipeline_label_id = gmail_label_id(gmail_service, config.pipeline_label_name)
+        except Exception:
+            pipeline_label_id = ""
+
+    internal_domains = {email_domain(config.from_email)}
+    if config.hiring_alias:
+        internal_domains.add(email_domain(config.hiring_alias))
+    internal_domains.discard("")
+
+    scanned = 0
+    eligible: list[dict[str, Any]] = []
+    skipped: Counter[str] = Counter()
+    sent = 0
+    updated = 0
+    failures: list[str] = []
+
+    for page in pages:
+        page_props = page.get("properties", {})
+        current_status = notion_prop_value(page_props.get(prop.status, {})).strip()
+        if current_status.lower() != "in customgpt process":
+            continue
+        scanned += 1
+
+        candidate_name = notion_prop_value(page_props.get(title_prop_name, {})).strip() or "Candidate"
+        candidate_email = notion_prop_value(page_props.get(prop.email, {})).strip()
+        thread_id = notion_prop_value(page_props.get(prop.gmail_thread_id, {})).strip()
+        if not candidate_email or not thread_id:
+            skipped["missing_email_or_thread"] += 1
+            continue
+
+        related_thread_ids = candidate_related_thread_ids(
+            gmail_service,
+            candidate_email=candidate_email,
+            primary_thread_id=thread_id,
+            internal_domains=internal_domains,
+            hiring_label_id=hiring_label_id,
+        )
+        reply_thread_id = preferred_reply_thread_id(
+            gmail_service,
+            thread_ids=related_thread_ids,
+            fallback_thread_id=thread_id,
+        )
+        assignment_sent_at = thread_latest_assignment_sent_at_any_thread(
+            gmail_service,
+            thread_ids=related_thread_ids,
+            sender_email=config.from_email,
+            keywords=config.assignment_keywords,
+        )
+        if not assignment_sent_at:
+            skipped["no_assignment_sent_match"] += 1
+            continue
+
+        due_at = add_business_days(assignment_sent_at, business_days, config.timezone_name)
+        if now_utc <= due_at:
+            skipped["not_past_business_day_threshold"] += 1
+            continue
+
+        reply_dt, _reply_text = latest_candidate_message_since_any_thread(
+            gmail_service,
+            thread_ids=related_thread_ids,
+            candidate_email=candidate_email,
+            since=assignment_sent_at,
+        )
+        if reply_dt:
+            skipped["candidate_replied_after_assignment"] += 1
+            continue
+
+        first_name = extract_first_name(candidate_name, candidate_email)
+        body = render_no_response_template(message_template, first_name)
+        item = {
+            "page_id": page.get("id", ""),
+            "candidate_name": candidate_name,
+            "candidate_email": candidate_email,
+            "thread_id": thread_id,
+            "reply_thread_id": reply_thread_id,
+            "assignment_sent_at": assignment_sent_at.isoformat(),
+            "due_at": due_at.isoformat(),
+            "notion_url": notion_page_url(page.get("id", "")),
+        }
+        eligible.append(item)
+
+        if dry_run:
+            continue
+
+        try:
+            message_id = send_reply_email(
+                gmail_service,
+                sender_email=config.from_email,
+                to_email=candidate_email,
+                thread_id=reply_thread_id,
+                body_text=body,
+            )
+            if not message_id:
+                raise RuntimeError("Gmail send returned no message id")
+            sent += 1
+            update_payload: dict[str, Any] = {}
+            if prop.status in properties_schema:
+                update_payload[prop.status] = build_notion_value(properties_schema[prop.status], "Rejected")
+            if prop.decision in properties_schema:
+                update_payload[prop.decision] = build_notion_value(properties_schema[prop.decision], "Reject")
+            if prop.decision_time in properties_schema:
+                update_payload[prop.decision_time] = build_notion_value(properties_schema[prop.decision_time], iso(now))
+            if prop.reject_draft_id in properties_schema:
+                update_payload[prop.reject_draft_id] = build_notion_value(properties_schema[prop.reject_draft_id], "")
+            if prop.reject_send_at in properties_schema:
+                update_payload[prop.reject_send_at] = build_notion_value(properties_schema[prop.reject_send_at], "")
+            if update_payload:
+                notion.update_page(page["id"], {k: v for k, v in update_payload.items() if v is not None})
+                updated += 1
+            closeout_labels = [label_id for label_id in (hiring_label_id, pipeline_label_id) if label_id]
+            if closeout_labels:
+                remove_labels_from_threads(
+                    gmail_service,
+                    thread_ids=related_thread_ids,
+                    label_ids=closeout_labels,
+                )
+        except Exception as exc:
+            failures.append(f"{candidate_name} <{candidate_email}>: {exc}")
+
+    print(json.dumps({
+        "dry_run": dry_run,
+        "business_days": business_days,
+        "scanned_in_custom_gpt_process": scanned,
+        "eligible_count": len(eligible),
+        "sent": sent,
+        "notion_updated": updated,
+        "skipped": dict(skipped),
+        "failures": failures,
+        "eligible": eligible,
+    }, indent=2))
+    if failures:
+        raise SystemExit(1)
+
+
 def sync_slack_decisions_cmd(_args: argparse.Namespace) -> None:
     config = load_config()
     if not slack_enabled(config):
@@ -5688,6 +5911,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Post the non-terminal ATS Slack digest immediately without consuming a scheduled slot",
     )
     follow_up_test_parser.set_defaults(func=post_ats_follow_up_test_cmd)
+
+    close_custom_gpt_parser = subparsers.add_parser(
+        "close-stale-custom-gpt",
+        help="Close CustomGPT candidates with no reply after a business-day threshold. Defaults to dry run.",
+    )
+    close_custom_gpt_parser.add_argument(
+        "--business-days",
+        type=int,
+        default=3,
+        help="Business days to wait after the CustomGPT assignment was sent. Default: 3.",
+    )
+    close_custom_gpt_parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Actually send the closeout email and mark eligible candidates rejected. Omit for dry run.",
+    )
+    close_custom_gpt_parser.add_argument(
+        "--message",
+        default="",
+        help="Optional closeout message template. Supports {{first name}} or {first_name}.",
+    )
+    close_custom_gpt_parser.set_defaults(func=close_stale_custom_gpt_cmd)
 
     run_parser = subparsers.add_parser(
         "run",
