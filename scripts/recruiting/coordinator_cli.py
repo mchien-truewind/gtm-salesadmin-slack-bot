@@ -2493,10 +2493,38 @@ def notify_rejection_name_verification_failure(
     subagent_reason: str,
     notion_url: str,
 ) -> bool:
-    if not slack_post_enabled(config) or not draft_id:
+    return notify_rejection_draft_issue(
+        config,
+        draft_id=draft_id,
+        issue_key="name_verification_failed",
+        heading="Rejection draft name verification failed. Auto-send skipped.",
+        candidate_name=candidate_name,
+        candidate_email=candidate_email,
+        details=[
+            f"*Draft greeting:* `{greeting_first_name or '(missing)'}`",
+            f"*Subagent reason:* {subagent_reason or 'No reason returned'}",
+            f"*Evidence:* {evidence_summary or 'No strong email/resume/LinkedIn name evidence'}",
+        ],
+        notion_url=notion_url,
+    )
+
+
+def notify_rejection_draft_issue(
+    config: Config,
+    *,
+    draft_id: str,
+    issue_key: str,
+    heading: str,
+    candidate_name: str,
+    candidate_email: str,
+    details: list[str],
+    notion_url: str,
+) -> bool:
+    if not slack_post_enabled(config):
         return False
+    notification_key = f"{issue_key}:{draft_id or candidate_email}"
     already_notified = load_rejection_name_failure_notified_drafts(config.slack_state_file)
-    if draft_id in already_notified:
+    if notification_key in already_notified or (issue_key == "name_verification_failed" and draft_id in already_notified):
         return False
     try:
         client = slack_post_client(config)
@@ -2506,12 +2534,11 @@ def notify_rejection_name_verification_failure(
 
     mention_prefix = f"<@{config.slack_mention_user_id}> " if config.slack_mention_user_id else ""
     lines = [
-        f"{mention_prefix}Rejection draft name verification failed. Auto-send skipped.",
+        f"{mention_prefix}{heading}",
         f"*Candidate:* {candidate_name}",
         f"*Email:* `{candidate_email}`",
-        f"*Draft greeting:* `{greeting_first_name or '(missing)'}`",
-        f"*Subagent reason:* {subagent_reason or 'No reason returned'}",
-        f"*Evidence:* {evidence_summary or 'No strong email/resume/LinkedIn name evidence'}",
+        f"*Draft ID:* `{draft_id or '(missing)'}`",
+        *details,
     ]
     if notion_url:
         lines.append(f"*ATS:* <{notion_url}|Open Notion row>")
@@ -2519,12 +2546,12 @@ def notify_rejection_name_verification_failure(
     try:
         client.post_message(
             channel_id,
-            f"Rejection draft name verification failed for {candidate_email}",
+            f"Rejection draft issue for {candidate_email}: {heading}",
             [{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
         )
     except Exception:
         return False
-    save_rejection_name_failure_notified_draft(config.slack_state_file, draft_id)
+    save_rejection_name_failure_notified_draft(config.slack_state_file, notification_key)
     return True
 
 
@@ -5325,13 +5352,38 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     )
 
             if reject_draft_id and current_status == "reject drafted":
+                candidate_notion_url = notion_page_url(page.get("id", ""))
                 draft = get_gmail_draft(gmail_service, reject_draft_id)
                 draft_created_at = gmail_draft_created_at(draft or {})
                 now_utc = now.astimezone(timezone.utc)
                 if not draft:
                     reject_drafts_auto_send_skipped_missing += 1
+                    notify_rejection_draft_issue(
+                        config,
+                        draft_id=reject_draft_id,
+                        issue_key="draft_missing",
+                        heading="Rejection draft is missing. Auto-send skipped.",
+                        candidate_name=candidate_name,
+                        candidate_email=candidate_email,
+                        details=[
+                            "*Reason:* Gmail could not find the draft stored on the ATS row.",
+                        ],
+                        notion_url=candidate_notion_url,
+                    )
                 elif not draft_created_at:
                     reject_drafts_auto_send_skipped_missing += 1
+                    notify_rejection_draft_issue(
+                        config,
+                        draft_id=reject_draft_id,
+                        issue_key="draft_timestamp_missing",
+                        heading="Rejection draft timestamp is missing. Auto-send skipped.",
+                        candidate_name=candidate_name,
+                        candidate_email=candidate_email,
+                        details=[
+                            "*Reason:* Gmail returned the draft, but it did not include a usable creation timestamp.",
+                        ],
+                        notion_url=candidate_notion_url,
+                    )
                 elif now_utc - draft_created_at < timedelta(hours=config.reject_draft_auto_send_age_hours):
                     reject_drafts_auto_send_skipped_young += 1
                 else:
@@ -5371,7 +5423,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             greeting_first_name=greeting_first_name,
                             evidence_summary=summarize_name_evidence(name_evidence),
                             subagent_reason=failure_reason,
-                            notion_url=notion_page_url(page.get("id", "")),
+                            notion_url=candidate_notion_url,
                         )
                         print(
                             "Reject draft auto-send skipped (first-name mismatch): "
@@ -5407,6 +5459,18 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                             reject_archive_failures += archive_failures
                         else:
                             reject_drafts_auto_send_skipped_missing += 1
+                            notify_rejection_draft_issue(
+                                config,
+                                draft_id=reject_draft_id,
+                                issue_key="draft_send_failed",
+                                heading="Rejection draft send failed. Auto-send skipped.",
+                                candidate_name=candidate_name,
+                                candidate_email=candidate_email,
+                                details=[
+                                    "*Reason:* Gmail accepted the send request path but did not return a sent message ID.",
+                                ],
+                                notion_url=candidate_notion_url,
+                            )
             elif not reject_send_at:
                 reject_send_at = decision_time + timedelta(hours=config.reject_delay_hours)
                 reject_scheduled += 1
