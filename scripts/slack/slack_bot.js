@@ -79,12 +79,13 @@ const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || process.env.FIRECRAWL
 const FIRECRAWL_API_BASE = (process.env.FIRECRAWL_API_BASE || 'https://api.firecrawl.dev/v1').replace(/\/$/, '');
 const HUBSPOT_PORTAL_ID = process.env.HUBSPOT_PORTAL_ID || '43974586';
 const HUBSPOT_ACTIVITY_PROPERTIES = {
-  meetings: ['hs_meeting_title', 'hs_meeting_body', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hs_activity_type', 'hs_timestamp', 'hubspot_owner_id'],
+  meetings: ['hs_meeting_title', 'hs_meeting_body', 'hs_meeting_start_time', 'hs_meeting_end_time', 'hs_meeting_outcome', 'hs_activity_type', 'hs_timestamp', 'hubspot_owner_id'],
   calls: ['hs_call_title', 'hs_call_body', 'hs_call_disposition', 'hs_call_duration', 'hs_timestamp', 'hubspot_owner_id', 'hs_call_from_number', 'hs_call_to_number'],
   emails: ['hs_email_subject', 'hs_email_text', 'hs_email_html', 'hs_email_from_email', 'hs_email_to_email', 'hs_timestamp', 'hubspot_owner_id'],
   notes: ['hs_note_body', 'hs_timestamp', 'hubspot_owner_id'],
   tasks: ['hs_task_subject', 'hs_task_body', 'hs_task_status', 'hs_task_priority', 'hs_timestamp', 'hubspot_owner_id'],
 };
+const DEFAULT_NO_SHOW_KEYWORDS = ['no-show', 'no show', "didn't show", 'missed', 'did not attend'];
 const HUBSPOT_OBJECT_TYPE_IDS = {
   contacts: '0-1',
   companies: '0-2',
@@ -343,6 +344,23 @@ function isoWithoutMillis(date) {
   return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
+function recruitingCalendarTitle(input = {}, candidateName = '', candidateEmail = '') {
+  const raw = String(
+    input.title
+    || input.email_subject
+    || input.gmail_subject
+    || input.thread_subject
+    || input.summary
+    || ''
+  ).trim();
+  const cleaned = raw
+    .replace(/\[hiring@\]/gi, '')
+    .replace(/^\s*(?:(?:re|fwd?|fw):\s*)+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || `Truewind Intro Call - ${candidateName || candidateEmail}`;
+}
+
 function buildRecruitingCalendarInvite(input = {}) {
   const candidateEmail = normalizeEmail(input.candidate_email || input.email || input.attendee_email);
   if (!isValidEmail(candidateEmail)) throw new Error('candidate_email is required and must be a valid email');
@@ -375,11 +393,7 @@ function buildRecruitingCalendarInvite(input = {}) {
     throw new Error('send_updates must be all, externalOnly, or none');
   }
 
-  const summary = String(
-    input.title
-    || input.summary
-    || `Truewind Intro Call - ${candidateName || candidateEmail}`
-  ).trim();
+  const summary = recruitingCalendarTitle(input, candidateName, candidateEmail);
   const extraAttendees = Array.isArray(input.extra_attendees)
     ? input.extra_attendees.map(normalizeEmail).filter(isValidEmail)
     : [];
@@ -1552,7 +1566,7 @@ async function searchHubSpotDealsForPipeline(pipelineId, maxDeals = 10000) {
       filterGroups: [{
         filters: [{ propertyName: 'pipeline', operator: 'EQ', value: pipelineId }],
       }],
-      properties: ['dealname', 'pipeline', 'dealstage', 'createdate', 'hs_lastmodifieddate'],
+      properties: ['dealname', 'pipeline', 'dealstage', 'createdate', 'hs_lastmodifieddate', 'hubspot_owner_id', 'amount', 'closedate'],
       sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
       limit: Math.min(100, maxDeals - deals.length),
     };
@@ -1768,6 +1782,193 @@ async function getHubSpotAssociatedActivities(input = {}) {
   }
 
   return { deal_id: dealId, activities, coverage };
+}
+
+function normalizeActivityKeywords(keywords) {
+  const values = Array.isArray(keywords) && keywords.length ? keywords : DEFAULT_NO_SHOW_KEYWORDS;
+  return Array.from(new Set(values.map((keyword) => String(keyword || '').trim()).filter(Boolean)));
+}
+
+function normalizeHubSpotActivityTypes(types, fallback = ['meetings', 'calls', 'notes', 'emails']) {
+  const requested = Array.isArray(types) && types.length ? types : fallback;
+  return Array.from(new Set(
+    requested
+      .map((type) => String(type || '').trim().toLowerCase())
+      .filter((type) => HUBSPOT_ACTIVITY_PROPERTIES[type])
+  ));
+}
+
+function stripHubSpotHtml(value) {
+  return String(value || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function activityDisplayFields(type, properties = {}) {
+  if (type === 'meetings') {
+    return {
+      title: properties.hs_meeting_title || '',
+      outcome: properties.hs_meeting_outcome || '',
+      body_excerpt: stripHubSpotHtml(properties.hs_meeting_body).slice(0, 500),
+    };
+  }
+  if (type === 'calls') {
+    return {
+      title: properties.hs_call_title || '',
+      outcome: properties.hs_call_disposition || '',
+      body_excerpt: stripHubSpotHtml(properties.hs_call_body).slice(0, 500),
+    };
+  }
+  if (type === 'emails') {
+    return {
+      title: properties.hs_email_subject || '',
+      from: properties.hs_email_from_email || '',
+      to: properties.hs_email_to_email || '',
+      body_excerpt: stripHubSpotHtml(properties.hs_email_text || properties.hs_email_html).slice(0, 500),
+    };
+  }
+  if (type === 'notes') {
+    return {
+      body_excerpt: stripHubSpotHtml(properties.hs_note_body).slice(0, 500),
+    };
+  }
+  return {};
+}
+
+function activitySearchText(type, properties = {}) {
+  return Object.values(activityDisplayFields(type, properties)).join('\n').toLowerCase();
+}
+
+function matchingActivityKeywords(type, properties, keywords) {
+  const haystack = activitySearchText(type, properties);
+  return keywords.filter((keyword) => haystack.includes(keyword.toLowerCase()));
+}
+
+async function fetchActivitiesForDealsAnalysis(dealIds, activityTypes, maxPerType) {
+  const activitiesByDeal = new Map(dealIds.map((dealId) => [dealId, []]));
+  const coverageByDeal = Object.fromEntries(dealIds.map((dealId) => [dealId, {}]));
+  for (const type of activityTypes) {
+    const associatedByDeal = new Map(dealIds.map((dealId) => [dealId, []]));
+    try {
+      for (const chunk of chunkArray(dealIds, 100)) {
+        const result = await hubspotRequest(`/crm/v4/associations/${HUBSPOT_OBJECT_TYPE_IDS.deals}/${hubSpotObjectType(type)}/batch/read`, 'POST', {
+          inputs: chunk.map((id) => ({ id })),
+        });
+        const chunkMap = parseBatchAssociationResults(result);
+        for (const dealId of chunk) {
+          associatedByDeal.set(dealId, chunkMap.get(dealId) || []);
+        }
+      }
+
+      const uniqueActivityIds = Array.from(new Set(
+        Array.from(associatedByDeal.values()).flatMap((ids) => ids.slice(0, maxPerType))
+      ));
+      const records = await batchReadHubSpotObjects(type, uniqueActivityIds, HUBSPOT_ACTIVITY_PROPERTIES[type]);
+      const recordsById = new Map(records.map((record) => [String(record.id || '').trim(), record]));
+
+      for (const dealId of dealIds) {
+        const ids = associatedByDeal.get(dealId) || [];
+        const truncated = ids.length > maxPerType;
+        coverageByDeal[dealId][type] = {
+          associated_count_returned: Math.min(ids.length, maxPerType),
+          truncated,
+          warning: truncated ? `More than ${maxPerType} associated ${type} exist; scanned the first ${maxPerType}.` : '',
+        };
+        for (const id of ids.slice(0, maxPerType)) {
+          const record = recordsById.get(id);
+          if (record) activitiesByDeal.get(dealId).push({ type, record });
+        }
+      }
+    } catch (err) {
+      for (const dealId of dealIds) {
+        coverageByDeal[dealId][type] = { error: err.message };
+      }
+    }
+  }
+  return { activitiesByDeal, coverageByDeal };
+}
+
+async function analyzeHubSpotDealActivities(input = {}) {
+  const pipelineId = String(input.pipeline_id || TRUEWIND_HUBSPOT.pipeline).trim() || TRUEWIND_HUBSPOT.pipeline;
+  const keywords = normalizeActivityKeywords(input.activity_keywords || input.keywords);
+  const activityTypes = normalizeHubSpotActivityTypes(input.activity_types);
+  const maxDealsRaw = Number(input.max_deals || 500);
+  const maxDeals = Number.isFinite(maxDealsRaw) && maxDealsRaw > 0 ? Math.min(Math.floor(maxDealsRaw), 500) : 500;
+  const maxActivitiesPerTypeRaw = Number(input.limit_per_type || input.max_activities_per_type || 100);
+  const maxActivitiesPerType = Number.isFinite(maxActivitiesPerTypeRaw) && maxActivitiesPerTypeRaw > 0
+    ? Math.min(Math.floor(maxActivitiesPerTypeRaw), 500)
+    : 100;
+
+  const { deals, truncated: searchTruncated } = await searchHubSpotDealsForPipeline(pipelineId, maxDeals);
+  const dealIds = deals.map((deal) => String(deal.id || '').trim()).filter(Boolean);
+  const { activitiesByDeal, coverageByDeal } = await fetchActivitiesForDealsAnalysis(dealIds, activityTypes, maxActivitiesPerType);
+  const keywordCounts = Object.fromEntries(keywords.map((keyword) => [keyword, 0]));
+  const activityTypeCounts = Object.fromEntries(activityTypes.map((type) => [type, 0]));
+  const dealsWithMatches = [];
+
+  for (const deal of deals) {
+    const dealId = String(deal.id || '').trim();
+    if (!dealId) continue;
+    const activities = activitiesByDeal.get(dealId) || [];
+    const matchingActivities = [];
+
+    for (const { type, record } of activities) {
+      const properties = record.properties || {};
+      const matchedKeywords = matchingActivityKeywords(type, properties, keywords);
+      if (!matchedKeywords.length) continue;
+      for (const keyword of matchedKeywords) keywordCounts[keyword] = (keywordCounts[keyword] || 0) + 1;
+      activityTypeCounts[type] = (activityTypeCounts[type] || 0) + 1;
+      matchingActivities.push({
+        id: String(record.id || ''),
+        object_type: type,
+        url: hubspotRecordUrl(record.objectTypeId || HUBSPOT_OBJECT_TYPE_IDS[type] || type, record.id),
+        timestamp: properties.hs_timestamp || properties.hs_meeting_start_time || '',
+        matched_keywords: matchedKeywords,
+        fields: activityDisplayFields(type, properties),
+      });
+    }
+
+    if (matchingActivities.length) {
+      const properties = deal.properties || {};
+      dealsWithMatches.push({
+        deal_id: dealId,
+        dealname: properties.dealname || '',
+        stage_id: properties.dealstage || '',
+        owner_id: properties.hubspot_owner_id || '',
+        amount: properties.amount || '',
+        closedate: properties.closedate || '',
+        url: hubspotRecordUrl('0-3', dealId),
+        matching_activities: matchingActivities,
+      });
+    }
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    activity_keywords: keywords,
+    activity_types: activityTypes,
+    total_deals_analyzed: deals.length,
+    deals_with_matching_activities_count: dealsWithMatches.length,
+    deals_with_matching_activities: dealsWithMatches,
+    summary_counts_by_keyword: keywordCounts,
+    summary_counts_by_activity_type: activityTypeCounts,
+    coverage: {
+      max_deals: maxDeals,
+      max_activities_per_type: maxActivitiesPerType,
+      search_truncated: searchTruncated,
+      warning: searchTruncated
+        ? `Scanned the first ${deals.length} pipeline deals and stopped at max_deals; result may be incomplete.`
+        : '',
+      activity_coverage_by_deal: coverageByDeal,
+    },
+  };
 }
 
 function mergeExistingContactUpdate({ proposed, existingProperties, explicitKeys }) {
@@ -2405,6 +2606,28 @@ const TOOLS = [
     },
   },
   {
+    name: 'hubspot_analyze_deal_activities',
+    description: 'Analyze HubSpot activities across deals in a pipeline to find no-shows, ghosted deals, missed meetings, or other activity text patterns. Scans associated meetings, calls, notes, and emails for keywords and returns matching deal/activity context with coverage metadata.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pipeline_id: { type: 'string', description: 'Pipeline ID (default: Active Pipeline 105321581).' },
+        activity_keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Keywords or phrases to search. Defaults to no-show patterns: no-show, no show, didn\'t show, missed, did not attend.',
+        },
+        max_deals: { type: 'number', description: 'Safety cap for pipeline deals scanned (default 500, max 500). coverage.warning is set if truncated.' },
+        max_activities_per_type: { type: 'number', description: 'Safety cap per activity type per deal (default 100, max 500).' },
+        activity_types: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Activity types to scan. Defaults to meetings, calls, notes, and emails.',
+        },
+      },
+    },
+  },
+  {
     name: 'hubspot_push_truewind_prospect',
     description: 'End-to-end Truewind HubSpot workflow. Use this when asked to push/add/create a prospect, lead, opportunity, or new deal in HubSpot. It requires email, enriches LinkedIn via Firecrawl, creates/updates contact first, creates the MQL deal, creates all required associations, creates a HubSpot note associated to the deal/contact/company when notes are supplied, sets contact lifecycle to opportunity and lead status internal value MQL, and returns exact IDs.',
     input_schema: {
@@ -2605,7 +2828,8 @@ const TOOLS = [
         start_datetime: { type: 'string', description: 'Interview start as ISO datetime with timezone, e.g. 2026-05-28T14:00:00-07:00. Required.' },
         end_datetime: { type: 'string', description: 'Optional end as ISO datetime with timezone. Omit to use duration_minutes.' },
         duration_minutes: { type: 'number', description: 'Duration when end_datetime is omitted. Default 20.' },
-        title: { type: 'string', description: 'Optional calendar title. Defaults to Truewind Intro Call - candidate.' },
+        title: { type: 'string', description: 'Optional calendar title. Use the Gmail email subject when available; the tool removes [hiring@] and reply prefixes.' },
+        email_subject: { type: 'string', description: 'Original Gmail thread/email subject. Preferred source for the calendar title; [hiring@], Re:, and Fwd: prefixes are removed.' },
         description: { type: 'string', description: 'Optional event description.' },
         timezone: { type: 'string', description: 'IANA timezone for display, default America/Los_Angeles.' },
         calendar_id: { type: 'string', description: 'Calendar ID. Defaults to RECRUITING_CALENDAR_ID, GOOGLE_CALENDAR_DEFAULT_CALENDAR_ID, then primary.' },
@@ -2757,6 +2981,10 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
     }
     if (name === 'hubspot_count_deals_entered_stage') {
       const result = await countHubSpotDealsEnteredStage(input);
+      return JSON.stringify(result);
+    }
+    if (name === 'hubspot_analyze_deal_activities') {
+      const result = await analyzeHubSpotDealActivities(input);
       return JSON.stringify(result);
     }
     if (name === 'hubspot_push_truewind_prospect') {
@@ -2971,6 +3199,8 @@ For historical stage cohort questions like "how many SQLs did we have in January
 
 For true cohort conversion questions like "of the 26 SQLs from January, how many later moved to Won or Closed/Lost?", use the same hubspot_count_deals_entered_stage tool with track_outcomes.stages set to the exact Won/Lost stage IDs from hubspot_get_pipeline. Interpret cohort_outcomes.outcomes.still_active as deals that have not entered any tracked outcome stage by the as_of_date cutoff, not as deals currently in the SQL stage.
 
+For no-show, ghosted, missed meeting, or prospect-did-not-attend questions across deals, call hubspot_analyze_deal_activities. Use the default Active Pipeline 105321581 unless the user specifies another pipeline. The tool scans associated meetings, calls, notes, and emails for no-show language and returns coverage metadata; mention coverage.warning if present.
+
 ### Critical HubSpot data freshness
 You MUST call the relevant HubSpot API for every HubSpot question, even if you just answered a similar question moments ago. Never say "as I mentioned" or "based on what we just discussed" for HubSpot data. Configuration, stages, owners, records, counts, and associations change constantly. Always fetch fresh data before answering or acting. No exceptions.
 
@@ -3047,6 +3277,7 @@ For recruiting pipeline questions in #hiring-review, use recruiting_list_outstan
 When someone asks you to schedule, book, or create an invite for a recruiting interview, first-round call, intro call, or candidate screen, use recruiting_create_calendar_invite.
 - Only use it for recruiting/interview scheduling. For customer sales meetings, do not use this tool unless the user explicitly says it is a recruiting interview.
 - Required fields: candidate email and exact start time.
+- Title the calendar event from the Gmail email/thread subject whenever you have it. Pass that subject as title or email_subject; the tool will remove the [hiring@] tag and leading Re:/Fwd: prefixes.
 - If candidate email is missing, ask for the email.
 - If the time is ambiguous, ask for the exact date/time/timezone.
 - Convert natural language times to ISO datetime with timezone before calling the tool. Use America/Los_Angeles when the user does not specify a timezone.
@@ -4577,6 +4808,9 @@ module.exports = {
   classifyProgressDealSource,
   compactProperties,
   countHubSpotDealsEnteredStage,
+  analyzeHubSpotDealActivities,
+  activityDisplayFields,
+  matchingActivityKeywords,
   createRecruitingCalendarInvite,
   deduceLeadSource,
   dealEnteredStageInRange,

@@ -18,6 +18,7 @@ const {
   buildDealNoteBody,
   buildRecruitingCalendarInvite,
   classifyProgressDealSource,
+  activityDisplayFields,
   deduceLeadSource,
   dealEnteredStageInRange,
   executeTool,
@@ -46,6 +47,7 @@ const {
   resolveDealHubSpotOwner,
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
+  matchingActivityKeywords,
   summarizeHubSpotStageCohortOutcomes,
   validateHubSpotProperties,
 } = require('../slack_bot');
@@ -259,6 +261,7 @@ function testDealNotesPromptAndTools() {
   assert.strictEqual(toolNames.has('hubspot_get_associated_activities'), true);
   assert.strictEqual(toolNames.has('hubspot_get_pipeline'), true);
   assert.strictEqual(toolNames.has('hubspot_count_deals_entered_stage'), true);
+  assert.strictEqual(toolNames.has('hubspot_analyze_deal_activities'), true);
   assert.strictEqual(toolNames.has('recruiting_create_calendar_invite'), true);
   assert.strictEqual(hubSpotPipelineEndpoint(), '/crm/v3/pipelines/deals/105321581');
   assert.strictEqual(hubSpotPipelineEndpoint('custom pipeline'), '/crm/v3/pipelines/deals/custom%20pipeline');
@@ -290,6 +293,14 @@ function testDealNotesPromptAndTools() {
     TOOLS.find((tool) => tool.name === 'hubspot_count_deals_entered_stage').input_schema.properties.track_outcomes.description,
     /first tracked outcome stage/,
   );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_analyze_deal_activities').description,
+    /no-shows/,
+  );
+  assert.match(
+    TOOLS.find((tool) => tool.name === 'hubspot_analyze_deal_activities').input_schema.properties.max_deals.description,
+    /coverage\.warning/,
+  );
 
   const prompt = getSystemPrompt();
   assert.match(prompt, /Deal notes and deal summaries/);
@@ -312,6 +323,8 @@ function testDealNotesPromptAndTools() {
   assert.match(prompt, /true cohort conversion questions/);
   assert.match(prompt, /track_outcomes\.stages/);
   assert.match(prompt, /cohort_outcomes\.outcomes\.still_active/);
+  assert.match(prompt, /hubspot_analyze_deal_activities/);
+  assert.match(prompt, /no-show, ghosted, missed meeting/);
   assert.match(prompt, /Recruiting calendar scheduling/);
   assert.match(prompt, /recruiting_create_calendar_invite/);
 }
@@ -351,6 +364,19 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
   assert.strictEqual(payload.event.start.dateTime, '2026-05-28T14:00:00-07:00');
   assert.strictEqual(payload.event.end.dateTime, '2026-05-28T21:20:00Z');
   assert.strictEqual(payload.event.conferenceData.createRequest.conferenceSolutionKey.type, 'hangoutsMeet');
+
+  const subjectTitled = buildRecruitingCalendarInvite({
+    candidate_email: 'candidate@example.com',
+    candidate_name: 'Casey Candidate',
+    start_datetime: '2026-05-28T14:00:00-07:00',
+    email_subject: 'Re: [hiring@] BDR - Casey Candidate',
+    __trusted_slack_metadata: {
+      channel_id: 'C123',
+      slack_user_id: 'U_TEST',
+      thread_ts: '1770000000.000100',
+    },
+  });
+  assert.strictEqual(subjectTitled.event.summary, 'BDR - Casey Candidate');
 
   assert.throws(
     () => buildRecruitingCalendarInvite({ candidate_email: 'candidate@example.com', start_datetime: '2026-05-28T14:00:00' }),
@@ -514,6 +540,34 @@ function testHubSpotStageHistoryHelpers() {
       new Date('2026-03-01T00:00:00.000Z'),
     ),
     null,
+  );
+}
+
+function testHubSpotActivityPatternHelpers() {
+  const meetingProps = {
+    hs_meeting_title: 'Discovery call - no-show',
+    hs_meeting_body: '<p>Prospect did not attend the scheduled call.</p>',
+    hs_meeting_outcome: 'NO_SHOW',
+  };
+  assert.deepStrictEqual(
+    matchingActivityKeywords('meetings', meetingProps, ['no-show', 'did not attend', 'missed']),
+    ['no-show', 'did not attend'],
+  );
+  assert.deepStrictEqual(
+    activityDisplayFields('meetings', meetingProps),
+    {
+      title: 'Discovery call - no-show',
+      outcome: 'NO_SHOW',
+      body_excerpt: 'Prospect did not attend the scheduled call.',
+    },
+  );
+
+  const noteProps = {
+    hs_note_body: 'Buyer missed the meeting and asked to reschedule.',
+  };
+  assert.deepStrictEqual(
+    matchingActivityKeywords('notes', noteProps, ['missed', 'no show']),
+    ['missed'],
   );
 }
 
@@ -778,6 +832,7 @@ async function run() {
   testRecruitingCalendarInviteBuilderAndAuthorization();
   await testRecruitingCalendarInviteExecuteToolAuthAndIdempotency();
   testHubSpotStageHistoryHelpers();
+  testHubSpotActivityPatternHelpers();
   testHubSpotStageCohortOutcomes();
   testGrainSearchFilteringHelpers();
   testDailyProgressUsesDealSourceProperty();
