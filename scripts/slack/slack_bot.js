@@ -344,6 +344,15 @@ function isoWithoutMillis(date) {
   return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
+function cleanRecruitingCalendarTitleText(value = '') {
+  return String(value || '')
+    .trim()
+    .replace(/\[hiring@\]/gi, '')
+    .replace(/^\s*(?:(?:re|fwd?|fw):\s*)+/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function recruitingCalendarTitle(input = {}, candidateName = '', candidateEmail = '') {
   const raw = String(
     input.title
@@ -353,12 +362,28 @@ function recruitingCalendarTitle(input = {}, candidateName = '', candidateEmail 
     || input.summary
     || ''
   ).trim();
-  const cleaned = raw
-    .replace(/\[hiring@\]/gi, '')
-    .replace(/^\s*(?:(?:re|fwd?|fw):\s*)+/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const cleaned = cleanRecruitingCalendarTitleText(raw);
   return cleaned || `Truewind Intro Call - ${candidateName || candidateEmail}`;
+}
+
+function hasRecruitingCalendarTitleInput(input = {}) {
+  return Boolean(cleanRecruitingCalendarTitleText(
+    input.title
+    || input.email_subject
+    || input.gmail_subject
+    || input.thread_subject
+    || input.summary
+    || ''
+  ).trim());
+}
+
+function recruitingCalendarTitleFromCandidate(candidate = {}) {
+  const role = String(candidate.role || '').trim();
+  const name = String(candidate.candidate_name || candidate.name || '').trim();
+  const usableRole = role && role.toLowerCase() !== 'unknown' ? role : '';
+  const usableName = name && name.toLowerCase() !== 'unknown' ? name : '';
+  if (usableRole && usableName) return `${usableRole} - ${usableName}`;
+  return usableRole || usableName || '';
 }
 
 function buildRecruitingCalendarInvite(input = {}) {
@@ -375,6 +400,7 @@ function buildRecruitingCalendarInvite(input = {}) {
     ? parseCalendarIsoWithZone(input.end_datetime || input.end_at || input.end, 'end_datetime')
     : { date: new Date(start.date.getTime() + durationMinutes * 60000) };
   if (end.date <= start.date) throw new Error('end_datetime must be after start_datetime');
+  const endDateTime = end.text || isoWithoutMillis(end.date);
 
   const timezone = String(
     input.timezone
@@ -408,7 +434,7 @@ function buildRecruitingCalendarInvite(input = {}) {
     trusted.thread_ts || '',
     candidateEmail,
     start.text,
-    summary,
+    endDateTime,
   ].join('|');
   const stableId = `rc${crypto.createHash('sha256').update(requestSeed).digest('hex').slice(0, 32)}`;
 
@@ -421,7 +447,7 @@ function buildRecruitingCalendarInvite(input = {}) {
       summary,
       description: descriptionParts.join('\n\n'),
       start: { dateTime: start.text, timeZone: timezone },
-      end: { dateTime: end.text || isoWithoutMillis(end.date), timeZone: timezone },
+      end: { dateTime: endDateTime, timeZone: timezone },
       attendees: attendeeEmails.map((email) => ({ email })),
       ...(input.with_meet === false ? {} : {
         conferenceData: {
@@ -435,12 +461,46 @@ function buildRecruitingCalendarInvite(input = {}) {
   };
 }
 
+async function findRecruitingCandidateByEmail(email, options = {}) {
+  const candidateEmail = normalizeEmail(email);
+  if (!isValidEmail(candidateEmail)) return null;
+  const databaseId = getEnvFirst('NOTION_DATABASE_ID', 'NOTION_ATS_DB_ID').replace(/-/g, '');
+  const notionToken = getEnvFirst('NOTION_INTERNAL_INTEGRATION_SECRET', 'NOTION_INTERNAL_INTEGRATION');
+  if (!databaseId || !notionToken) return null;
+  const request = options.notionRequest || notionRequest;
+  try {
+    const databaseSchema = await request(`/v1/databases/${encodeURIComponent(databaseId)}`);
+    const propMap = recruitingNotionPropertyMap(databaseSchema);
+    const response = await request(`/v1/databases/${encodeURIComponent(databaseId)}/query`, 'POST', {
+      page_size: 1,
+      filter: {
+        property: propMap.email,
+        email: { equals: candidateEmail },
+      },
+    });
+    const [page] = response.results || [];
+    return page ? buildRecruitingCandidateFromNotionPage(page, propMap) : null;
+  } catch (err) {
+    console.warn(`Recruiting ATS title lookup failed for calendar invite: ${err.message}`);
+    return null;
+  }
+}
+
 async function createRecruitingCalendarInvite(input = {}) {
   const authorization = isRecruitingCalendarWriteAuthorized(input);
   if (!authorization.authorized) {
     return `Error: not authorized to create recruiting calendar invite: ${authorization.reason}`;
   }
-  const payload = buildRecruitingCalendarInvite(input);
+  let enrichedInput = input;
+  if (!hasRecruitingCalendarTitleInput(input)) {
+    const candidateEmail = normalizeEmail(input.candidate_email || input.email || input.attendee_email);
+    if (!isValidEmail(candidateEmail)) throw new Error('candidate_email is required and must be a valid email');
+    parseCalendarIsoWithZone(input.start_datetime || input.start_at || input.start, 'start_datetime');
+    const candidate = await findRecruitingCandidateByEmail(candidateEmail, { notionRequest: input.__notion_request });
+    const atsTitle = recruitingCalendarTitleFromCandidate(candidate || {});
+    if (atsTitle) enrichedInput = { ...input, title: atsTitle };
+  }
+  const payload = buildRecruitingCalendarInvite(enrichedInput);
   const calendar = input.__calendar_service || google.calendar({ version: 'v3', auth: createCalendarOAuthClient() });
   let created;
   try {
@@ -2819,7 +2879,7 @@ const TOOLS = [
   },
   {
     name: 'recruiting_create_calendar_invite',
-    description: 'Create a Google Calendar invite with Google Meet for a recruiting interview. Use only when the Slack user asks to schedule/book a recruiting interview or first-round call and provides a concrete candidate email plus exact date/time. If the user gives a natural-language time, convert it to ISO with timezone before calling. Ask for missing email or exact time before using this tool.',
+    description: 'Create a Google Calendar invite with Google Meet for a recruiting interview. Use only when the Slack user asks to schedule/book a recruiting interview or first-round call and provides a concrete candidate email plus exact date/time. If the user gives a natural-language time, convert it to ISO with timezone before calling. Ask for missing email or exact time before using this tool. If no title or Gmail subject is supplied, the tool attempts to infer the title from the Notion ATS candidate role and name.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2904,6 +2964,7 @@ async function executeTool(name, input = {}, runtimeContext = {}) {
         thread_ts: runtimeContext.thread_ts || '',
       },
       ...(runtimeContext.calendar_service ? { __calendar_service: runtimeContext.calendar_service } : {}),
+      ...(runtimeContext.notion_request ? { __notion_request: runtimeContext.notion_request } : {}),
     };
     const hubspotWriteTools = new Set([
       'hubspot_create_contact',
@@ -3278,6 +3339,7 @@ When someone asks you to schedule, book, or create an invite for a recruiting in
 - Only use it for recruiting/interview scheduling. For customer sales meetings, do not use this tool unless the user explicitly says it is a recruiting interview.
 - Required fields: candidate email and exact start time.
 - Title the calendar event from the Gmail email/thread subject whenever you have it. Pass that subject as title or email_subject; the tool will remove the [hiring@] tag and leading Re:/Fwd: prefixes.
+- If no Gmail subject is available, omit the title instead of inventing one; the tool will look up the candidate in the Notion ATS by email and infer a title from role and candidate name when possible.
 - If candidate email is missing, ask for the email.
 - If the time is ambiguous, ask for the exact date/time/timezone.
 - Convert natural language times to ISO datetime with timezone before calling the tool. Use America/Los_Angeles when the user does not specify a timezone.
@@ -4815,6 +4877,7 @@ module.exports = {
   deduceLeadSource,
   dealEnteredStageInRange,
   executeTool,
+  findRecruitingCandidateByEmail,
   extractStructuredBlockField,
   firstOutcomeAfterEntry,
   formatProspectWorkflowResponse,
@@ -4830,8 +4893,10 @@ module.exports = {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
+  hasRecruitingCalendarTitleInput,
   listRecruitingOutstandingCandidates,
   notionPropValue,
+  recruitingCalendarTitleFromCandidate,
   recruitingNotionPropertyMap,
   normalizeHubSpotPropertyValue,
   normalizeHubSpotOutcomeTracking,

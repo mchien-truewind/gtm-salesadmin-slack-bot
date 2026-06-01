@@ -22,6 +22,7 @@ const {
   deduceLeadSource,
   dealEnteredStageInRange,
   executeTool,
+  findRecruitingCandidateByEmail,
   extractStructuredBlockField,
   firstOutcomeAfterEntry,
   formatProspectWorkflowResponse,
@@ -35,7 +36,9 @@ const {
   isHubSpotWriteAuthorized,
   isReadOnlyHubSpotProperty,
   isRecruitingCalendarWriteAuthorized,
+  hasRecruitingCalendarTitleInput,
   notionPropValue,
+  recruitingCalendarTitleFromCandidate,
   recruitingNotionPropertyMap,
   normalizeHubSpotOutcomeTracking,
   parseHubSpotAsOfBoundary,
@@ -377,6 +380,17 @@ function testRecruitingCalendarInviteBuilderAndAuthorization() {
     },
   });
   assert.strictEqual(subjectTitled.event.summary, 'BDR - Casey Candidate');
+  assert.strictEqual(hasRecruitingCalendarTitleInput({ email_subject: 'Re: [hiring@] BDR - Casey Candidate' }), true);
+  assert.strictEqual(hasRecruitingCalendarTitleInput({ candidate_email: 'candidate@example.com' }), false);
+  assert.strictEqual(hasRecruitingCalendarTitleInput({ email_subject: 'Re: [hiring@]' }), false);
+  assert.strictEqual(
+    recruitingCalendarTitleFromCandidate({ role: 'BDR', candidate_name: 'Casey Candidate' }),
+    'BDR - Casey Candidate',
+  );
+  assert.strictEqual(
+    recruitingCalendarTitleFromCandidate({ role: 'Growth Generalist', candidate_name: 'Unknown' }),
+    'Growth Generalist',
+  );
 
   assert.throws(
     () => buildRecruitingCalendarInvite({ candidate_email: 'candidate@example.com', start_datetime: '2026-05-28T14:00:00' }),
@@ -466,6 +480,207 @@ async function testRecruitingCalendarInviteExecuteToolAuthAndIdempotency() {
     [{ email: 'candidate@example.com' }, { email: 'interviewer@example.com' }],
   );
   assert.strictEqual(insertedRequest.body, undefined);
+}
+
+function fakeNotionCandidatePage({ email = 'gina@example.com', candidateName = 'Gina Yu', role = 'BDR' } = {}) {
+  return {
+    id: 'page-1',
+    url: 'https://www.notion.so/page1',
+    properties: {
+      'Candidate Name': { type: 'title', title: [{ plain_text: candidateName }] },
+      Email: { type: 'email', email },
+      'Role at Truewind': { type: 'multi_select', multi_select: [{ name: role }] },
+      Status: { type: 'select', select: { name: 'Interview Scheduled' } },
+    },
+  };
+}
+
+function fakeRecruitingAtsSchema() {
+  return {
+    properties: {
+      'Candidate Name': { type: 'title' },
+      Email: { type: 'email' },
+      'Role at Truewind': { type: 'multi_select' },
+      Status: { type: 'select' },
+    },
+  };
+}
+
+async function testRecruitingCalendarInviteInfersTitleFromAts() {
+  const oldDb = process.env.NOTION_DATABASE_ID;
+  const oldDbAlias = process.env.NOTION_ATS_DB_ID;
+  const oldToken = process.env.NOTION_INTERNAL_INTEGRATION_SECRET;
+  const oldTokenAlias = process.env.NOTION_INTERNAL_INTEGRATION;
+  process.env.NOTION_DATABASE_ID = 'notion-db';
+  delete process.env.NOTION_ATS_DB_ID;
+  process.env.NOTION_INTERNAL_INTEGRATION_SECRET = 'notion-token';
+  delete process.env.NOTION_INTERNAL_INTEGRATION;
+
+  const calendarRequests = [];
+  const calendarService = {
+    events: {
+      insert: async (request) => {
+        calendarRequests.push(request);
+        return {
+          data: {
+            id: request.requestBody.id,
+            summary: request.requestBody.summary,
+            htmlLink: 'https://calendar.google.com/event?eid=test',
+            start: request.requestBody.start,
+            end: request.requestBody.end,
+            attendees: request.requestBody.attendees,
+            conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/test' }] },
+          },
+        };
+      },
+    },
+  };
+  const notionCalls = [];
+  const notionRequest = async (endpoint, method = 'GET', body = null) => {
+    notionCalls.push({ endpoint, method, body });
+    if (method === 'GET') return fakeRecruitingAtsSchema();
+    assert.deepStrictEqual(body.filter, {
+      property: 'Email',
+      email: { equals: 'ginayu75798@icloud.com' },
+    });
+    return { results: [fakeNotionCandidatePage({ email: 'ginayu75798@icloud.com', candidateName: 'Gina Yu', role: 'BDR' })] };
+  };
+
+  try {
+    const created = await executeTool('recruiting_create_calendar_invite', {
+      candidate_email: 'ginayu75798@icloud.com',
+      start_datetime: '2026-06-03T13:30:00-07:00',
+    }, {
+      slack_user_id: 'U_TEST',
+      channel_id: 'C123',
+      thread_ts: '1770000000.000100',
+      calendar_service: calendarService,
+      notion_request: notionRequest,
+    });
+    const parsed = JSON.parse(created);
+    assert.strictEqual(parsed.summary, 'BDR - Gina Yu');
+    assert.strictEqual(calendarRequests[0].requestBody.summary, 'BDR - Gina Yu');
+    assert.strictEqual(notionCalls.length, 2);
+    const inferredId = calendarRequests[0].requestBody.id;
+
+    const candidate = await findRecruitingCandidateByEmail('ginayu75798@icloud.com', { notionRequest });
+    assert.strictEqual(candidate.candidate_name, 'Gina Yu');
+    assert.strictEqual(candidate.role, 'BDR');
+
+    const subjectCreated = await executeTool('recruiting_create_calendar_invite', {
+      candidate_email: 'ginayu75798@icloud.com',
+      start_datetime: '2026-06-03T13:30:00-07:00',
+      email_subject: 'Re: [hiring@] BDR - Gina Yu',
+    }, {
+      slack_user_id: 'U_TEST',
+      channel_id: 'C123',
+      thread_ts: '1770000000.000100',
+      calendar_service: calendarService,
+      notion_request: notionRequest,
+    });
+    const subjectParsed = JSON.parse(subjectCreated);
+    assert.strictEqual(subjectParsed.summary, 'BDR - Gina Yu');
+    assert.strictEqual(calendarRequests[1].requestBody.id, inferredId);
+  } finally {
+    if (oldDb == null) delete process.env.NOTION_DATABASE_ID;
+    else process.env.NOTION_DATABASE_ID = oldDb;
+    if (oldDbAlias == null) delete process.env.NOTION_ATS_DB_ID;
+    else process.env.NOTION_ATS_DB_ID = oldDbAlias;
+    if (oldToken == null) delete process.env.NOTION_INTERNAL_INTEGRATION_SECRET;
+    else process.env.NOTION_INTERNAL_INTEGRATION_SECRET = oldToken;
+    if (oldTokenAlias == null) delete process.env.NOTION_INTERNAL_INTEGRATION;
+    else process.env.NOTION_INTERNAL_INTEGRATION = oldTokenAlias;
+  }
+}
+
+async function testRecruitingCalendarInviteAtsLookupDoesNotBlockCreation() {
+  const oldDb = process.env.NOTION_DATABASE_ID;
+  const oldDbAlias = process.env.NOTION_ATS_DB_ID;
+  const oldToken = process.env.NOTION_INTERNAL_INTEGRATION_SECRET;
+  const oldTokenAlias = process.env.NOTION_INTERNAL_INTEGRATION;
+  process.env.NOTION_DATABASE_ID = 'notion-db';
+  delete process.env.NOTION_ATS_DB_ID;
+  process.env.NOTION_INTERNAL_INTEGRATION_SECRET = 'notion-token';
+  delete process.env.NOTION_INTERNAL_INTEGRATION;
+
+  const calendarRequests = [];
+  const calendarService = {
+    events: {
+      insert: async (request) => {
+        calendarRequests.push(request);
+        return {
+          data: {
+            id: request.requestBody.id,
+            summary: request.requestBody.summary,
+            htmlLink: 'https://calendar.google.com/event?eid=test',
+            start: request.requestBody.start,
+            end: request.requestBody.end,
+            attendees: request.requestBody.attendees,
+            conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/test' }] },
+          },
+        };
+      },
+    },
+  };
+
+  try {
+    let notionCalls = 0;
+    const missingTime = await executeTool('recruiting_create_calendar_invite', {
+        candidate_email: 'missing@example.com',
+      }, {
+        slack_user_id: 'U_TEST',
+        channel_id: 'C123',
+        thread_ts: '1770000000.000100',
+        calendar_service: calendarService,
+        notion_request: async () => {
+          notionCalls += 1;
+          throw new Error('should not call Notion before datetime validation');
+        },
+      });
+    assert.match(missingTime, /Error: start_datetime is required/);
+    assert.strictEqual(notionCalls, 0);
+
+    const created = await executeTool('recruiting_create_calendar_invite', {
+      candidate_email: 'missing@example.com',
+      start_datetime: '2026-06-03T13:30:00-07:00',
+    }, {
+      slack_user_id: 'U_TEST',
+      channel_id: 'C123',
+      thread_ts: '1770000000.000100',
+      calendar_service: calendarService,
+      notion_request: async () => { throw new Error('notion unavailable'); },
+    });
+    const parsed = JSON.parse(created);
+    assert.strictEqual(parsed.summary, 'Truewind Intro Call - missing@example.com');
+    const fallbackId = calendarRequests[0].requestBody.id;
+
+    const retried = await executeTool('recruiting_create_calendar_invite', {
+      candidate_email: 'missing@example.com',
+      start_datetime: '2026-06-03T13:30:00-07:00',
+    }, {
+      slack_user_id: 'U_TEST',
+      channel_id: 'C123',
+      thread_ts: '1770000000.000100',
+      calendar_service: calendarService,
+      notion_request: async (endpoint, method = 'GET', body = null) => {
+        if (method === 'GET') return fakeRecruitingAtsSchema();
+        assert.deepStrictEqual(body.filter.email, { equals: 'missing@example.com' });
+        return { results: [fakeNotionCandidatePage({ email: 'missing@example.com', candidateName: 'Missing Person', role: 'BDR' })] };
+      },
+    });
+    const retriedParsed = JSON.parse(retried);
+    assert.strictEqual(retriedParsed.summary, 'BDR - Missing Person');
+    assert.strictEqual(calendarRequests[1].requestBody.id, fallbackId);
+  } finally {
+    if (oldDb == null) delete process.env.NOTION_DATABASE_ID;
+    else process.env.NOTION_DATABASE_ID = oldDb;
+    if (oldDbAlias == null) delete process.env.NOTION_ATS_DB_ID;
+    else process.env.NOTION_ATS_DB_ID = oldDbAlias;
+    if (oldToken == null) delete process.env.NOTION_INTERNAL_INTEGRATION_SECRET;
+    else process.env.NOTION_INTERNAL_INTEGRATION_SECRET = oldToken;
+    if (oldTokenAlias == null) delete process.env.NOTION_INTERNAL_INTEGRATION;
+    else process.env.NOTION_INTERNAL_INTEGRATION = oldTokenAlias;
+  }
 }
 
 function testHubSpotStageHistoryHelpers() {
@@ -831,6 +1046,8 @@ async function run() {
   testRecruitingNotionPropertyHelpers();
   testRecruitingCalendarInviteBuilderAndAuthorization();
   await testRecruitingCalendarInviteExecuteToolAuthAndIdempotency();
+  await testRecruitingCalendarInviteInfersTitleFromAts();
+  await testRecruitingCalendarInviteAtsLookupDoesNotBlockCreation();
   testHubSpotStageHistoryHelpers();
   testHubSpotActivityPatternHelpers();
   testHubSpotStageCohortOutcomes();
