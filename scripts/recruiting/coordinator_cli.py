@@ -7,7 +7,9 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import tempfile
+import time as time_module
 import unicodedata
 import zipfile
 from collections import Counter
@@ -32,6 +34,44 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - fallback for partial envs
     def load_dotenv(*_args, **_kwargs):  # type: ignore[no-redef]
         return False
+
+
+GOOGLE_TRANSIENT_ERRORS = (TimeoutError, BrokenPipeError, ConnectionError, socket.timeout)
+
+
+def is_google_transient_error(exc: Exception) -> bool:
+    if isinstance(exc, GOOGLE_TRANSIENT_ERRORS):
+        return True
+    # httplib2/google-auth can wrap network failures in OSError subclasses.
+    if isinstance(exc, OSError) and exc.__class__.__name__ in {
+        "TimeoutError",
+        "BrokenPipeError",
+        "ConnectionResetError",
+        "SSLError",
+    }:
+        return True
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    return isinstance(status, int) and status in {429, 500, 502, 503, 504}
+
+
+def execute_google_request(request: Any, *, description: str, attempts: int = 3) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return request.execute(num_retries=2)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not is_google_transient_error(exc):
+                raise
+            sleep_seconds = min(8, 2 ** (attempt - 1))
+            print(
+                f"{description} transient failure; retrying attempt {attempt + 1}/{attempts}: "
+                f"{exc.__class__.__name__}"
+            )
+            time_module.sleep(sleep_seconds)
+    if last_exc:
+        raise last_exc
+    return {}
 
 
 GMAIL_SCOPES = [
@@ -296,7 +336,15 @@ def ensure_google_service(
     if not creds:
         creds = run_auth_flow(credentials_path, token_path, scopes, help_text)
     _, _, _, build, _ = require_google_dependencies()
-    return build(api_name, api_version, credentials=creds)
+    timeout_seconds = parse_env_int("RECRUITING_GOOGLE_API_TIMEOUT_SECONDS", 20)
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=timeout_seconds))
+        return build(api_name, api_version, http=http, cache_discovery=False)
+    except ModuleNotFoundError:
+        return build(api_name, api_version, credentials=creds, cache_discovery=False)
 
 
 def parse_weekdays(value: str) -> set[int]:
@@ -1928,10 +1976,9 @@ def upload_resume_to_drive(drive_service, filename: str, raw: bytes, folder_id: 
 
     mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     media = MediaIoBaseUpload(BytesIO(raw), mimetype=mime_type, resumable=False)
-    created = (
-        drive_service.files()
-        .create(body=metadata, media_body=media, fields="id,webViewLink")
-        .execute()
+    created = execute_google_request(
+        drive_service.files().create(body=metadata, media_body=media, fields="id,webViewLink"),
+        description=f"Google Drive resume upload {safe_name}",
     )
     file_id = created.get("id", "")
     return created.get("webViewLink") or (f"https://drive.google.com/file/d/{file_id}/view" if file_id else "")
@@ -1949,7 +1996,7 @@ def list_label_messages(gmail_service, label_id: str, query: str, max_messages: 
     messages: list[dict[str, Any]] = []
     page_token: str | None = None
     while len(messages) < max_messages:
-        response = (
+        response = execute_google_request(
             gmail_service.users()
             .messages()
             .list(
@@ -1958,8 +2005,8 @@ def list_label_messages(gmail_service, label_id: str, query: str, max_messages: 
                 q=query,
                 maxResults=min(100, max_messages - len(messages)),
                 pageToken=page_token,
-            )
-            .execute()
+            ),
+            description=f"Gmail label message search {query or label_id}",
         )
         batch = response.get("messages", [])
         if not batch:
@@ -1975,7 +2022,7 @@ def list_messages_matching_query(gmail_service, query: str, max_messages: int) -
     messages: list[dict[str, Any]] = []
     page_token: str | None = None
     while len(messages) < max_messages:
-        response = (
+        response = execute_google_request(
             gmail_service.users()
             .messages()
             .list(
@@ -1983,8 +2030,8 @@ def list_messages_matching_query(gmail_service, query: str, max_messages: int) -
                 q=query,
                 maxResults=min(100, max_messages - len(messages)),
                 pageToken=page_token,
-            )
-            .execute()
+            ),
+            description=f"Gmail message search {query}",
         )
         batch = response.get("messages", [])
         if not batch:
@@ -2023,7 +2070,7 @@ def list_threads_matching_query(gmail_service, query: str, max_threads: int = 50
     threads: list[dict[str, Any]] = []
     page_token: str | None = None
     while len(threads) < max_threads:
-        response = (
+        response = execute_google_request(
             gmail_service.users()
             .threads()
             .list(
@@ -2031,8 +2078,9 @@ def list_threads_matching_query(gmail_service, query: str, max_threads: int = 50
                 q=query,
                 maxResults=min(100, max_threads - len(threads)),
                 pageToken=page_token,
-            )
-            .execute()
+            ),
+            description=f"Gmail thread search {query}",
+            attempts=2,
         )
         batch = response.get("threads", [])
         if not batch:
@@ -3321,7 +3369,18 @@ def candidate_related_thread_ids(
         return list(related_ids)
 
     query = f'"{candidate_email}"'
-    for item in list_threads_matching_query(gmail_service, query, max_threads=max_threads):
+    try:
+        matching_threads = list_threads_matching_query(gmail_service, query, max_threads=max_threads)
+    except Exception as exc:
+        if not is_google_transient_error(exc):
+            raise
+        print(
+            "Gmail related-thread search failed; falling back to primary ATS thread: "
+            f"{candidate_email} ({exc.__class__.__name__})"
+        )
+        return list(related_ids)
+
+    for item in matching_threads:
         thread_id = str(item.get("id", "") or "").strip()
         if not thread_id or thread_id in related_ids:
             continue
@@ -5805,9 +5864,19 @@ def post_ats_follow_up_test_cmd(_args: argparse.Namespace) -> None:
 
 
 def run_cmd(_args: argparse.Namespace) -> None:
-    ingest_cmd(_args)
-    sync_slack_decisions_cmd(_args)
-    process_decisions_cmd(_args)
+    failures: list[str] = []
+    for step_name, step_func in (
+        ("ingest", ingest_cmd),
+        ("sync-slack-decisions", sync_slack_decisions_cmd),
+        ("process-decisions", process_decisions_cmd),
+    ):
+        try:
+            step_func(_args)
+        except Exception as exc:
+            failures.append(f"{step_name}: {exc.__class__.__name__}")
+            print(f"{step_name} failed (continuing): {exc}")
+    if failures:
+        raise RuntimeError("Recruiting run completed with step failures: " + "; ".join(failures))
 
 
 def auth_cmd(_args: argparse.Namespace) -> None:
