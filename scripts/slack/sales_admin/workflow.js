@@ -474,6 +474,15 @@ function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, g
     { type: 'section', text: { type: 'mrkdwn', text } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
     { type: 'section', text: { type: 'mrkdwn', text: `\n\`\`\`\n${extractionText(extraction).slice(0, 2500)}\n\`\`\`` } },
+    ...(stageDecision ? [{
+      type: 'section',
+      block_id: 'deal_stage',
+      text: {
+        type: 'mrkdwn',
+        text: `*Confirm deal stage for ${stageDecision.dealName}*\nCurrent: ${stageDecision.currentStageLabel}\nConfirm to move deal to:`,
+      },
+      accessory: stageSelectElement(stageDecision, stageDecision.recommendedStageId),
+    }] : []),
     {
       type: 'actions',
       elements: [

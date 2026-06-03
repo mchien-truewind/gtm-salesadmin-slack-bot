@@ -210,7 +210,10 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
     grainUrl: 'https://grain.com/share/recording/grain-1',
     source: 'grain_matched',
   });
-  workflow.buildStageDecisionForMeeting = async () => null;
+  workflow.buildStageDecisionForMeeting = async () => buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'EdOps - New Deal', pipeline: '105321581', dealstage: '190380582' },
+    stages: STAGES,
+  });
   workflow.state.set('post:target-me:84547076', { status: 'previously_prompted' });
 
   const stats = await workflow.runPostMeetingScan(new Date('2026-06-03T22:00:00Z'), {
@@ -222,6 +225,11 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.equal(stats.prompted, 1);
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /EdOps/);
+  const stageBlock = posts[0].blocks.find(block => block.block_id === 'deal_stage');
+  assert.match(stageBlock.text.text, /Confirm deal stage for EdOps - New Deal/);
+  assert.equal(stageBlock.accessory.type, 'static_select');
+  assert.equal(stageBlock.accessory.initial_option.value, '190380583');
+  assert.deepEqual(stageBlock.accessory.options.map(option => option.value), ['190380582', '190380583', '190380586', '190380584', '1166230571', '190380587']);
   assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
 });
 
