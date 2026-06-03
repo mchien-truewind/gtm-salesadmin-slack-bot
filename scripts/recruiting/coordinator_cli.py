@@ -2367,37 +2367,29 @@ def run_rejection_name_verification_agent(
     normalized_greeting = normalize_first_name_for_verification(greeting_first_name)
     if not normalized_greeting:
         return False, greeting_first_name, "missing greeting"
+    if "@" in greeting_first_name or "." in greeting_first_name:
+        return False, greeting_first_name, "greeting is not a first name"
 
-    strong_sources = ("email", "resume", "linkedin")
-    strong_expected: list[str] = []
-    for source in strong_sources:
-        strong_expected.extend(evidence.get(source, []))
-    normalized_strong = {
-        normalize_first_name_for_verification(name): name
-        for name in strong_expected
-        if normalize_first_name_for_verification(name)
-    }
-    if len(normalized_strong) > 1:
-        expected_summary = []
-        for source in ("email", "resume", "linkedin", "linkedin_slug", "ats"):
-            values = evidence.get(source, [])
-            if values:
-                expected_summary.append(f"{source}={','.join(values)}")
-        return False, greeting_first_name, "conflicting strong evidence: " + "; ".join(expected_summary)
-    if normalized_greeting in normalized_strong:
-        return True, greeting_first_name, f"{normalized_strong[normalized_greeting]} (email/resume/linkedin)"
+    # This deterministic check is intentionally narrow: it verifies the salutation
+    # name itself, not resume parsing quality. OCR often extracts section headers
+    # as candidate names, so unrelated resume tokens should not block a correct
+    # "Hi <first name>" greeting.
+    expected: dict[str, str] = {}
+    for source in ("ats", "email", "linkedin", "linkedin_slug", "resume"):
+        for name in evidence.get(source, []):
+            normalized = normalize_first_name_for_verification(name)
+            if normalized:
+                expected.setdefault(normalized, f"{name} ({source})")
 
-    ats_expected = [
-        name for name in evidence.get("ats", []) if normalize_first_name_for_verification(name)
-    ]
+    if normalized_greeting in expected:
+        return True, greeting_first_name, expected[normalized_greeting]
+
     expected_summary = []
     for source in ("email", "resume", "linkedin", "linkedin_slug", "ats"):
         values = evidence.get(source, [])
         if values:
             expected_summary.append(f"{source}={','.join(values)}")
-    if not expected_summary and ats_expected:
-        expected_summary.append(f"ats={','.join(ats_expected)}")
-    return False, greeting_first_name, "; ".join(expected_summary) or "no email/resume/linkedin name evidence"
+    return False, greeting_first_name, "; ".join(expected_summary) or "no candidate first-name evidence"
 
 
 def summarize_name_evidence(evidence: dict[str, list[str]]) -> str:
@@ -2429,10 +2421,15 @@ def extract_json_object(text: str) -> dict[str, Any]:
 def build_name_verifier_prompt(payload: dict[str, Any]) -> str:
     return (
         "You are a recruiting operations verification subagent. "
-        "Decide whether it is safe to auto-send a rejection draft based only on first-name identity. "
-        "Allow only if the greeting first name matches strong evidence from the candidate's email display name, "
-        "resume name, or enriched LinkedIn profile name. Do not allow based on ATS name or LinkedIn URL slug alone. "
-        "If strong evidence is missing, ambiguous, or conflicting, reject. "
+        "Decide whether it is safe to auto-send a rejection draft based only on the salutation first name. "
+        "Your job is only to verify the greeting, for example whether 'Hi Abishek,' or 'Hi Lori,' is the correct "
+        "first-name greeting for the candidate. Allow if the greeting first name plausibly matches the candidate "
+        "name in the ATS, the candidate email/local part or display name, a clean resume name, or an enriched "
+        "LinkedIn profile name. Do not require resume or LinkedIn evidence when ATS/email evidence is clear. "
+        "Ignore obvious resume/OCR noise such as section headers, locations, companies, roles, dates, or words like "
+        "Summary, Core, Contact, Professional, Skills, Revenue, University, Bachelor, Phone, Account, or Growth. "
+        "Reject if the greeting is missing, is an email address, is clearly a last name when the candidate's first "
+        "name is known, or is clearly a different person's name. "
         "Return only compact JSON with keys allow_auto_send (boolean), reason (string), "
         "matched_sources (array), conflicts (array).\n\n"
         f"Payload:\n{json.dumps(payload, ensure_ascii=True, sort_keys=True)}"
@@ -2450,7 +2447,7 @@ def call_anthropic_name_verifier(config: Config, payload: dict[str, Any]) -> tup
             "Content-Type": "application/json",
         },
         json={
-            "model": config.name_verifier_model or "claude-3-5-haiku-latest",
+            "model": config.name_verifier_model or "claude-sonnet-4-6",
             "max_tokens": 300,
             "temperature": 0,
             "messages": [{"role": "user", "content": build_name_verifier_prompt(payload)}],
@@ -5468,7 +5465,7 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                         deterministic_allowed=deterministic_ok,
                         deterministic_reason=deterministic_reason,
                     )
-                    name_ok = deterministic_ok and subagent_ok
+                    name_ok = subagent_ok
                     if not name_ok:
                         reject_drafts_auto_send_skipped_name += 1
                         failure_reason = (
