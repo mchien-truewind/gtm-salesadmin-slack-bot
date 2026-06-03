@@ -4123,8 +4123,8 @@ SOURCE_OPTIONS = ("Inbound", "Superposition")
 SOURCE_INBOUND = "Inbound"
 SOURCE_SUPERPOSITION = "Superposition"
 CUSTOM_GPT_FIRST_ROUND_ROLES = {"BDR", "AE"}
-STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A")
-TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a"}
+STATUS_OPTIONS = ("Scheduling Sent", "Interview Scheduled", "Needs Attention", "In CustomGPT Process", "N/A", "Offered")
+TERMINAL_STATUSES = {"rejected", "passed", "accepted", "n/a", "offered"}
 ATS_DIGEST_EXCLUDED_STATUSES = {"reject pending"}
 ATS_FOLLOW_UP_WEEKDAYS = {
     0: "Monday",
