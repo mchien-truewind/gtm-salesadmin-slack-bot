@@ -360,19 +360,41 @@ function inputElement(initialValue) {
   return element;
 }
 
-function extractionText(extraction) {
-  const lines = [`Outcome: ${extraction.outcome || 'Needs AE confirmation'}`];
-  if (extraction.nextSteps?.length) {
-    lines.push('Next steps:');
-    for (const step of extraction.nextSteps) {
-      const suffix = [step.owner ? `Owner: ${step.owner}` : '', step.dueDate ? `Due: ${step.dueDate}` : ''].filter(Boolean).join(', ');
-      lines.push(`- ${step.text}${suffix ? ` (${suffix})` : ''}`);
-    }
-  } else {
-    lines.push('Next steps: none extracted yet.');
+function slackMrkdwn(value) {
+  return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function truncateText(value, maxLength = 2900) {
+  const text = String(value || '');
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 3)}...`;
+}
+
+function outcomeBlockText(extraction) {
+  return truncateText(`*Outcome from Grain*\n${slackMrkdwn(extraction?.outcome || 'Needs AE confirmation.')}`);
+}
+
+function nextStepsBlockText(extraction) {
+  const steps = extraction?.nextSteps || [];
+  if (!steps.length) {
+    return '*Next steps from Grain*\n_No next steps were found in Grain. Click Edit Notes to add them before saving._';
   }
-  lines.push(`Source: ${extraction.source || 'unknown'}; confidence: ${extraction.confidence || 'low'}`);
-  return lines.join('\n');
+  const lines = steps.slice(0, 8).map((step, index) => {
+    const suffix = [step.owner ? `Owner: ${slackMrkdwn(step.owner)}` : '', step.dueDate ? `Due: ${slackMrkdwn(step.dueDate)}` : ''].filter(Boolean).join(', ');
+    return `${index + 1}. ${slackMrkdwn(step.text)}${suffix ? ` _(${suffix})_` : ''}`;
+  });
+  if (steps.length > lines.length) lines.push(`_${steps.length - lines.length} more next steps omitted. Click Edit Notes to review._`);
+  return truncateText(`*Next steps from Grain*\n${lines.join('\n')}`);
+}
+
+function stageBlockText(stageDecision) {
+  if (!stageDecision) return '';
+  const recommendedVerb = stageDecision.recommendedStageId === stageDecision.currentStageId ? 'keep it in' : 'move it to';
+  return [
+    `*Deal stage: ${slackMrkdwn(stageDecision.dealName)}*`,
+    `Current stage: *${slackMrkdwn(stageDecision.currentStageLabel)}*`,
+    `Recommended: *${recommendedVerb} ${slackMrkdwn(stageDecision.recommendedStageLabel)}*`,
+    'Dropdown default is the recommendation. Choose the current stage if the deal should stay put.',
+  ].join('\n');
 }
 
 function stageLabel(stage) {
@@ -414,7 +436,7 @@ function stageSelectElement(stageDecision, selectedStageId) {
   return {
     type: 'static_select',
     action_id: POST_ACTIONS.stageSelect,
-    placeholder: { type: 'plain_text', text: 'Select deal stage', emoji: true },
+    placeholder: { type: 'plain_text', text: 'Move deal to...', emoji: true },
     options,
     ...(initialOption ? { initial_option: initialOption } : {}),
   };
@@ -469,27 +491,41 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', ed
 }
 
 function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, stageDecision }) {
-  const text = `*Post-meeting check:* <@${ae.slackUserId}> please confirm next steps for *${meetingTitle(meeting)}*.`;
+  const instruction = stageDecision
+    ? 'review the notes, choose the deal stage, then save to HubSpot.'
+    : 'review the notes, then save to HubSpot.';
+  const text = `:clipboard: *Post-meeting check: ${slackMrkdwn(meetingTitle(meeting))}*\n<@${ae.slackUserId}> ${instruction}`;
   return [
     { type: 'section', text: { type: 'mrkdwn', text } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
-    { type: 'section', text: { type: 'mrkdwn', text: `\n\`\`\`\n${extractionText(extraction).slice(0, 2500)}\n\`\`\`` } },
+    { type: 'section', text: { type: 'mrkdwn', text: outcomeBlockText(extraction) } },
+    { type: 'section', text: { type: 'mrkdwn', text: nextStepsBlockText(extraction) } },
     ...(stageDecision ? [{
       type: 'section',
       block_id: 'deal_stage',
-      text: {
-        type: 'mrkdwn',
-        text: `*Confirm deal stage for ${stageDecision.dealName}*\nCurrent: ${stageDecision.currentStageLabel}\nConfirm to move deal to:`,
-      },
+      text: { type: 'mrkdwn', text: stageBlockText(stageDecision) },
       accessory: stageSelectElement(stageDecision, stageDecision.recommendedStageId),
     }] : []),
     {
+      type: 'context',
+      elements: [{
+        type: 'mrkdwn',
+        text: stageDecision
+          ? ':information_source: *Confirm & Save* writes a HubSpot note and applies the selected deal stage. To avoid moving the deal, select the current stage.'
+          : ':information_source: *Confirm & Save* writes these notes back to HubSpot.',
+      }],
+    },
+    {
       type: 'actions',
       elements: [
-        { type: 'button', text: { type: 'plain_text', text: 'Confirm' }, style: 'primary', action_id: POST_ACTIONS.confirm, value: promptKey },
-        { type: 'button', text: { type: 'plain_text', text: 'Edit' }, action_id: POST_ACTIONS.edit, value: promptKey },
-        { type: 'button', text: { type: 'plain_text', text: 'No show' }, style: 'danger', action_id: POST_ACTIONS.noShow, value: promptKey },
-        { type: 'button', text: { type: 'plain_text', text: 'Not this meeting' }, action_id: POST_ACTIONS.ignore, value: promptKey },
+        { type: 'button', text: { type: 'plain_text', text: 'Confirm & Save' }, style: 'primary', action_id: POST_ACTIONS.confirm, value: promptKey },
+        { type: 'button', text: { type: 'plain_text', text: 'Edit Notes' }, action_id: POST_ACTIONS.edit, value: promptKey },
+        { type: 'button', text: { type: 'plain_text', text: 'No-Show' }, style: 'danger', action_id: POST_ACTIONS.noShow, value: promptKey },
+        {
+          type: 'overflow',
+          action_id: POST_ACTIONS.ignore,
+          options: [{ text: { type: 'plain_text', text: 'Not this meeting', emoji: true }, value: promptKey }],
+        },
       ],
     },
   ];
@@ -914,7 +950,8 @@ class SalesAdminWorkflow {
 
     this.app.action(POST_ACTIONS.ignore, async ({ ack, body, action, client }) => {
       await ack();
-      this.state.update(action.value, { status: 'ignored', ignoredBySlackUser: body.user?.id });
+      const promptKey = action.value || action.selected_option?.value || '';
+      this.state.update(promptKey, { status: 'ignored', ignoredBySlackUser: body.user?.id });
       await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: 'Marked as not this meeting. Nothing was written to HubSpot.' });
     });
 

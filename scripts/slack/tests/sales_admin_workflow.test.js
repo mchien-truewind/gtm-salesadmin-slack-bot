@@ -225,11 +225,20 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.equal(stats.prompted, 1);
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /EdOps/);
+  assert.match(posts[0].blocks[0].text.text, /review the notes, choose the deal stage, then save to HubSpot/);
+  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
+  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Next steps from Grain*')));
+  assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('```')));
   const stageBlock = posts[0].blocks.find(block => block.block_id === 'deal_stage');
-  assert.match(stageBlock.text.text, /Confirm deal stage for EdOps - New Deal/);
+  assert.match(stageBlock.text.text, /Deal stage: EdOps - New Deal/);
+  assert.match(stageBlock.text.text, /Current stage: \*Stage 2: SQL/);
+  assert.match(stageBlock.text.text, /Recommended: \*move it to Stage 3: Awaiting Materials/);
   assert.equal(stageBlock.accessory.type, 'static_select');
   assert.equal(stageBlock.accessory.initial_option.value, '190380583');
   assert.deepEqual(stageBlock.accessory.options.map(option => option.value), ['190380582', '190380583', '190380586', '190380584', '1166230571', '190380587']);
+  const actions = posts[0].blocks.find(block => block.type === 'actions');
+  assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['Confirm & Save', 'Edit Notes', 'No-Show', 'Not this meeting']);
+  assert.equal(actions.elements[3].type, 'overflow');
   assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
 });
 
