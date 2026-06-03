@@ -1126,35 +1126,40 @@ class SalesAdminWorkflow {
     });
 
     this.app.action(POST_ACTIONS.edit, async ({ ack, body, action, client }) => {
+      const receivedAt = Date.now();
+      await ack();
+      const channel = body.channel?.id || body.container?.channel_id;
+      const threadTs = body.message?.ts || body.container?.message_ts;
       const record = this.state.get(action.value);
       if (!record) {
-        await ack();
-        await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: `Sales admin prompt state not found: ${action.value}` });
+        await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `Sales admin prompt state not found: ${action.value}` });
         return;
       }
       const selectedStageId = selectedStageFromInteraction(body, record.stageDecision?.recommendedStageId || '');
-      const openModal = client.views.open({
-        token: this.env.SLACK_BOT_TOKEN,
-        trigger_id: body.trigger_id,
+      try {
+        await client.views.open({
+          token: this.env.SLACK_BOT_TOKEN,
+          trigger_id: body.trigger_id,
           view: {
-          type: 'modal',
-          callback_id: POST_ACTIONS.editSubmit,
-          private_metadata: JSON.stringify({ promptKey: action.value, channel: body.channel?.id || body.container?.channel_id, threadTs: body.message?.ts || body.container?.message_ts }),
-          title: { type: 'plain_text', text: 'Edit HubSpot next step' },
-          submit: { type: 'plain_text', text: 'Save to HubSpot' },
-          close: { type: 'plain_text', text: 'Cancel' },
-          blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: 'Edit the short text that will be saved to the HubSpot deal `Next step` field.' } },
-            { type: 'input', block_id: 'hubspot_next_step', label: { type: 'plain_text', text: 'HubSpot Next step' }, element: inputElement(record.hubspotNextStep || hubspotNextStepSummary({ meeting: record.meeting, extraction: record.extraction })) },
-            ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
-          ],
-        },
-      }).catch(async (err) => {
-        await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: `Sales admin edit modal failed to open: ${err.message}` }).catch(() => {});
-        throw err;
-      });
-      await ack();
-      await openModal;
+            type: 'modal',
+            callback_id: POST_ACTIONS.editSubmit,
+            private_metadata: JSON.stringify({ promptKey: action.value, channel, threadTs }),
+            title: { type: 'plain_text', text: 'Edit HubSpot next step' },
+            submit: { type: 'plain_text', text: 'Save to HubSpot' },
+            close: { type: 'plain_text', text: 'Cancel' },
+            blocks: [
+              { type: 'section', text: { type: 'mrkdwn', text: 'Edit the short text that will be saved to the HubSpot deal `Next step` field.' } },
+              { type: 'input', block_id: 'hubspot_next_step', label: { type: 'plain_text', text: 'HubSpot Next step' }, element: inputElement(record.hubspotNextStep || hubspotNextStepSummary({ meeting: record.meeting, extraction: record.extraction })) },
+              ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
+            ],
+          },
+        });
+      } catch (err) {
+        const elapsedMs = Date.now() - receivedAt;
+        const slackError = err?.data?.error || err.message;
+        this.logger.error(`Sales admin edit modal failed after ${elapsedMs}ms: ${slackError}`);
+        await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `Sales admin edit modal failed to open: ${err.message}` }).catch(() => {});
+      }
     });
 
     this.app.view(POST_ACTIONS.editSubmit, async ({ ack, body, view }) => {

@@ -8,6 +8,7 @@ const {
   buildConfig,
   buildStageDecision,
   buildWritebackNote,
+  POST_ACTIONS,
   SalesAdminWorkflow,
   cancellationSourceLabel,
   classifyMeetingStatus,
@@ -376,6 +377,55 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
   assert.equal(updated.hubspotNextStep, 'Acme is interested in AP automation and needs pricing follow-up.');
   assert.equal(updated.nextStepPropertyUpdate.updated, true);
   assert.match(notes[0], /HubSpot Next step: Acme is interested/);
+});
+
+test('sales admin edit action acks before opening modal', async () => {
+  const handlers = {};
+  const workflow = new SalesAdminWorkflow({
+    app: {
+      client: {},
+      action: (actionId, handler) => { handlers[actionId] = handler; },
+      view: () => {},
+    },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-edit-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.registerHandlers();
+  let acked = false;
+  let stateReadAfterAck = false;
+  let openedPayload = null;
+  workflow.state.get = () => {
+    stateReadAfterAck = acked;
+    return {
+      meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro' } },
+      extraction: { summary: 'Acme is evaluating Truewind and needs pricing follow-up.' },
+      stageDecision: null,
+    };
+  };
+
+  await handlers[POST_ACTIONS.edit]({
+    ack: async () => { acked = true; },
+    body: { trigger_id: 'trigger-1', channel: { id: 'C_SARAH' }, message: { ts: '1' }, state: { values: {} }, container: {} },
+    action: { value: 'post:m1:84547076' },
+    client: {
+      views: { open: async payload => { openedPayload = payload; return { ok: true }; } },
+      chat: { postMessage: async () => ({ ok: true }) },
+    },
+  });
+
+  assert.equal(acked, true);
+  assert.equal(stateReadAfterAck, true);
+  assert.equal(openedPayload.trigger_id, 'trigger-1');
+  assert.equal(openedPayload.view.callback_id, POST_ACTIONS.editSubmit);
 });
 
 test('sales admin state persists idempotency records', () => {
