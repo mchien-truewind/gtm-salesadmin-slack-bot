@@ -956,14 +956,14 @@ class SalesAdminWorkflow {
     });
 
     this.app.action(POST_ACTIONS.edit, async ({ ack, body, action, client }) => {
-      await ack();
       const record = this.state.get(action.value);
       if (!record) {
+        await ack();
         await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: `Sales admin prompt state not found: ${action.value}` });
         return;
       }
       const selectedStageId = selectedStageFromInteraction(body, record.stageDecision?.recommendedStageId || '');
-      await client.views.open({
+      const openModal = client.views.open({
         token: this.env.SLACK_BOT_TOKEN,
         trigger_id: body.trigger_id,
         view: {
@@ -979,7 +979,12 @@ class SalesAdminWorkflow {
             ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
           ],
         },
+      }).catch(async (err) => {
+        await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: `Sales admin edit modal failed to open: ${err.message}` }).catch(() => {});
+        throw err;
       });
+      await ack();
+      await openModal;
     });
 
     this.app.view(POST_ACTIONS.editSubmit, async ({ ack, body, view }) => {
