@@ -77,6 +77,7 @@ function buildConfig(env = process.env) {
     statePath: env.SALES_ADMIN_STATE_PATH || path.resolve(process.cwd(), 'data/sales_admin_state.json'),
     grainToken: env.GRAIN_API_TOKEN || env.GRAIN_API || env.GRAIN_ACCESS_TOKEN || env.GRAIN_WORKSPACE_TOKEN || '',
     grainBaseUrl: env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api/v2',
+    grainTeamId: String(env.SALES_ADMIN_GRAIN_TEAM_ID || '').trim(),
     roster: parseRoster(env.SALES_ADMIN_AE_ROSTER_JSON),
   };
 }
@@ -744,6 +745,7 @@ class SalesAdminWorkflow {
     const recordings = await this.grain.listRecordings({
       start: new Date(startMs - 45 * 60 * 1000),
       end: new Date(startMs + 45 * 60 * 1000),
+      teamId: this.config.grainTeamId,
       maxPages: Number(this.env.SALES_ADMIN_GRAIN_MAX_PAGES || 5),
     });
     const config = { matchWindowMs: 45 * 60 * 1000 };

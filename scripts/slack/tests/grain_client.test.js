@@ -30,6 +30,7 @@ test('sales admin Grain client lists recordings using v2 POST schema', async () 
   const recordings = await client.listRecordings({
     start: new Date('2026-06-03T19:45:00Z'),
     end: new Date('2026-06-03T21:15:00Z'),
+    teamId: '58594e3b-292b-4ca2-aa35-417cf13addf1',
     include: ['participants', 'ai_action_items'],
   });
 
@@ -38,6 +39,7 @@ test('sales admin Grain client lists recordings using v2 POST schema', async () 
   assert.equal(Object.hasOwn(calls[0].body, 'limit'), false);
   assert.equal(Object.hasOwn(calls[0].body.filter, 'start_time'), false);
   assert.equal(calls[0].body.filter.after_datetime, '2026-06-03T21:15:00.000Z');
+  assert.equal(calls[0].body.filter.team, '58594e3b-292b-4ca2-aa35-417cf13addf1');
 });
 
 test('sales admin Grain client gets recording details using v2 include object', async () => {

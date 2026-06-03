@@ -86,7 +86,7 @@ class GrainClient {
     });
   }
 
-  async listRecordings({ start, end, maxPages = 10, include = { participants: true, ai_action_items: true, ai_summary: true, calendar_event: true, hubspot: true } } = {}) {
+  async listRecordings({ start, end, teamId = '', maxPages = 10, include = { participants: true, ai_action_items: true, ai_summary: true, calendar_event: true, hubspot: true } } = {}) {
     const recordings = [];
     let cursor = '';
     for (let page = 0; page < maxPages; page++) {
@@ -94,7 +94,10 @@ class GrainClient {
         include: normalizeInclude(include),
       };
       if (cursor) body.cursor = cursor;
-      if (end) body.filter = { after_datetime: new Date(end).toISOString() };
+      const filter = {};
+      if (end) filter.after_datetime = new Date(end).toISOString();
+      if (teamId) filter.team = String(teamId).trim();
+      if (Object.keys(filter).length) body.filter = filter;
       let payload;
       try {
         payload = await this.request('POST', '/recordings', body);
