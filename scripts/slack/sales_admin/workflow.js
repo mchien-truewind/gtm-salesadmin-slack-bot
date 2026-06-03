@@ -67,6 +67,8 @@ function buildConfig(env = process.env) {
     timezone: env.SALES_ADMIN_TZ || 'America/Los_Angeles',
     morningHour: parseNumber(env.SALES_ADMIN_MORNING_HOUR, 8),
     morningMinute: parseNumber(env.SALES_ADMIN_MORNING_MINUTE, 0),
+    tomorrowHour: parseNumber(env.SALES_ADMIN_TOMORROW_HOUR, 17),
+    tomorrowMinute: parseNumber(env.SALES_ADMIN_TOMORROW_MINUTE, 0),
     postMeetingDelayMin: parseNumber(env.SALES_ADMIN_POST_MEETING_DELAY_MIN, 10),
     scanIntervalMin: parseNumber(env.SALES_ADMIN_SCAN_MIN, 5),
     cancelScanMin: parseNumber(env.SALES_ADMIN_CANCEL_SCAN_MIN, 5),
@@ -75,6 +77,7 @@ function buildConfig(env = process.env) {
     createTasks: parseBoolean(env.SALES_ADMIN_CREATE_TASKS, false),
     portalId: env.HUBSPOT_PORTAL_ID || '43974586',
     statePath: env.SALES_ADMIN_STATE_PATH || path.resolve(process.cwd(), 'data/sales_admin_state.json'),
+    hubspotNextStepProperty: env.SALES_ADMIN_HUBSPOT_NEXT_STEP_PROPERTY || 'hs_next_step',
     grainToken: env.GRAIN_API_TOKEN || env.GRAIN_API || env.GRAIN_ACCESS_TOKEN || env.GRAIN_WORKSPACE_TOKEN || '',
     grainBaseUrl: env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api/v2',
     grainTeamId: String(env.SALES_ADMIN_GRAIN_TEAM_ID || '').trim(),
@@ -128,13 +131,24 @@ function getLocalDateParts(date, timeZone) {
   };
 }
 
-function getLocalDayRange(now = new Date(), timeZone = 'America/Los_Angeles') {
-  const parts = getLocalDateParts(now, timeZone);
+function getLocalDayRange(now = new Date(), timeZone = 'America/Los_Angeles', dayOffset = 0) {
+  const baseParts = getLocalDateParts(now, timeZone);
+  const targetNoon = zonedLocalToUtc(baseParts.year, baseParts.month, baseParts.day + dayOffset, 12, 0, 0, timeZone);
+  const parts = getLocalDateParts(targetNoon, timeZone);
   const start = zonedLocalToUtc(parts.year, parts.month, parts.day, 0, 0, 0, timeZone);
-  const nextDay = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1, 0, 0, 0));
-  const nextParts = getLocalDateParts(nextDay, 'UTC');
+  const nextDayNoon = zonedLocalToUtc(parts.year, parts.month, parts.day + 1, 12, 0, 0, timeZone);
+  const nextParts = getLocalDateParts(nextDayNoon, timeZone);
   const end = zonedLocalToUtc(nextParts.year, nextParts.month, nextParts.day, 0, 0, 0, timeZone);
   return { start, end, dateKey: parts.dateKey };
+}
+
+function formatLocalDate(date, timeZone = 'America/Los_Angeles') {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  }).format(date);
 }
 
 function formatLocalTime(iso, timeZone = 'America/Los_Angeles') {
@@ -215,6 +229,13 @@ function contactLabel(contact) {
   return `${name || contact.email || 'Contact'}${company}`;
 }
 
+function companyNameForMeeting(meeting) {
+  return primaryCompany(meeting)?.name
+    || primaryDeal(meeting)?.dealname
+    || primaryContact(meeting)?.company
+    || meetingTitle(meeting);
+}
+
 function slackLink(url, label) {
   return url ? `<${url}|${label}>` : label;
 }
@@ -233,6 +254,17 @@ function meetingLinks(hubspot, meeting) {
   if (company?.id) links.push(slackLink(hubspot.recordUrl('companies', company.id), company.name || 'Company'));
   if (deal?.id) links.push(slackLink(hubspot.recordUrl('deals', deal.id), deal.dealname || 'Deal'));
   return links.join(' | ');
+}
+
+function tomorrowMeetingText({ hubspot, meeting, timeZone }) {
+  const companyName = companyNameForMeeting(meeting);
+  const title = meetingTitle(meeting);
+  const lines = [
+    `*${formatLocalTime(meeting.properties?.hs_meeting_start_time, timeZone)} — ${slackMrkdwn(companyName)}*`,
+  ];
+  if (title && title !== companyName) lines.push(slackMrkdwn(title));
+  lines.push(meetingLinks(hubspot, meeting));
+  return lines.join('\n');
 }
 
 function isInternalEmail(email) {
@@ -279,10 +311,17 @@ function getRecordingText(recording) {
   return [actionText, typeof summary === 'object' ? JSON.stringify(summary) : summary, transcript].filter(Boolean).join('\n\n');
 }
 
+function aiSummaryText(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  return String(value.summary || value.text || value.overview || '').trim();
+}
+
 function normalizeExtraction(raw = {}) {
   const nextSteps = Array.isArray(raw.next_steps) ? raw.next_steps : [];
   return {
     outcome: String(raw.outcome || '').trim() || 'Needs AE confirmation',
+    summary: String(raw.summary || raw.sales_summary || '').trim(),
     nextSteps: nextSteps.map(step => ({
       text: String(step.text || step.description || step.action || step || '').trim(),
       owner: String(step.owner || '').trim(),
@@ -298,8 +337,10 @@ function normalizeExtraction(raw = {}) {
 async function extractNextSteps({ anthropic, recording, logger = console }) {
   const actionItems = recording?.ai_action_items || recording?.action_items || recording?.next_steps;
   if (Array.isArray(actionItems) && actionItems.length > 0) {
+    const summary = aiSummaryText(recording?.ai_summary || recording?.summary || recording?.overview);
     return normalizeExtraction({
-      outcome: recording?.ai_summary?.summary || recording?.summary || 'Meeting completed; review next steps.',
+      outcome: 'Meeting completed; review next steps.',
+      summary,
       next_steps: actionItems.map(item => (typeof item === 'string' ? { text: item } : item)),
       confidence: 'high',
       source: 'grain_ai_action_items',
@@ -315,10 +356,10 @@ async function extractNextSteps({ anthropic, recording, logger = console }) {
     const res = await anthropic.messages.create({
       model: process.env.SALES_ADMIN_CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 700,
-      system: 'Extract sales meeting outcome and next steps. Return only valid JSON. Never invent facts.',
+      system: 'Extract a short sales-leader summary and explicit next steps. Return only valid JSON. Never invent facts.',
       messages: [{
         role: 'user',
-        content: `From these meeting notes/transcript, extract the outcome and explicit next steps. If no next steps are explicit, return an empty next_steps array and confidence low.\n\nJSON schema:\n{"outcome":"string","next_steps":[{"text":"string","owner":"string","due_date":"string"}],"confidence":"high|medium|low"}\n\nMeeting content:\n${text}`,
+        content: `From these meeting notes/transcript, extract a very short sales-leader summary and explicit follow-up items. If no follow-up items are explicit, return an empty next_steps array and confidence low.\n\nJSON schema:\n{"outcome":"Meeting completed; review next steps.","summary":"1-2 short sentences for a sales leader","next_steps":[{"text":"string","owner":"string","due_date":"string"}],"confidence":"high|medium|low"}\n\nMeeting content:\n${text}`,
       }],
     });
     const responseText = res.content?.find(block => block.type === 'text')?.text || '{}';
@@ -370,21 +411,35 @@ function truncateText(value, maxLength = 2900) {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 3)}...`;
 }
 
-function outcomeBlockText(extraction) {
-  return truncateText(`*Outcome from Grain*\n${slackMrkdwn(extraction?.outcome || 'Needs AE confirmation.')}`);
-}
-
 function nextStepsBlockText(extraction) {
   const steps = extraction?.nextSteps || [];
   if (!steps.length) {
-    return '*Next steps from Grain*\n_No next steps were found in Grain. Click Edit Notes to add them before saving._';
+    return '*Suggested follow-up from Grain*\n_No follow-up items were found in Grain._';
   }
   const lines = steps.slice(0, 8).map((step, index) => {
     const suffix = [step.owner ? `Owner: ${slackMrkdwn(step.owner)}` : '', step.dueDate ? `Due: ${slackMrkdwn(step.dueDate)}` : ''].filter(Boolean).join(', ');
     return `${index + 1}. ${slackMrkdwn(step.text)}${suffix ? ` _(${suffix})_` : ''}`;
   });
-  if (steps.length > lines.length) lines.push(`_${steps.length - lines.length} more next steps omitted. Click Edit Notes to review._`);
-  return truncateText(`*Next steps from Grain*\n${lines.join('\n')}`);
+  if (steps.length > lines.length) lines.push(`_${steps.length - lines.length} more follow-up items omitted._`);
+  return truncateText(`*Suggested follow-up from Grain*\n${lines.join('\n')}`);
+}
+
+function hubspotNextStepSummary({ meeting, extraction } = {}) {
+  const summary = String(extraction?.summary || '').trim();
+  if (summary) return truncateText(summary.replace(/\s+/g, ' '), 700);
+  const steps = extraction?.nextSteps || [];
+  if (steps.length) {
+    return truncateText(steps.slice(0, 2).map(step => step.text).filter(Boolean).join(' '), 700);
+  }
+  return `Meeting completed for ${companyNameForMeeting(meeting)}; AE to confirm next step.`;
+}
+
+function hubspotNextStepBlockText({ meeting, extraction } = {}) {
+  return truncateText([
+    '*HubSpot Next Step*',
+    'Please confirm this short summary should be saved to HubSpot under `Next step`:',
+    `>${slackMrkdwn(hubspotNextStepSummary({ meeting, extraction }))}`,
+  ].join('\n'));
 }
 
 function stageBlockText(stageDecision) {
@@ -459,7 +514,7 @@ function selectedStageLabel(stageDecision, stageId) {
   return stageDecision?.options?.find(stage => stage.id === stageId)?.label || '';
 }
 
-function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', editedOutcome = '', editedNextSteps = '', stageDecision = null, selectedStageId = '', stageUpdate = null }) {
+function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hubspotNextStep = '', stageDecision = null, selectedStageId = '', stageUpdate = null, nextStepPropertyUpdate = null }) {
   const lines = [
     'Sales Admin Confirmed Meeting Outcome',
     `AE: ${ae.name} <${ae.email}>`,
@@ -477,11 +532,12 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', ed
   if (status === 'no_show') {
     lines.push('Outcome: No show');
   } else {
-    lines.push(`Outcome: ${editedOutcome || extraction?.outcome || 'Confirmed'}`);
-    const steps = editedNextSteps
-      ? editedNextSteps.split(/\n+/).map(text => ({ text: text.trim() })).filter(step => step.text)
-      : (extraction?.nextSteps || []);
-    lines.push('Next steps:');
+    lines.push('Outcome: Meeting completed; review next steps.');
+    lines.push(`HubSpot Next step: ${hubspotNextStep || hubspotNextStepSummary({ meeting, extraction })}`);
+    if (nextStepPropertyUpdate?.updated) lines.push(`HubSpot Next step property updated: ${nextStepPropertyUpdate.propertyName}`);
+    if (nextStepPropertyUpdate && !nextStepPropertyUpdate.updated) lines.push(`HubSpot Next step property update: ${nextStepPropertyUpdate.reason}`);
+    const steps = extraction?.nextSteps || [];
+    lines.push('Grain suggested follow-up:');
     if (steps.length) {
       for (const step of steps) lines.push(`- ${step.text}${step.owner ? ` (Owner: ${step.owner})` : ''}${step.dueDate ? ` (Due: ${step.dueDate})` : ''}`);
     } else {
@@ -492,28 +548,26 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', ed
 }
 
 function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, stageDecision }) {
-  const instruction = stageDecision
-    ? 'review the notes, choose the deal stage, then save to HubSpot.'
-    : 'review the notes, then save to HubSpot.';
-  const text = `:clipboard: *Post-meeting check: ${slackMrkdwn(meetingTitle(meeting))}*\n<@${ae.slackUserId}> ${instruction}`;
+  const companyName = companyNameForMeeting(meeting);
+  const text = `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. Meeting completed; review next steps.`;
   return [
     { type: 'section', text: { type: 'mrkdwn', text } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
-    { type: 'section', text: { type: 'mrkdwn', text: outcomeBlockText(extraction) } },
-    { type: 'section', text: { type: 'mrkdwn', text: nextStepsBlockText(extraction) } },
     ...(stageDecision ? [{
       type: 'section',
       block_id: 'deal_stage',
       text: { type: 'mrkdwn', text: stageBlockText(stageDecision) },
       accessory: stageSelectElement(stageDecision, stageDecision.recommendedStageId),
     }] : []),
+    { type: 'section', text: { type: 'mrkdwn', text: nextStepsBlockText(extraction) } },
+    { type: 'section', text: { type: 'mrkdwn', text: hubspotNextStepBlockText({ meeting, extraction }) } },
     {
       type: 'context',
       elements: [{
         type: 'mrkdwn',
         text: stageDecision
-          ? ':information_source: *Confirm & Save* writes a HubSpot note and applies the selected deal stage. To avoid moving the deal, select the current stage.'
-          : ':information_source: *Confirm & Save* writes these notes back to HubSpot.',
+          ? ':information_source: *Confirm & Save* updates HubSpot `Next step`, writes a note, and applies the selected deal stage.'
+          : ':information_source: *Confirm & Save* updates HubSpot `Next step` and writes a note.',
       }],
     },
     {
@@ -645,10 +699,18 @@ class SalesAdminWorkflow {
     }
   }
 
-  async meetingsForToday(ae, now = new Date()) {
-    const { start, end } = getLocalDayRange(now, this.config.timezone);
+  async meetingsForDayOffset(ae, now = new Date(), dayOffset = 0) {
+    const { start, end } = getLocalDayRange(now, this.config.timezone, dayOffset);
     const meetings = await this.hubspot.searchMeetingsForOwnerBetween(ae.hubspotOwnerId, start, end);
     return Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
+  }
+
+  async meetingsForToday(ae, now = new Date()) {
+    return this.meetingsForDayOffset(ae, now, 0);
+  }
+
+  async meetingsForTomorrow(ae, now = new Date()) {
+    return this.meetingsForDayOffset(ae, now, 1);
   }
 
   async runMorningSummaries(now = new Date()) {
@@ -683,6 +745,47 @@ class SalesAdminWorkflow {
         } catch (err) {
           stats.errors += 1;
           this.logger.error(`Sales admin morning summary failed for ${ae.name}: ${err.message}`);
+        }
+      }
+      return stats;
+    });
+  }
+
+  async runTomorrowSummaries(now = new Date()) {
+    if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
+    return this.withLock('tomorrow', async () => {
+      const { start, dateKey } = getLocalDayRange(now, this.config.timezone, 1);
+      const dateLabel = formatLocalDate(start, this.config.timezone);
+      const stats = { posted: 0, skipped: 0, errors: 0 };
+      for (const ae of this.config.roster) {
+        if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
+        const key = `tomorrow:${dateKey}:${ae.hubspotOwnerId}`;
+        if (this.state.has(key)) { stats.skipped += 1; continue; }
+        try {
+          const meetings = await this.meetingsForTomorrow(ae, now);
+          const scheduled = meetings.filter(meeting => classifyMeetingStatus(meeting) !== 'cancelled');
+          const cancelled = meetings.filter(meeting => classifyMeetingStatus(meeting) === 'cancelled');
+          const lines = [
+            `:calendar: *Tomorrow's calls — ${dateLabel}*`,
+            `<@${ae.slackUserId}>, here are the calls on your calendar tomorrow.`,
+          ];
+          if (scheduled.length === 0) {
+            lines.push('\nNo scheduled calls found for tomorrow.');
+          } else {
+            for (const meeting of scheduled) {
+              lines.push(`\n${tomorrowMeetingText({ hubspot: this.hubspot, meeting, timeZone: this.config.timezone })}`);
+            }
+          }
+          if (cancelled.length > 0) {
+            lines.push('\n*Cancelled tomorrow:*');
+            for (const meeting of cancelled) lines.push(`- ${formatLocalTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)} — ${slackMrkdwn(meetingTitle(meeting))}`);
+          }
+          const posted = await this.safePostMessage(ae, { text: truncateText(lines.join('\n'), 39000) });
+          this.state.set(key, { type: 'tomorrow', ae, dateKey, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'posted' });
+          stats.posted += 1;
+        } catch (err) {
+          stats.errors += 1;
+          this.logger.error(`Sales admin tomorrow summary failed for ${ae.name}: ${err.message}`);
         }
       }
       return stats;
@@ -844,7 +947,15 @@ class SalesAdminWorkflow {
     return { updated: true, dealId: stageDecision.dealId, fromStageId: stageDecision.currentStageId, toStageId: selectedStageId, fromLabel: stageDecision.currentStageLabel, toLabel: selectedLabel };
   }
 
-  async writeMeetingOutcome(promptKey, { status, editedOutcome = '', editedNextSteps = '', selectedStageId = '', slackUserId = '', responseChannel = '', responseThreadTs = '' } = {}) {
+  async updateHubSpotNextStep(record, value) {
+    const dealId = record.stageDecision?.dealId || primaryDeal(record.meeting)?.id || '';
+    if (!dealId) return { updated: false, reason: 'No associated deal found for HubSpot Next step.' };
+    if (!this.config.hubspotNextStepProperty) return { updated: false, reason: 'No HubSpot Next step property configured.' };
+    await this.hubspot.updateDealProperty(dealId, this.config.hubspotNextStepProperty, value);
+    return { updated: true, dealId, propertyName: this.config.hubspotNextStepProperty };
+  }
+
+  async writeMeetingOutcome(promptKey, { status, hubspotNextStep = '', selectedStageId = '', slackUserId = '', responseChannel = '', responseThreadTs = '' } = {}) {
     const record = this.state.get(promptKey);
     if (!record) throw new Error(`Sales admin prompt state not found: ${promptKey}`);
     if (record.writebackStatus === 'written') return record;
@@ -852,17 +963,21 @@ class SalesAdminWorkflow {
     const ae = record.ae;
     const effectiveStageId = status === 'no_show' ? '' : (selectedStageId || record.stageDecision?.recommendedStageId || '');
     const stageUpdate = status === 'no_show' ? { updated: false, reason: 'No-show confirmation does not move deal stage.' } : await this.applySelectedStage(record, effectiveStageId);
+    const effectiveHubSpotNextStep = status === 'no_show' ? '' : (hubspotNextStep || hubspotNextStepSummary({ meeting, extraction: record.extraction }));
+    const nextStepPropertyUpdate = status === 'no_show'
+      ? { updated: false, reason: 'No-show confirmation does not update HubSpot Next step.' }
+      : await this.updateHubSpotNextStep(record, effectiveHubSpotNextStep).catch(err => ({ updated: false, reason: err.message }));
     const body = buildWritebackNote({
       ae,
       meeting,
       status,
       extraction: record.extraction,
       grainUrl: record.grainUrl,
-      editedOutcome,
-      editedNextSteps,
+      hubspotNextStep: effectiveHubSpotNextStep,
       stageDecision: record.stageDecision,
       selectedStageId: effectiveStageId,
       stageUpdate,
+      nextStepPropertyUpdate,
     });
     const note = await this.hubspot.createNote({
       body: `${body}\nConfirmed by Slack user: ${slackUserId || 'unknown'}`,
@@ -873,9 +988,7 @@ class SalesAdminWorkflow {
     });
     const taskIds = [];
     if (this.config.createTasks && status !== 'no_show') {
-      const steps = editedNextSteps
-        ? editedNextSteps.split(/\n+/).map(text => ({ text: text.trim() })).filter(step => step.text)
-        : (record.extraction?.nextSteps || []);
+      const steps = record.extraction?.nextSteps || [];
       for (const step of steps.slice(0, 5)) {
         const task = await this.hubspot.createTask({
           subject: `Follow up: ${meetingTitle(meeting)}`.slice(0, 250),
@@ -892,13 +1005,13 @@ class SalesAdminWorkflow {
     }
     const updated = this.state.update(promptKey, {
       confirmationStatus: status,
-      editedOutcome,
-      editedNextSteps,
+      hubspotNextStep: effectiveHubSpotNextStep,
       confirmedBySlackUser: slackUserId,
       hubspotNoteId: note.id,
       hubspotTaskIds: taskIds,
       selectedStageId: effectiveStageId,
       stageUpdate,
+      nextStepPropertyUpdate,
       writebackStatus: 'written',
       status: status === 'no_show' ? 'no_show' : 'confirmed',
     });
@@ -909,7 +1022,7 @@ class SalesAdminWorkflow {
         token: this.env.SLACK_BOT_TOKEN,
         channel,
         thread_ts: threadTs,
-        text: `Recorded in HubSpot. Note ID: ${note.id}${stageUpdate?.updated ? `; deal moved to ${stageUpdate.toLabel}` : ''}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
+        text: `Recorded in HubSpot. Note ID: ${note.id}${nextStepPropertyUpdate?.updated ? '; Next step updated' : ''}${stageUpdate?.updated ? `; deal moved to ${stageUpdate.toLabel}` : ''}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
       }).catch(err => this.logger.warn(`Sales admin confirmation Slack reply failed: ${err.message}`));
     }
     return updated;
@@ -968,16 +1081,16 @@ class SalesAdminWorkflow {
       const openModal = client.views.open({
         token: this.env.SLACK_BOT_TOKEN,
         trigger_id: body.trigger_id,
-        view: {
+          view: {
           type: 'modal',
           callback_id: POST_ACTIONS.editSubmit,
           private_metadata: JSON.stringify({ promptKey: action.value, channel: body.channel?.id || body.container?.channel_id, threadTs: body.message?.ts || body.container?.message_ts }),
-          title: { type: 'plain_text', text: 'Edit next steps' },
+          title: { type: 'plain_text', text: 'Edit HubSpot next step' },
           submit: { type: 'plain_text', text: 'Save to HubSpot' },
           close: { type: 'plain_text', text: 'Cancel' },
           blocks: [
-            { type: 'input', block_id: 'outcome', label: { type: 'plain_text', text: 'Outcome' }, element: inputElement(record.extraction?.outcome || '') },
-            { type: 'input', block_id: 'next_steps', label: { type: 'plain_text', text: 'Next steps' }, element: inputElement((record.extraction?.nextSteps || []).map(step => step.text).join('\n')) },
+            { type: 'section', text: { type: 'mrkdwn', text: 'Edit the short text that will be saved to the HubSpot deal `Next step` field.' } },
+            { type: 'input', block_id: 'hubspot_next_step', label: { type: 'plain_text', text: 'HubSpot Next step' }, element: inputElement(record.hubspotNextStep || hubspotNextStepSummary({ meeting: record.meeting, extraction: record.extraction })) },
             ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
           ],
         },
@@ -993,14 +1106,12 @@ class SalesAdminWorkflow {
       await ack();
       const metadata = JSON.parse(view.private_metadata || '{}');
       const values = view.state?.values || {};
-      const editedOutcome = values.outcome?.value?.value || '';
-      const editedNextSteps = values.next_steps?.value?.value || '';
+      const hubspotNextStep = values.hubspot_next_step?.value?.value || '';
       const selectedStageId = values.deal_stage?.[POST_ACTIONS.stageSelect]?.selected_option?.value || '';
       try {
         await this.writeMeetingOutcome(metadata.promptKey, {
           status: 'edited',
-          editedOutcome,
-          editedNextSteps,
+          hubspotNextStep,
           selectedStageId,
           slackUserId: body.user?.id,
           responseChannel: metadata.channel,
@@ -1042,6 +1153,15 @@ function scheduleSalesAdminWorkflow(workflow) {
     workflow.logger.log(`  Sales admin morning scheduled in ${Math.round(delay / 60000)} min`);
   };
   scheduleMorning();
+  const scheduleTomorrow = () => {
+    const delay = msUntilNextLocalTime({ timeZone: workflow.config.timezone, hour: workflow.config.tomorrowHour, minute: workflow.config.tomorrowMinute });
+    timers.push(setTimeout(async () => {
+      await workflow.runTomorrowSummaries().catch(err => workflow.logger.error(`Sales admin tomorrow scheduled run failed: ${err.message}`));
+      scheduleTomorrow();
+    }, delay));
+    workflow.logger.log(`  Sales admin tomorrow summary scheduled in ${Math.round(delay / 60000)} min`);
+  };
+  scheduleTomorrow();
   timers.push(setInterval(() => workflow.runCancellationScan().catch(err => workflow.logger.error(`Sales admin cancellation scheduled run failed: ${err.message}`)), workflow.config.cancelScanMin * 60 * 1000));
   timers.push(setInterval(() => workflow.runPostMeetingScan().catch(err => workflow.logger.error(`Sales admin post-meeting scheduled run failed: ${err.message}`)), workflow.config.scanIntervalMin * 60 * 1000));
   return timers;

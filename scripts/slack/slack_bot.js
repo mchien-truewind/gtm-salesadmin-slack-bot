@@ -5166,6 +5166,27 @@ function startHttpServer() {
       }
       return;
     }
+    if (req.url.split('?')[0] === '/run-sales-admin-tomorrow') {
+      if (!isAuthorizedSalesAdminTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const nowParam = params.get('now');
+        const now = nowParam ? new Date(nowParam) : new Date();
+        if (Number.isNaN(now.getTime())) throw new Error(`Invalid now parameter: ${nowParam}`);
+        const stats = await salesAdminWorkflow.runTomorrowSummaries(now);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('Sales admin tomorrow manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
     if (req.url.split('?')[0] === '/run-sales-admin-cancellations') {
       if (!isAuthorizedSalesAdminTrigger(req.url, req.headers)) {
         res.writeHead(401);

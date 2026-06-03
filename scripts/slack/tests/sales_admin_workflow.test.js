@@ -115,6 +115,8 @@ test('sales admin config defaults disabled and channel roster is available', () 
   assert.equal(config.enabled, false);
   assert.equal(config.postMeetingDelayMin, 10);
   assert.equal(config.cancelScanMin, 5);
+  assert.equal(config.tomorrowHour, 17);
+  assert.equal(config.tomorrowMinute, 0);
   assert.ok(config.roster.some(ae => ae.salesAdminChannel === 'gtm-salesadmin-sarah'));
 });
 
@@ -123,6 +125,13 @@ test('sales admin Pacific day range respects date key', () => {
   assert.equal(range.dateKey, '2026-06-03');
   assert.equal(range.start.toISOString(), '2026-06-03T07:00:00.000Z');
   assert.equal(range.end.toISOString(), '2026-06-04T07:00:00.000Z');
+});
+
+test('sales admin Pacific day range supports tomorrow offset', () => {
+  const range = getLocalDayRange(new Date('2026-06-03T18:00:00.000Z'), 'America/Los_Angeles', 1);
+  assert.equal(range.dateKey, '2026-06-04');
+  assert.equal(range.start.toISOString(), '2026-06-04T07:00:00.000Z');
+  assert.equal(range.end.toISOString(), '2026-06-05T07:00:00.000Z');
 });
 
 test('sales admin meeting end falls back to one hour after start', () => {
@@ -162,6 +171,51 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
   assert.equal(stats.skipped, 1);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].channel, 'C_SARAH');
+});
+
+test('sales admin tomorrow summary posts next-day calls after 5pm schedule', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-tomorrow-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.meetingsForTomorrow = async () => [
+    {
+      id: 'm1',
+      properties: { hs_meeting_title: 'Truewind Full Demo', hs_meeting_start_time: '2026-06-04T16:30:00.000Z' },
+      _companies: [{ id: 'c1', name: 'Acme' }],
+      _deals: [{ id: 'd1', dealname: 'Acme - New Deal' }],
+      _contacts: [{ id: 'ct1', firstname: 'Ava', lastname: 'Buyer', email: 'ava@example.com' }],
+    },
+    {
+      id: 'm2',
+      properties: { hs_meeting_title: 'Canceled: Old Intro', hs_meeting_start_time: '2026-06-04T20:00:00.000Z' },
+    },
+  ];
+
+  const stats = await workflow.runTomorrowSummaries(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(stats.posted, 1);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].channel, 'C_SARAH');
+  assert.match(posts[0].text, /Tomorrow's calls .*Jun 4/);
+  assert.match(posts[0].text, /<@U09QC3B292R>/);
+  assert.match(posts[0].text, /\*9:30 AM — Acme\*/);
+  assert.match(posts[0].text, /Truewind Full Demo/);
+  assert.match(posts[0].text, /HubSpot meeting/);
+  assert.match(posts[0].text, /Cancelled tomorrow/);
+  assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
 
 test('sales admin resolves public channels without requiring private channel scope', async () => {
@@ -206,7 +260,7 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
     { id: 'target-me', properties: { hs_meeting_title: 'EdOps / Truewind', hs_meeting_start_time: '2026-06-03T20:30:00Z', hs_meeting_end_time: '2026-06-03T21:30:00Z' } },
   ];
   workflow.fetchGrainForMeeting = async () => ({
-    recording: { id: 'grain-1', title: 'EdOps / Truewind', ai_action_items: [{ text: 'Send follow-up' }] },
+    recording: { id: 'grain-1', title: 'EdOps / Truewind', ai_summary: { summary: 'EdOps is evaluating Truewind for finance workflow automation and needs a follow-up on implementation scope.' }, ai_action_items: [{ text: 'Send follow-up' }] },
     grainUrl: 'https://grain.com/share/recording/grain-1',
     source: 'grain_matched',
   });
@@ -225,9 +279,13 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.equal(stats.prompted, 1);
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /EdOps/);
-  assert.match(posts[0].blocks[0].text.text, /review the notes, choose the deal stage, then save to HubSpot/);
-  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
-  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Next steps from Grain*')));
+  assert.match(posts[0].blocks[0].text.text, /^\*EdOps \/ Truewind\*/);
+  assert.match(posts[0].blocks[0].text.text, /Meeting completed; review next steps/);
+  assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
+  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Suggested follow-up from Grain*')));
+  const hubspotNextStepBlock = posts[0].blocks.find(block => block.text?.text?.includes('*HubSpot Next Step*'));
+  assert.match(hubspotNextStepBlock.text.text, /saved to HubSpot under `Next step`/);
+  assert.match(hubspotNextStepBlock.text.text, /EdOps is evaluating Truewind/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('```')));
   const stageBlock = posts[0].blocks.find(block => block.block_id === 'deal_stage');
   assert.match(stageBlock.text.text, /Deal stage: EdOps - New Deal/);
@@ -240,6 +298,61 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['Confirm & Save', 'Edit Notes', 'No-Show', 'Not this meeting']);
   assert.equal(actions.elements[3].type, 'overflow');
   assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
+});
+
+test('sales admin confirmation updates HubSpot deal next step summary', async () => {
+  const propertyUpdates = [];
+  const notes = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async () => ({ ts: 'reply' }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-write-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.hubspot = {
+    updateDealStage: async () => ({}),
+    updateDealProperty: async (dealId, propertyName, value) => {
+      propertyUpdates.push({ dealId, propertyName, value });
+      return {};
+    },
+    createNote: async input => {
+      notes.push(input.body);
+      return { id: 'note-1' };
+    },
+    createTask: async () => ({ id: 'task-1' }),
+  };
+  const stageDecision = buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380582' },
+    stages: STAGES,
+  });
+  workflow.state.set('post:m1:84547076', {
+    ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com', hubspotOwnerId: '84547076' },
+    meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }, _deals: [{ id: 'deal-1' }] },
+    extraction: { summary: 'Acme is interested in AP automation and needs pricing follow-up.', nextSteps: [{ text: 'Send pricing' }] },
+    grainUrl: 'https://grain.com/share/recording/grain-1',
+    stageDecision,
+    slackChannel: 'C_SARAH',
+    slackTs: '1',
+  });
+
+  const updated = await workflow.writeMeetingOutcome('post:m1:84547076', {
+    status: 'confirmed',
+    selectedStageId: '190380582',
+    slackUserId: 'U_TEST',
+  });
+
+  assert.deepEqual(propertyUpdates, [{ dealId: 'deal-1', propertyName: 'hs_next_step', value: 'Acme is interested in AP automation and needs pricing follow-up.' }]);
+  assert.equal(updated.hubspotNextStep, 'Acme is interested in AP automation and needs pricing follow-up.');
+  assert.equal(updated.nextStepPropertyUpdate.updated, true);
+  assert.match(notes[0], /HubSpot Next step: Acme is interested/);
 });
 
 test('sales admin state persists idempotency records', () => {
@@ -272,7 +385,8 @@ test('sales admin writeback note records selected deal stage movement', () => {
     ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com' },
     meeting: meeting({ hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }),
     status: 'confirmed',
-    extraction: { outcome: 'Meeting completed', nextSteps: [{ text: 'Send proposal' }] },
+    extraction: { outcome: 'Meeting completed', summary: 'Prospect is ready for proposal follow-up.', nextSteps: [{ text: 'Send proposal' }] },
+    hubspotNextStep: 'Prospect is ready for proposal follow-up.',
     stageDecision,
     selectedStageId: '190380583',
     stageUpdate: { updated: true, fromLabel: 'Stage 2: SQL (Full Product Demo)', toLabel: 'Stage 3: Awaiting Materials' },
@@ -280,4 +394,5 @@ test('sales admin writeback note records selected deal stage movement', () => {
   assert.match(note, /Deal stage before confirmation: Stage 2/);
   assert.match(note, /Confirmed deal stage: Stage 3: Awaiting Materials/);
   assert.match(note, /Deal stage updated in HubSpot: Stage 2: SQL \(Full Product Demo\) -> Stage 3: Awaiting Materials/);
+  assert.match(note, /HubSpot Next step: Prospect is ready for proposal follow-up/);
 });

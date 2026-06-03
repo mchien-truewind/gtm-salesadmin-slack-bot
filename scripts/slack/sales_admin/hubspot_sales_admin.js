@@ -132,6 +132,13 @@ class HubSpotSalesAdminClient {
     });
   }
 
+  async updateDealProperty(dealId, propertyName, value) {
+    if (!dealId || !propertyName) return null;
+    return this.hubspotRequest(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, 'PATCH', {
+      properties: { [propertyName]: String(value || '') },
+    });
+  }
+
   async attachAssociations(meeting) {
     const enriched = {
       ...meeting,
