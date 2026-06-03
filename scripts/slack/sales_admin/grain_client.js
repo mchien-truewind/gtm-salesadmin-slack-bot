@@ -17,6 +17,15 @@ function parseListItems(payload) {
   };
 }
 
+function normalizeInclude(include) {
+  if (!include) return {};
+  if (Array.isArray(include)) {
+    return Object.fromEntries(include.filter(Boolean).map(key => [key, true]));
+  }
+  if (typeof include === 'object') return include;
+  return {};
+}
+
 function requestJson(url, options = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -77,42 +86,51 @@ class GrainClient {
     });
   }
 
-  async listRecordings({ start, end, pageSize = 100, maxPages = 10, include = ['participants', 'ai_action_items', 'ai_summary', 'calendar_event', 'hubspot'] } = {}) {
+  async listRecordings({ start, end, maxPages = 10, include = { participants: true, ai_action_items: true, ai_summary: true, calendar_event: true, hubspot: true } } = {}) {
     const recordings = [];
     let cursor = '';
     for (let page = 0; page < maxPages; page++) {
       const body = {
-        limit: Math.min(Number(pageSize) || 100, 100),
-        include,
+        include: normalizeInclude(include),
       };
       if (cursor) body.cursor = cursor;
-      if (start || end) {
-        body.filter = {
-          ...(start ? { start_time: { gte: new Date(start).toISOString() } } : {}),
-          ...(end ? { start_time: { lte: new Date(end).toISOString() } } : {}),
-        };
-      }
+      if (end) body.filter = { after_datetime: new Date(end).toISOString() };
       let payload;
       try {
         payload = await this.request('POST', '/recordings', body);
       } catch (err) {
         if (page > 0) throw err;
-        const params = new URLSearchParams({ limit: String(body.limit) });
-        payload = await this.request('GET', `/recordings?${params.toString()}`);
+        payload = await this.request('POST', '/recordings', { include: body.include });
       }
       const parsed = parseListItems(payload);
       recordings.push(...parsed.items);
       if (!parsed.hasMore || !parsed.cursor || parsed.items.length === 0) break;
       cursor = parsed.cursor;
     }
-    return recordings;
+    const startMs = start ? new Date(start).getTime() : 0;
+    const endMs = end ? new Date(end).getTime() : 0;
+    if (!startMs && !endMs) return recordings;
+    return recordings.filter(recording => {
+      const raw = recording.start_datetime || recording.start_time || recording.started_at || recording.recorded_at || recording.created_at || '';
+      const recordingStartMs = raw ? new Date(raw).getTime() : 0;
+      if (!Number.isFinite(recordingStartMs) || recordingStartMs <= 0) return false;
+      if (startMs && recordingStartMs < startMs) return false;
+      if (endMs && recordingStartMs > endMs) return false;
+      return true;
+    });
   }
 
   async getRecording(recordingId) {
     const id = encodeURIComponent(recordingId);
     try {
       return await this.request('POST', `/recordings/${id}`, {
-        include: ['participants', 'ai_action_items', 'ai_summary', 'calendar_event', 'hubspot', 'ai_template_sections'],
+        include: {
+          participants: true,
+          ai_action_items: true,
+          ai_summary: true,
+          calendar_event: true,
+          hubspot: true,
+        },
       });
     } catch (err) {
       return this.request('GET', `/recordings/${id}`);
@@ -131,5 +149,6 @@ class GrainClient {
 
 module.exports = {
   GrainClient,
+  normalizeInclude,
   parseListItems,
 };
