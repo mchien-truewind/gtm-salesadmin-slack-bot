@@ -178,6 +178,7 @@ function parseDelimitedEnvSet(name) {
 const HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_USER_IDS');
 const HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('HUBSPOT_WRITE_ALLOWED_SLACK_CHANNEL_IDS');
 const HUBSPOT_WRITE_REQUIRE_AUTH = process.env.HUBSPOT_WRITE_REQUIRE_AUTH !== 'false';
+const SALES_ADMIN_ONLY_MODE = process.env.SALES_ADMIN_ONLY === 'true' || process.env.SALES_ADMIN_ONLY === '1';
 const RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_USER_IDS');
 const RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS = parseDelimitedEnvSet('RECRUITING_CALENDAR_ALLOWED_SLACK_CHANNEL_IDS');
 const RECRUITING_CALENDAR_REQUIRE_AUTH = process.env.RECRUITING_CALENDAR_REQUIRE_AUTH !== 'false';
@@ -3772,7 +3773,8 @@ async function handleMessage(text, threadTs, channel, isThread, say, slackUserId
   }
 }
 
-app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
+if (!SALES_ADMIN_ONLY_MODE) {
+  app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) => {
   await ack();
 
   const blockId = action?.block_id || body?.actions?.[0]?.block_id || '';
@@ -3820,10 +3822,10 @@ app.action(DEAL_SOURCE_SELECT_ACTION_ID, async ({ ack, body, action, client }) =
     deal_source: dealSource,
   });
   await client.chat.postMessage({ channel, thread_ts: threadTs, text: reply });
-});
+  });
 
-// Respond to @mentions in channels
-app.event('app_mention', async ({ event, say }) => {
+  // Respond to @mentions in channels
+  app.event('app_mention', async ({ event, say }) => {
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
   console.log(`app_mention: thread_ts=${event.thread_ts}, ts=${event.ts}, isThread=${isThread}`);
@@ -3831,13 +3833,14 @@ app.event('app_mention', async ({ event, say }) => {
 });
 
 // Respond to DMs
-app.event('message', async ({ event, say }) => {
+  app.event('message', async ({ event, say }) => {
   if (event.channel_type !== 'im') return;
   if (event.bot_id || event.subtype) return;
   const isThread = !!event.thread_ts;
   const threadTs = event.thread_ts || event.ts;
   await handleMessage(event.text, threadTs, event.channel, isThread, say, event.user || '');
-});
+  });
+}
 
 // ============================================================
 // Daily Discovery Call Digest
@@ -5232,9 +5235,13 @@ async function startSlackBot() {
 
   // Schedule Slack posts only after Slack is connected.
   await salesAdminWorkflow.initializeChannels();
-  scheduleMqlDiscoveryReport();
-  scheduleDailyProgress();
-  scheduleLeadStatusSync();
+  if (!SALES_ADMIN_ONLY_MODE) {
+    scheduleMqlDiscoveryReport();
+    scheduleDailyProgress();
+    scheduleLeadStatusSync();
+  } else {
+    console.log('  Sales admin only mode: general assistant and legacy schedules disabled');
+  }
   scheduleSalesAdminWorkflow(salesAdminWorkflow);
 
   // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
@@ -5301,6 +5308,7 @@ module.exports = {
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,
+  SALES_ADMIN_ONLY_MODE,
   salesAdminWorkflow,
   shouldSetLifecycleToOpportunity,
   startSlackBot,
