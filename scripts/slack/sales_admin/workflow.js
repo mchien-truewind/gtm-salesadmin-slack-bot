@@ -317,11 +317,64 @@ function aiSummaryText(value) {
   return String(value.summary || value.text || value.overview || '').trim();
 }
 
+function cleanSalesSummaryText(value) {
+  return String(value || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^[*-]\s+/gm, '')
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function compactSalesLeaderSummary(value, maxLength = 280) {
+  const text = cleanSalesSummaryText(value);
+  if (!text) return '';
+  const sentences = text
+    .split(/(?<=[.!?])\s+/)
+    .map(sentence => sentence.trim())
+    .filter(sentence => sentence.length > 20);
+  const scored = sentences
+    .map((sentence, index) => {
+      const score = [
+        /evaluat|interest|need|decid|timeline|follow|next|pilot|proposal|pricing|scope/i.test(sentence) ? 3 : 0,
+        /client|prospect|customer|company|team|buyer|edops|acme/i.test(sentence) ? 2 : 0,
+        sentence.length <= maxLength ? 1 : 0,
+        -index / 100,
+      ].reduce((sum, item) => sum + item, 0);
+      return { sentence, score };
+    })
+    .sort((left, right) => right.score - left.score);
+  const summary = scored[0]?.sentence || text;
+  return truncateText(summary, maxLength);
+}
+
+async function summarizeSalesLeaderText({ anthropic, text, logger = console }) {
+  const fallback = compactSalesLeaderSummary(text);
+  if (!text || !anthropic) return fallback;
+  try {
+    const res = await anthropic.messages.create({
+      model: process.env.SALES_ADMIN_CLAUDE_MODEL || 'claude-sonnet-4-6',
+      max_tokens: 120,
+      system: 'Write concise CRM sales summaries. Return one sentence only.',
+      messages: [{
+        role: 'user',
+        content: `Write a one-sentence sales-leader summary for HubSpot Next step. Maximum 35 words. Focus on buyer status, decision/timeline, and immediate next action. No bullets, headings, markdown, or invented facts.\n\nMeeting notes:\n${String(text || '').slice(0, 7000)}`,
+      }],
+    });
+    const responseText = res.content?.find(block => block.type === 'text')?.text || '';
+    return compactSalesLeaderSummary(responseText || fallback);
+  } catch (err) {
+    logger.warn(`Sales admin short summary generation failed: ${err.message}`);
+    return fallback;
+  }
+}
+
 function normalizeExtraction(raw = {}) {
   const nextSteps = Array.isArray(raw.next_steps) ? raw.next_steps : [];
   return {
     outcome: String(raw.outcome || '').trim() || 'Needs AE confirmation',
-    summary: String(raw.summary || raw.sales_summary || '').trim(),
+    summary: compactSalesLeaderSummary(raw.summary || raw.sales_summary || ''),
     nextSteps: nextSteps.map(step => ({
       text: String(step.text || step.description || step.action || step || '').trim(),
       owner: String(step.owner || '').trim(),
@@ -337,7 +390,9 @@ function normalizeExtraction(raw = {}) {
 async function extractNextSteps({ anthropic, recording, logger = console }) {
   const actionItems = recording?.ai_action_items || recording?.action_items || recording?.next_steps;
   if (Array.isArray(actionItems) && actionItems.length > 0) {
-    const summary = aiSummaryText(recording?.ai_summary || recording?.summary || recording?.overview);
+    const rawSummary = aiSummaryText(recording?.ai_summary || recording?.summary || recording?.overview);
+    const actionText = actionItems.map(item => (typeof item === 'string' ? item : item.text || item.description || item.title || '')).filter(Boolean).join('\n');
+    const summary = await summarizeSalesLeaderText({ anthropic, text: [rawSummary, actionText].filter(Boolean).join('\n\n'), logger });
     return normalizeExtraction({
       outcome: 'Meeting completed; review next steps.',
       summary,
@@ -426,10 +481,10 @@ function nextStepsBlockText(extraction) {
 
 function hubspotNextStepSummary({ meeting, extraction } = {}) {
   const summary = String(extraction?.summary || '').trim();
-  if (summary) return truncateText(summary.replace(/\s+/g, ' '), 700);
+  if (summary) return compactSalesLeaderSummary(summary);
   const steps = extraction?.nextSteps || [];
   if (steps.length) {
-    return truncateText(steps.slice(0, 2).map(step => step.text).filter(Boolean).join(' '), 700);
+    return compactSalesLeaderSummary(steps.slice(0, 2).map(step => step.text).filter(Boolean).join(' '));
   }
   return `Meeting completed for ${companyNameForMeeting(meeting)}; AE to confirm next step.`;
 }

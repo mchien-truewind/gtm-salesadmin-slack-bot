@@ -218,6 +218,29 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
 
+test('sales admin compacts long Grain summaries for HubSpot next step', async () => {
+  const extraction = await require('../sales_admin/workflow').extractNextSteps({
+    anthropic: null,
+    recording: {
+      ai_summary: {
+        summary: [
+          '## Call Notes',
+          'Truewind explained workpaper automation and accounting controls.',
+          'EdOps is evaluating Truewind for a Sage Intacct client and needs Sarah to send pricing before a July decision.',
+          'Additional implementation details covered bank reconciliations, AP reconciliation, accruals, and scheduling workflows.',
+        ].join('\n'),
+      },
+      ai_action_items: [{ text: 'Sarah will send pricing and implementation scope.' }],
+    },
+    logger: { warn() {} },
+  });
+
+  assert.ok(extraction.summary.length <= 280);
+  assert.doesNotMatch(extraction.summary, /##|\*\*/);
+  assert.match(extraction.summary, /EdOps is evaluating Truewind/);
+  assert.match(extraction.summary, /send pricing/);
+});
+
 test('sales admin resolves public channels without requiring private channel scope', async () => {
   const calls = [];
   const channelId = await resolveChannelId({
