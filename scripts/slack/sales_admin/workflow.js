@@ -724,20 +724,25 @@ class SalesAdminWorkflow {
     return { recording: detail, grainUrl: getGrainRecordingUrl(detail) || getGrainRecordingUrl(matched), source: 'grain_matched' };
   }
 
-  async runPostMeetingScan(now = new Date()) {
+  async runPostMeetingScan(now = new Date(), options = {}) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
     return this.withLock('post', async () => {
       const stats = { prompted: 0, skipped: 0, errors: 0 };
+      const ownerId = String(options.ownerId || options.owner_id || '').trim();
+      const meetingId = String(options.meetingId || options.meeting_id || '').trim();
+      const force = options.force === true || options.force === 'true' || options.force === '1';
       for (const ae of this.config.roster) {
+        if (ownerId && ae.hubspotOwnerId !== ownerId) { stats.skipped += 1; continue; }
         if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         try {
           const meetings = await this.meetingsForToday(ae, now);
           for (const meeting of meetings) {
+            if (meetingId && String(meeting.id) !== meetingId) { stats.skipped += 1; continue; }
             if (classifyMeetingStatus(meeting) === 'cancelled') { stats.skipped += 1; continue; }
             const key = `post:${meeting.id}:${ae.hubspotOwnerId}`;
-            if (this.state.has(key)) { stats.skipped += 1; continue; }
+            if (!force && this.state.has(key)) { stats.skipped += 1; continue; }
             const endMs = meetingEndMs(meeting);
-            if (!endMs || now.getTime() < endMs + this.config.postMeetingDelayMin * 60 * 1000) { stats.skipped += 1; continue; }
+            if (!force && (!endMs || now.getTime() < endMs + this.config.postMeetingDelayMin * 60 * 1000)) { stats.skipped += 1; continue; }
             const grain = await this.fetchGrainForMeeting(ae, meeting).catch(err => {
               this.logger.warn(`Sales admin Grain match failed for meeting ${meeting.id}: ${err.message}`);
               return { recording: null, grainUrl: '', source: 'grain_error' };

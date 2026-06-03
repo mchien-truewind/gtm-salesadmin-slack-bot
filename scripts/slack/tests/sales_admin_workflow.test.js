@@ -184,6 +184,47 @@ test('sales admin resolves public channels without requiring private channel sco
   assert.deepEqual(calls.map(call => call.types), ['public_channel']);
 });
 
+test('sales admin post-meeting scan can force a single targeted meeting', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-target-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.meetingsForToday = async () => [
+    { id: 'skip-me', properties: { hs_meeting_title: 'Other call', hs_meeting_start_time: '2026-06-03T18:00:00Z', hs_meeting_end_time: '2026-06-03T18:30:00Z' } },
+    { id: 'target-me', properties: { hs_meeting_title: 'EdOps / Truewind', hs_meeting_start_time: '2026-06-03T20:30:00Z', hs_meeting_end_time: '2026-06-03T21:30:00Z' } },
+  ];
+  workflow.fetchGrainForMeeting = async () => ({
+    recording: { id: 'grain-1', title: 'EdOps / Truewind', ai_action_items: [{ text: 'Send follow-up' }] },
+    grainUrl: 'https://grain.com/share/recording/grain-1',
+    source: 'grain_matched',
+  });
+  workflow.buildStageDecisionForMeeting = async () => null;
+  workflow.state.set('post:target-me:84547076', { status: 'previously_prompted' });
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-03T22:00:00Z'), {
+    ownerId: '84547076',
+    meetingId: 'target-me',
+    force: true,
+  });
+
+  assert.equal(stats.prompted, 1);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /EdOps/);
+  assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
+});
+
 test('sales admin state persists idempotency records', () => {
   const file = path.join(os.tmpdir(), `sales-admin-state-${Date.now()}-${Math.random()}.json`);
   const state = createSalesAdminState(file, { error() {}, warn() {}, log() {} });

@@ -5190,7 +5190,15 @@ function startHttpServer() {
         return;
       }
       try {
-        const stats = await salesAdminWorkflow.runPostMeetingScan();
+        const params = new URL(req.url, 'http://localhost').searchParams;
+        const nowParam = params.get('now');
+        const now = nowParam ? new Date(nowParam) : new Date();
+        if (Number.isNaN(now.getTime())) throw new Error(`Invalid now parameter: ${nowParam}`);
+        const stats = await salesAdminWorkflow.runPostMeetingScan(now, {
+          ownerId: params.get('owner_id') || params.get('ownerId') || '',
+          meetingId: params.get('meeting_id') || params.get('meetingId') || '',
+          force: params.get('force') || '',
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(stats));
       } catch (err) {
