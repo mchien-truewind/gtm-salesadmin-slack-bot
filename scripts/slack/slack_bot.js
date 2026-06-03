@@ -31,6 +31,10 @@ const {
   formatMqlDiscoveryReport,
 } = require('./mql_discovery_report');
 const {
+  createSalesAdminWorkflow,
+  scheduleSalesAdminWorkflow,
+} = require('./sales_admin/workflow');
+const {
   buildDiscoveryDigestConfig,
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -122,8 +126,8 @@ const TRUEWIND_HUBSPOT = {
     xavier: { id: '89305622', name: 'Xavier Marco' },
     'mercedes chien': { id: '87811681', name: 'Mercedes Chien' },
     mercedes: { id: '87811681', name: 'Mercedes Chien' },
-    'alex lee': { id: '559564379', name: 'Alex Lee' },
-    alex: { id: '559564379', name: 'Alex Lee' },
+    'alex lee': { id: '60918610', name: 'Alex Lee' },
+    alex: { id: '60918610', name: 'Alex Lee' },
     'amy vetter': { id: '92555980', name: 'Amy Vetter' },
     amy: { id: '92555980', name: 'Amy Vetter' },
     'aidan gleghorn': { id: '89053735', name: 'Aidan Gleghorn' },
@@ -144,7 +148,7 @@ const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
   U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
   U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
   U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
-  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
+  U04BPMPR29G: { id: '60918610', name: 'Alex Lee' },
   U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
   U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
 };
@@ -204,6 +208,7 @@ function createSlackApp() {
       client: { chat: { postMessage: async () => ({ ok: true }) } },
       event: () => {},
       action: () => {},
+      view: () => {},
       start: async () => {},
     };
   }
@@ -3338,6 +3343,15 @@ const CLAUDE_HIGH_MODEL = process.env.CLAUDE_MODEL_HIGH
   || 'claude-opus-4-1-20250805';
 const CLAUDE_DIGEST_MODEL = process.env.CLAUDE_DIGEST_MODEL || CLAUDE_DEFAULT_MODEL;
 
+const salesAdminWorkflow = createSalesAdminWorkflow({
+  app,
+  hubspotRequest,
+  anthropic,
+  env: process.env,
+  logger: console,
+});
+salesAdminWorkflow.registerHandlers();
+
 const PRIORITY_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI/edit?gid=0#gid=0';
 const PRIORITY_SHEET_ID = '1RSdbMzBer3O5-dMExLsn3I3ZCCL8vNYMKWs44Z36hnI';
 
@@ -3477,7 +3491,7 @@ When someone asks you to schedule, book, or create an invite for a recruiting in
 Key owner IDs:
 - Xavier Marco: 89305622
 - Mercedes Chien: 87811681
-- Alex Lee: 559564379
+- Alex Lee: 60918610
 - Amy Vetter: 92555980
 - Aidan Gleghorn: 89053735
 - Noah Salah: 90960689
@@ -4324,6 +4338,7 @@ const PROGRESS_TARGET_CHANNEL = process.env.LEAD_REPORT_TARGET_CHANNEL || 'gtm-g
 const PROGRESS_DEAL_SOURCE_PROPERTY = parseProgressDealSourceProperty(process.env.LEAD_REPORT_DEAL_SOURCE_PROPERTY);
 const PROGRESS_PIPELINE_ID = process.env.LEAD_REPORT_PIPELINE_ID || '105321581';
 const PROGRESS_TRIGGER_SECRET = process.env.LEAD_REPORT_TRIGGER_SECRET || '';
+const SALES_ADMIN_TRIGGER_SECRET = process.env.SALES_ADMIN_TRIGGER_SECRET || PROGRESS_TRIGGER_SECRET || '';
 const PROGRESS_WEEKLY_GOAL = parseProgressWeeklyGoal(process.env.LEAD_REPORT_WEEKLY_GOAL);
 const PROGRESS_TEST_DEAL_PATTERNS = [/\btest\b/i, /truewind/i];
 const PROGRESS_TIMEZONE = 'America/Los_Angeles';
@@ -4681,6 +4696,20 @@ function isAuthorizedProgressTrigger(reqUrl, headers = {}) {
   const params = new URL(reqUrl, 'http://localhost').searchParams;
   const provided = params.get('token') || headers['x-lead-report-token'] || '';
   const expectedBuffer = Buffer.from(PROGRESS_TRIGGER_SECRET);
+  const providedBuffer = Buffer.from(String(provided));
+  return providedBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+function isAuthorizedSalesAdminTrigger(reqUrl, headers = {}) {
+  if (!SALES_ADMIN_TRIGGER_SECRET) return false;
+
+  const params = new URL(reqUrl, 'http://localhost').searchParams;
+  const provided = params.get('token')
+    || headers['x-sales-admin-token']
+    || headers['x-lead-report-token']
+    || '';
+  const expectedBuffer = Buffer.from(SALES_ADMIN_TRIGGER_SECRET);
   const providedBuffer = Buffer.from(String(provided));
   return providedBuffer.length === expectedBuffer.length
     && crypto.timingSafeEqual(providedBuffer, expectedBuffer);
@@ -5117,6 +5146,57 @@ function startHttpServer() {
       }
       return;
     }
+    if (req.url.split('?')[0] === '/run-sales-admin-morning') {
+      if (!isAuthorizedSalesAdminTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const stats = await salesAdminWorkflow.runMorningSummaries();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('Sales admin morning manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+    if (req.url.split('?')[0] === '/run-sales-admin-cancellations') {
+      if (!isAuthorizedSalesAdminTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const stats = await salesAdminWorkflow.runCancellationScan();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('Sales admin cancellation manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+    if (req.url.split('?')[0] === '/run-sales-admin-post-meeting') {
+      if (!isAuthorizedSalesAdminTrigger(req.url, req.headers)) {
+        res.writeHead(401);
+        res.end('unauthorized');
+        return;
+      }
+      try {
+        const stats = await salesAdminWorkflow.runPostMeetingScan();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        console.error('Sales admin post-meeting manual trigger failed:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
     res.writeHead(200);
     res.end('ok');
   }).listen(PORT, () => {
@@ -5151,9 +5231,11 @@ async function startSlackBot() {
   if (!slackStarted) return;
 
   // Schedule Slack posts only after Slack is connected.
+  await salesAdminWorkflow.initializeChannels();
   scheduleMqlDiscoveryReport();
   scheduleDailyProgress();
   scheduleLeadStatusSync();
+  scheduleSalesAdminWorkflow(salesAdminWorkflow);
 
   // Manual CLI trigger is handled before socket mode starts so it posts once and exits.
 }
@@ -5219,6 +5301,7 @@ module.exports = {
   resolveHubSpotOwner,
   resolveHubSpotOwnerForProspect,
   runStructuredDealCreateWorkflow,
+  salesAdminWorkflow,
   shouldSetLifecycleToOpportunity,
   startSlackBot,
   summarizeHubSpotStageCohortOutcomes,
