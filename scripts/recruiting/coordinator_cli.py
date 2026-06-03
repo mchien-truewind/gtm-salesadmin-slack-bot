@@ -4990,6 +4990,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
     pages = notion.query_pages({"page_size": 100})
 
     proceed_drafts = 0
+    proceed_drafts_auto_sent = 0
+    proceed_drafts_auto_send_skipped_missing = 0
     reject_scheduled = 0
     reject_drafts = 0
     reject_drafts_auto_sent = 0
@@ -5350,7 +5352,27 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
 
         if decision == "proceed":
             proceed_draft_id = notion_prop_value(page_props.get(prop.proceed_draft_id, {})).strip()
-            if not proceed_draft_id:
+            if proceed_draft_id and current_status == "proceed drafted":
+                sent_message_id = send_gmail_draft(gmail_service, proceed_draft_id)
+                if sent_message_id:
+                    proceed_drafts_auto_sent += 1
+                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "Scheduling"
+                    current_status = next_status.lower()
+                    if prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], next_status
+                        )
+                    if prop.proceed_draft_id in properties_schema:
+                        update_payload[prop.proceed_draft_id] = build_notion_value(
+                            properties_schema[prop.proceed_draft_id], ""
+                        )
+                    if not decision_time and prop.decision_time in properties_schema:
+                        update_payload[prop.decision_time] = build_notion_value(
+                            properties_schema[prop.decision_time], iso(now)
+                        )
+                else:
+                    proceed_drafts_auto_send_skipped_missing += 1
+            elif not proceed_draft_id:
                 proceed_body = DEFAULT_CUSTOM_GPT_PROCEED_TEMPLATE if uses_custom_gpt_assignment else config.proceed_template
                 draft_id = create_reply_draft(
                     gmail_service,
@@ -5372,6 +5394,19 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
                     update_payload[prop.status] = build_notion_value(
                         properties_schema[prop.status], "Proceed Drafted"
                     )
+                sent_message_id = send_gmail_draft(gmail_service, draft_id)
+                if sent_message_id:
+                    proceed_drafts_auto_sent += 1
+                    next_status = "In CustomGPT Process" if uses_custom_gpt_assignment else "Scheduling"
+                    current_status = next_status.lower()
+                    if prop.status in properties_schema:
+                        update_payload[prop.status] = build_notion_value(
+                            properties_schema[prop.status], next_status
+                        )
+                    if prop.proceed_draft_id in properties_schema:
+                        update_payload[prop.proceed_draft_id] = build_notion_value(
+                            properties_schema[prop.proceed_draft_id], ""
+                        )
 
             # Scheduling proposal after candidate reply.
             scheduling_draft_id = notion_prop_value(page_props.get(prop.scheduling_draft_id, {})).strip()
@@ -5614,6 +5649,8 @@ def process_decisions_cmd(_args: argparse.Namespace) -> None:
             non_scheduling_archive_failures += archive_failures
 
     print(f"Proceed drafts created: {proceed_drafts}")
+    print(f"Proceed drafts auto-sent: {proceed_drafts_auto_sent}")
+    print(f"Proceed drafts auto-send skipped (missing draft): {proceed_drafts_auto_send_skipped_missing}")
     print(f"Reject schedules initialized: {reject_scheduled}")
     print(f"Reject drafts created: {reject_drafts}")
     print(f"Reject drafts auto-sent: {reject_drafts_auto_sent}")
