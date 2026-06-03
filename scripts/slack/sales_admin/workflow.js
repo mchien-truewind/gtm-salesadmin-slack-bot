@@ -486,14 +486,13 @@ function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, g
   ];
 }
 
-async function resolveChannelId(client, token, channelName) {
-  if (/^[CDG][A-Z0-9]+$/.test(channelName)) return channelName;
+async function findChannelIdByName(client, token, channelName, types) {
   let cursor = '';
   do {
     const res = await client.conversations.list({
       token,
       exclude_archived: true,
-      types: 'public_channel,private_channel',
+      types,
       limit: 1000,
       cursor: cursor || undefined,
     });
@@ -502,6 +501,23 @@ async function resolveChannelId(client, token, channelName) {
     cursor = res.response_metadata?.next_cursor || '';
   } while (cursor);
   return '';
+}
+
+async function resolveChannelId(client, token, channelName, { includePrivate = false, logger = console } = {}) {
+  const normalizedName = String(channelName || '').replace(/^#/, '');
+  if (/^[CDG][A-Z0-9]+$/.test(normalizedName)) return normalizedName;
+  const publicChannelId = await findChannelIdByName(client, token, normalizedName, 'public_channel');
+  if (publicChannelId) return publicChannelId;
+  if (!includePrivate) return '';
+  try {
+    return await findChannelIdByName(client, token, normalizedName, 'private_channel');
+  } catch (err) {
+    if (err?.data?.error === 'missing_scope') {
+      logger.warn(`Sales admin private channel lookup skipped for #${normalizedName}: missing Slack scope groups:read`);
+      return '';
+    }
+    throw err;
+  }
 }
 
 class SalesAdminWorkflow {
@@ -527,7 +543,10 @@ class SalesAdminWorkflow {
     if (!this.app?.client || !this.isEnabled()) return;
     for (const ae of this.config.roster) {
       try {
-        const channelId = await resolveChannelId(this.app.client, this.env.SLACK_BOT_TOKEN, ae.salesAdminChannel);
+        const channelId = await resolveChannelId(this.app.client, this.env.SLACK_BOT_TOKEN, ae.salesAdminChannel, {
+          includePrivate: this.env.SALES_ADMIN_RESOLVE_PRIVATE_CHANNELS === 'true',
+          logger: this.logger,
+        });
         if (!channelId) {
           this.logger.error(`Sales admin channel not found for ${ae.name}: #${ae.salesAdminChannel}; skipping this AE until the channel exists and the bot is invited.`);
           this.missingChannelsByOwnerId.add(ae.hubspotOwnerId);
@@ -990,6 +1009,7 @@ module.exports = {
   msUntilNextLocalTime,
   parseRoster,
   recordingDirectlyMatchesMeeting,
+  resolveChannelId,
   selectedStageFromInteraction,
   scheduleSalesAdminWorkflow,
 };

@@ -16,6 +16,7 @@ const {
   msUntilNextLocalTime,
   parseRoster,
   recordingDirectlyMatchesMeeting,
+  resolveChannelId,
   selectedStageFromInteraction,
 } = require('../sales_admin/workflow');
 const { createSalesAdminState } = require('../sales_admin/state');
@@ -161,6 +162,26 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
   assert.equal(stats.skipped, 1);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].channel, 'C_SARAH');
+});
+
+test('sales admin resolves public channels without requiring private channel scope', async () => {
+  const calls = [];
+  const channelId = await resolveChannelId({
+    conversations: {
+      list: async payload => {
+        calls.push(payload);
+        if (payload.types === 'private_channel') {
+          const err = new Error('missing_scope');
+          err.data = { error: 'missing_scope' };
+          throw err;
+        }
+        return { channels: [{ id: 'C_SARAH', name: 'gtm-salesadmin-sarah' }] };
+      },
+    },
+  }, 'xoxb-test', '#gtm-salesadmin-sarah');
+
+  assert.equal(channelId, 'C_SARAH');
+  assert.deepEqual(calls.map(call => call.types), ['public_channel']);
 });
 
 test('sales admin state persists idempotency records', () => {
