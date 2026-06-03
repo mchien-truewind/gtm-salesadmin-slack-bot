@@ -113,6 +113,25 @@ class HubSpotSalesAdminClient {
     return this.hubspotRequest(`/crm/v3/objects/${objectType}/${encodeURIComponent(objectId)}?properties=${props}`);
   }
 
+  async getDealPipelineStages(pipelineId = '105321581') {
+    const pipeline = await this.hubspotRequest(`/crm/v3/pipelines/deals/${encodeURIComponent(pipelineId)}`);
+    return (pipeline.stages || [])
+      .map(stage => ({
+        id: String(stage.id || '').trim(),
+        label: String(stage.label || stage.id || '').trim(),
+        displayOrder: Number(stage.displayOrder || 0),
+        metadata: stage.metadata || {},
+      }))
+      .filter(stage => stage.id)
+      .sort((a, b) => a.displayOrder - b.displayOrder);
+  }
+
+  async updateDealStage(dealId, stageId) {
+    return this.hubspotRequest(`/crm/v3/objects/deals/${encodeURIComponent(dealId)}`, 'PATCH', {
+      properties: { dealstage: String(stageId) },
+    });
+  }
+
   async attachAssociations(meeting) {
     const enriched = {
       ...meeting,

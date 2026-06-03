@@ -27,6 +27,7 @@ const INTERNAL_DOMAINS = new Set(['trytruewind.com']);
 const POST_ACTIONS = {
   confirm: 'sales_admin_confirm',
   edit: 'sales_admin_edit',
+  stageSelect: 'sales_admin_stage_select',
   noShow: 'sales_admin_no_show',
   ignore: 'sales_admin_ignore',
   editSubmit: 'sales_admin_edit_submit',
@@ -217,6 +218,11 @@ function slackLink(url, label) {
   return url ? `<${url}|${label}>` : label;
 }
 
+function slackPlainText(value, maxLength = 75) {
+  const text = String(value || '').trim() || 'Option';
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength - 3)}...`;
+}
+
 function meetingLinks(hubspot, meeting) {
   const links = [slackLink(hubspot.recordUrl('meetings', meeting.id), 'HubSpot meeting')];
   const contact = primaryContact(meeting);
@@ -369,7 +375,68 @@ function extractionText(extraction) {
   return lines.join('\n');
 }
 
-function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', editedOutcome = '', editedNextSteps = '' }) {
+function stageLabel(stage) {
+  return stage?.label || stage?.id || '';
+}
+
+function buildStageDecision({ deal, stages = [] } = {}) {
+  if (!deal?.id || !Array.isArray(stages) || stages.length === 0) return null;
+  const currentStageId = String(deal.dealstage || '').trim();
+  const currentIndex = stages.findIndex(stage => stage.id === currentStageId);
+  if (currentIndex < 0) return null;
+  const options = stages.slice(currentIndex);
+  const recommendedIndex = Math.min(currentIndex + 1, stages.length - 1);
+  const recommendedStage = stages[recommendedIndex];
+  const currentStage = stages[currentIndex];
+  return {
+    dealId: deal.id,
+    dealName: deal.dealname || 'Associated deal',
+    pipelineId: deal.pipeline || '105321581',
+    currentStageId,
+    currentStageLabel: stageLabel(currentStage),
+    recommendedStageId: recommendedStage.id,
+    recommendedStageLabel: stageLabel(recommendedStage),
+    options,
+    recommendationReason: recommendedStage.id === currentStageId
+      ? 'Deal is already in the last configured stage.'
+      : 'Default recommendation is the next pipeline stage after this meeting.',
+  };
+}
+
+function stageSelectElement(stageDecision, selectedStageId) {
+  if (!stageDecision?.options?.length) return null;
+  const options = stageDecision.options.slice(0, 100).map(stage => ({
+    text: { type: 'plain_text', text: slackPlainText(stage.label), emoji: true },
+    value: stage.id,
+  }));
+  const initialValue = selectedStageId || stageDecision.recommendedStageId || stageDecision.currentStageId;
+  const initialOption = options.find(option => option.value === initialValue) || options[0];
+  return {
+    type: 'static_select',
+    action_id: POST_ACTIONS.stageSelect,
+    placeholder: { type: 'plain_text', text: 'Select deal stage', emoji: true },
+    options,
+    ...(initialOption ? { initial_option: initialOption } : {}),
+  };
+}
+
+function selectedStageFromInteraction(body, fallbackStageId = '') {
+  const values = body?.state?.values || {};
+  for (const block of Object.values(values)) {
+    for (const actionValue of Object.values(block || {})) {
+      if (actionValue?.action_id === POST_ACTIONS.stageSelect && actionValue?.selected_option?.value) {
+        return String(actionValue.selected_option.value);
+      }
+    }
+  }
+  return fallbackStageId || '';
+}
+
+function selectedStageLabel(stageDecision, stageId) {
+  return stageDecision?.options?.find(stage => stage.id === stageId)?.label || '';
+}
+
+function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', editedOutcome = '', editedNextSteps = '', stageDecision = null, selectedStageId = '', stageUpdate = null }) {
   const lines = [
     'Sales Admin Confirmed Meeting Outcome',
     `AE: ${ae.name} <${ae.email}>`,
@@ -378,6 +445,12 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', ed
     `Meeting time: ${meeting.properties?.hs_meeting_start_time || ''}`,
   ];
   if (grainUrl) lines.push(`Grain recording: ${grainUrl}`);
+  if (stageDecision) {
+    lines.push(`Deal stage before confirmation: ${stageDecision.currentStageLabel}`);
+    if (status !== 'no_show') lines.push(`Confirmed deal stage: ${selectedStageLabel(stageDecision, selectedStageId) || selectedStageId || 'Not selected'}`);
+    if (stageUpdate?.updated) lines.push(`Deal stage updated in HubSpot: ${stageUpdate.fromLabel} -> ${stageUpdate.toLabel}`);
+    if (stageUpdate && !stageUpdate.updated) lines.push(`Deal stage update: ${stageUpdate.reason}`);
+  }
   if (status === 'no_show') {
     lines.push('Outcome: No show');
   } else {
@@ -395,7 +468,7 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', ed
   return lines.join('\n');
 }
 
-function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl }) {
+function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, stageDecision }) {
   const text = `*Post-meeting check:* <@${ae.slackUserId}> please confirm next steps for *${meetingTitle(meeting)}*.`;
   return [
     { type: 'section', text: { type: 'mrkdwn', text } },
@@ -645,12 +718,13 @@ class SalesAdminWorkflow {
               grainRecordingId: getGrainRecordingId(grain.recording),
               grainUrl: grain.grainUrl,
               extraction,
+              stageDecision: await this.buildStageDecisionForMeeting(meeting),
               status: 'pending',
             };
             this.state.set(key, promptRecord);
             const posted = await this.safePostMessage(ae, {
               text: `Post-meeting check: ${meetingTitle(meeting)}`,
-              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl }),
+              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, stageDecision: promptRecord.stageDecision }),
             });
             this.state.update(key, { slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'prompted' });
             stats.prompted += 1;
@@ -664,13 +738,47 @@ class SalesAdminWorkflow {
     });
   }
 
-  async writeMeetingOutcome(promptKey, { status, editedOutcome = '', editedNextSteps = '', slackUserId = '', responseChannel = '', responseThreadTs = '' } = {}) {
+  async buildStageDecisionForMeeting(meeting) {
+    const deal = primaryDeal(meeting);
+    if (!deal?.id || !deal.pipeline) return null;
+    const stages = await this.hubspot.getDealPipelineStages(deal.pipeline).catch(err => {
+      this.logger.warn(`Sales admin pipeline stage fetch failed for deal ${deal.id}: ${err.message}`);
+      return [];
+    });
+    return buildStageDecision({ deal, stages });
+  }
+
+  async applySelectedStage(record, selectedStageId) {
+    const stageDecision = record.stageDecision;
+    if (!stageDecision || !selectedStageId) return { updated: false, reason: 'No deal stage selected.' };
+    const selectedLabel = selectedStageLabel(stageDecision, selectedStageId) || selectedStageId;
+    if (selectedStageId === stageDecision.currentStageId) {
+      return { updated: false, reason: `Deal stayed in ${stageDecision.currentStageLabel}.`, fromLabel: stageDecision.currentStageLabel, toLabel: selectedLabel };
+    }
+    await this.hubspot.updateDealStage(stageDecision.dealId, selectedStageId);
+    return { updated: true, dealId: stageDecision.dealId, fromStageId: stageDecision.currentStageId, toStageId: selectedStageId, fromLabel: stageDecision.currentStageLabel, toLabel: selectedLabel };
+  }
+
+  async writeMeetingOutcome(promptKey, { status, editedOutcome = '', editedNextSteps = '', selectedStageId = '', slackUserId = '', responseChannel = '', responseThreadTs = '' } = {}) {
     const record = this.state.get(promptKey);
     if (!record) throw new Error(`Sales admin prompt state not found: ${promptKey}`);
     if (record.writebackStatus === 'written') return record;
     const meeting = record.meeting;
     const ae = record.ae;
-    const body = buildWritebackNote({ ae, meeting, status, extraction: record.extraction, grainUrl: record.grainUrl, editedOutcome, editedNextSteps });
+    const effectiveStageId = status === 'no_show' ? '' : (selectedStageId || record.stageDecision?.recommendedStageId || '');
+    const stageUpdate = status === 'no_show' ? { updated: false, reason: 'No-show confirmation does not move deal stage.' } : await this.applySelectedStage(record, effectiveStageId);
+    const body = buildWritebackNote({
+      ae,
+      meeting,
+      status,
+      extraction: record.extraction,
+      grainUrl: record.grainUrl,
+      editedOutcome,
+      editedNextSteps,
+      stageDecision: record.stageDecision,
+      selectedStageId: effectiveStageId,
+      stageUpdate,
+    });
     const note = await this.hubspot.createNote({
       body: `${body}\nConfirmed by Slack user: ${slackUserId || 'unknown'}`,
       meeting,
@@ -704,6 +812,8 @@ class SalesAdminWorkflow {
       confirmedBySlackUser: slackUserId,
       hubspotNoteId: note.id,
       hubspotTaskIds: taskIds,
+      selectedStageId: effectiveStageId,
+      stageUpdate,
       writebackStatus: 'written',
       status: status === 'no_show' ? 'no_show' : 'confirmed',
     });
@@ -714,7 +824,7 @@ class SalesAdminWorkflow {
         token: this.env.SLACK_BOT_TOKEN,
         channel,
         thread_ts: threadTs,
-        text: `Recorded in HubSpot. Note ID: ${note.id}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
+        text: `Recorded in HubSpot. Note ID: ${note.id}${stageUpdate?.updated ? `; deal moved to ${stageUpdate.toLabel}` : ''}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
       }).catch(err => this.logger.warn(`Sales admin confirmation Slack reply failed: ${err.message}`));
     }
     return updated;
@@ -727,6 +837,7 @@ class SalesAdminWorkflow {
       try {
         await this.writeMeetingOutcome(action.value, {
           status: 'confirmed',
+          selectedStageId: selectedStageFromInteraction(body),
           slackUserId: body.user?.id,
           responseChannel: body.channel?.id || body.container?.channel_id,
           responseThreadTs: body.message?.ts || body.container?.message_ts,
@@ -750,6 +861,10 @@ class SalesAdminWorkflow {
       }
     });
 
+    this.app.action(POST_ACTIONS.stageSelect, async ({ ack }) => {
+      await ack();
+    });
+
     this.app.action(POST_ACTIONS.ignore, async ({ ack, body, action, client }) => {
       await ack();
       this.state.update(action.value, { status: 'ignored', ignoredBySlackUser: body.user?.id });
@@ -763,6 +878,7 @@ class SalesAdminWorkflow {
         await client.chat.postMessage({ token: this.env.SLACK_BOT_TOKEN, channel: body.channel?.id || body.container?.channel_id, thread_ts: body.message?.ts || body.container?.message_ts, text: `Sales admin prompt state not found: ${action.value}` });
         return;
       }
+      const selectedStageId = selectedStageFromInteraction(body, record.stageDecision?.recommendedStageId || '');
       await client.views.open({
         token: this.env.SLACK_BOT_TOKEN,
         trigger_id: body.trigger_id,
@@ -776,6 +892,7 @@ class SalesAdminWorkflow {
           blocks: [
             { type: 'input', block_id: 'outcome', label: { type: 'plain_text', text: 'Outcome' }, element: inputElement(record.extraction?.outcome || '') },
             { type: 'input', block_id: 'next_steps', label: { type: 'plain_text', text: 'Next steps' }, element: inputElement((record.extraction?.nextSteps || []).map(step => step.text).join('\n')) },
+            ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
           ],
         },
       });
@@ -787,11 +904,13 @@ class SalesAdminWorkflow {
       const values = view.state?.values || {};
       const editedOutcome = values.outcome?.value?.value || '';
       const editedNextSteps = values.next_steps?.value?.value || '';
+      const selectedStageId = values.deal_stage?.[POST_ACTIONS.stageSelect]?.selected_option?.value || '';
       try {
         await this.writeMeetingOutcome(metadata.promptKey, {
           status: 'edited',
           editedOutcome,
           editedNextSteps,
+          selectedStageId,
           slackUserId: body.user?.id,
           responseChannel: metadata.channel,
           responseThreadTs: metadata.threadTs,
@@ -852,9 +971,11 @@ module.exports = {
   createSalesAdminWorkflow,
   extractNextSteps,
   getLocalDayRange,
+  buildStageDecision,
   meetingEndMs,
   msUntilNextLocalTime,
   parseRoster,
   recordingDirectlyMatchesMeeting,
+  selectedStageFromInteraction,
   scheduleSalesAdminWorkflow,
 };

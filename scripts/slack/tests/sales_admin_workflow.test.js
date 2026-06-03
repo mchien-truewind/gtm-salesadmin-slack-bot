@@ -6,6 +6,7 @@ const path = require('path');
 const {
   DEFAULT_AE_ROSTER,
   buildConfig,
+  buildStageDecision,
   buildWritebackNote,
   cancellationSourceLabel,
   classifyMeetingStatus,
@@ -14,12 +15,23 @@ const {
   msUntilNextLocalTime,
   parseRoster,
   recordingDirectlyMatchesMeeting,
+  selectedStageFromInteraction,
 } = require('../sales_admin/workflow');
 const { createSalesAdminState } = require('../sales_admin/state');
 
 function meeting(properties = {}) {
   return { id: 'm1', properties };
 }
+
+const STAGES = [
+  { id: '1307720553', label: 'Stage 1: MQL', displayOrder: 0 },
+  { id: '190380582', label: 'Stage 2: SQL (Full Product Demo)', displayOrder: 1 },
+  { id: '190380583', label: 'Stage 3: Awaiting Materials', displayOrder: 2 },
+  { id: '190380586', label: 'Stage 4: POC', displayOrder: 3 },
+  { id: '190380584', label: 'Stage 5: Proposal', displayOrder: 4 },
+  { id: '1166230571', label: 'Stage 6: Won', displayOrder: 5 },
+  { id: '190380587', label: 'Stage 7: Closed/Lost', displayOrder: 6 },
+];
 
 test('sales admin cancellation detection handles CalendarSync, Calendly, and outcome fallbacks', () => {
   assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Canceled: Anthony and Xavier' })), 'cancelled');
@@ -54,6 +66,46 @@ test('sales admin default roster includes confirmed Alex and Amy IDs', () => {
   assert.equal(byName['Alex Lee'].slackUserId, 'U04BPMPR29G');
   assert.equal(byName['Amy Vetter'].hubspotOwnerId, '92555980');
   assert.equal(byName['Amy Vetter'].slackUserId, 'U0B4MRN83FE');
+});
+
+
+test('sales admin stage decision defaults to next stage and includes current plus later stages', () => {
+  const decision = buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380582' },
+    stages: STAGES,
+  });
+
+  assert.equal(decision.currentStageLabel, 'Stage 2: SQL (Full Product Demo)');
+  assert.equal(decision.recommendedStageId, '190380583');
+  assert.equal(decision.recommendedStageLabel, 'Stage 3: Awaiting Materials');
+  assert.deepEqual(decision.options.map(stage => stage.id), ['190380582', '190380583', '190380586', '190380584', '1166230571', '190380587']);
+});
+
+test('sales admin stage decision stays on final stage when already terminal', () => {
+  const decision = buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380587' },
+    stages: STAGES,
+  });
+
+  assert.equal(decision.currentStageLabel, 'Stage 7: Closed/Lost');
+  assert.equal(decision.recommendedStageId, '190380587');
+  assert.deepEqual(decision.options.map(stage => stage.id), ['190380587']);
+});
+
+test('sales admin reads selected stage from Slack interaction state', () => {
+  assert.equal(selectedStageFromInteraction({
+    state: {
+      values: {
+        deal_stage: {
+          sales_admin_stage_select: {
+            action_id: 'sales_admin_stage_select',
+            selected_option: { value: '190380583' },
+          },
+        },
+      },
+    },
+  }), '190380583');
+  assert.equal(selectedStageFromInteraction({ state: { values: {} } }, 'fallback'), 'fallback');
 });
 
 test('sales admin config defaults disabled and channel roster is available', () => {
@@ -99,4 +151,24 @@ test('sales admin writeback note separates cancellation/no-show from confirmed n
   assert.match(note, /Status: no_show/);
   assert.match(note, /Outcome: No show/);
   assert.doesNotMatch(note, /Send proposal/);
+  assert.doesNotMatch(note, /Confirmed deal stage:/);
+});
+
+test('sales admin writeback note records selected deal stage movement', () => {
+  const stageDecision = buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380582' },
+    stages: STAGES,
+  });
+  const note = buildWritebackNote({
+    ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com' },
+    meeting: meeting({ hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }),
+    status: 'confirmed',
+    extraction: { outcome: 'Meeting completed', nextSteps: [{ text: 'Send proposal' }] },
+    stageDecision,
+    selectedStageId: '190380583',
+    stageUpdate: { updated: true, fromLabel: 'Stage 2: SQL (Full Product Demo)', toLabel: 'Stage 3: Awaiting Materials' },
+  });
+  assert.match(note, /Deal stage before confirmation: Stage 2/);
+  assert.match(note, /Confirmed deal stage: Stage 3: Awaiting Materials/);
+  assert.match(note, /Deal stage updated in HubSpot: Stage 2: SQL \(Full Product Demo\) -> Stage 3: Awaiting Materials/);
 });
