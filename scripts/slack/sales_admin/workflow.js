@@ -515,6 +515,7 @@ class SalesAdminWorkflow {
     this.hubspot = new HubSpotSalesAdminClient({ hubspotRequest, portalId: this.config.portalId, logger });
     this.grain = new GrainClient({ token: this.config.grainToken, baseUrl: this.config.grainBaseUrl, logger });
     this.channelIdsByOwnerId = new Map();
+    this.missingChannelsByOwnerId = new Set();
     this.inFlight = new Set();
   }
 
@@ -528,9 +529,11 @@ class SalesAdminWorkflow {
       try {
         const channelId = await resolveChannelId(this.app.client, this.env.SLACK_BOT_TOKEN, ae.salesAdminChannel);
         if (!channelId) {
-          this.logger.error(`Sales admin channel not found for ${ae.name}: #${ae.salesAdminChannel}`);
+          this.logger.error(`Sales admin channel not found for ${ae.name}: #${ae.salesAdminChannel}; skipping this AE until the channel exists and the bot is invited.`);
+          this.missingChannelsByOwnerId.add(ae.hubspotOwnerId);
           continue;
         }
+        this.missingChannelsByOwnerId.delete(ae.hubspotOwnerId);
         this.channelIdsByOwnerId.set(ae.hubspotOwnerId, channelId);
       } catch (err) {
         this.logger.error(`Sales admin channel resolution failed for ${ae.name}: ${err.message}`);
@@ -538,11 +541,19 @@ class SalesAdminWorkflow {
     }
   }
 
+  isAeChannelReady(ae) {
+    if (/^[CDG][A-Z0-9]+$/.test(ae.salesAdminChannel)) return true;
+    return this.channelIdsByOwnerId.has(ae.hubspotOwnerId) && !this.missingChannelsByOwnerId.has(ae.hubspotOwnerId);
+  }
+
   channelFor(ae) {
     return this.channelIdsByOwnerId.get(ae.hubspotOwnerId) || ae.salesAdminChannel;
   }
 
   async safePostMessage(ae, payload) {
+    if (!this.isAeChannelReady(ae)) {
+      throw new Error(`Configured sales-admin channel is not ready for ${ae.name}: #${ae.salesAdminChannel}`);
+    }
     const channel = this.channelFor(ae);
     try {
       return await this.app.client.chat.postMessage({
@@ -581,6 +592,7 @@ class SalesAdminWorkflow {
       const { dateKey } = getLocalDayRange(now, this.config.timezone);
       const stats = { posted: 0, skipped: 0, errors: 0 };
       for (const ae of this.config.roster) {
+        if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         const key = `morning:${dateKey}:${ae.hubspotOwnerId}`;
         if (this.state.has(key)) { stats.skipped += 1; continue; }
         try {
@@ -619,6 +631,7 @@ class SalesAdminWorkflow {
       const updatedSince = new Date(now.getTime() - this.config.cancelLookbackMin * 60 * 1000);
       const startAfter = new Date(now.getTime() - this.config.cancelPastGraceHours * 60 * 60 * 1000);
       for (const ae of this.config.roster) {
+        if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         try {
           const meetings = await this.hubspot.searchRecentlyUpdatedMeetingsForOwner(ae.hubspotOwnerId, updatedSince, startAfter);
           for (const rawMeeting of meetings) {
@@ -697,6 +710,7 @@ class SalesAdminWorkflow {
     return this.withLock('post', async () => {
       const stats = { prompted: 0, skipped: 0, errors: 0 };
       for (const ae of this.config.roster) {
+        if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
         try {
           const meetings = await this.meetingsForToday(ae, now);
           for (const meeting of meetings) {

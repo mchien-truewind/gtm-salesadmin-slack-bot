@@ -8,6 +8,7 @@ const {
   buildConfig,
   buildStageDecision,
   buildWritebackNote,
+  SalesAdminWorkflow,
   cancellationSourceLabel,
   classifyMeetingStatus,
   getLocalDayRange,
@@ -131,6 +132,35 @@ test('sales admin meeting end falls back to one hour after start', () => {
 test('sales admin next local time schedules tomorrow after target', () => {
   const delay = msUntilNextLocalTime({ now: new Date('2026-06-03T16:00:00.000Z'), timeZone: 'America/Los_Angeles', hour: 8, minute: 0 });
   assert.equal(delay, 23 * 60 * 60 * 1000);
+});
+
+
+test('sales admin skips configured AEs whose channel has not resolved', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+        { name: 'Alex Lee', hubspotOwnerId: '60918610', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-skip-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.missingChannelsByOwnerId.add('60918610');
+  workflow.meetingsForToday = async () => [];
+
+  const stats = await workflow.runMorningSummaries(new Date('2026-06-03T18:00:00.000Z'));
+  assert.equal(stats.posted, 1);
+  assert.equal(stats.skipped, 1);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].channel, 'C_SARAH');
 });
 
 test('sales admin state persists idempotency records', () => {
