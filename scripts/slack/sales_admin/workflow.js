@@ -1,5 +1,6 @@
 const path = require('path');
 const {
+  dedupeDigestMeetings,
   dedupeGrainRecordings,
   findBestGrainRecordingForMeeting,
   formatGrainTranscriptText,
@@ -757,7 +758,8 @@ class SalesAdminWorkflow {
   async meetingsForDayOffset(ae, now = new Date(), dayOffset = 0) {
     const { start, end } = getLocalDayRange(now, this.config.timezone, dayOffset);
     const meetings = await this.hubspot.searchMeetingsForOwnerBetween(ae.hubspotOwnerId, start, end);
-    return Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
+    const enriched = await Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
+    return dedupeDigestMeetings(enriched);
   }
 
   async meetingsForToday(ae, now = new Date()) {

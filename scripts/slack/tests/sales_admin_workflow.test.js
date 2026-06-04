@@ -219,6 +219,49 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
 
+test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-dedupe-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const rawMeetings = [
+    { id: 'm1', properties: { hs_meeting_title: 'Intro to Truewind', hs_meeting_start_time: '2026-06-04T18:00:00.000Z' } },
+    { id: 'm2', properties: { hs_meeting_title: 'Brooksher Banks and Xavier Marco', hs_meeting_start_time: '2026-06-04T18:00:00.000Z' } },
+    { id: 'm3', properties: { hs_meeting_title: 'Calendly: Intro to Truewind', hs_meeting_start_time: '2026-06-04T18:00:00.000Z' } },
+    { id: 'm4', properties: { hs_meeting_title: 'A+ Education Intro', hs_meeting_start_time: '2026-06-04T18:30:00.000Z' } },
+  ];
+  workflow.hubspot.searchMeetingsForOwnerBetween = async () => rawMeetings;
+  workflow.hubspot.attachAssociations = async rawMeeting => ({
+    ...rawMeeting,
+    _contacts: rawMeeting.id === 'm4'
+      ? [{ id: 'ct2', firstname: 'Jenifer', lastname: 'Glover', email: 'jenifer@example.com', company: 'A+ Education Partnership' }]
+      : [{ id: 'ct1', firstname: 'Brooksher', lastname: 'Banks', email: 'brooksher@example.com', company: 'Banks & Associates' }],
+    _companies: rawMeeting.id === 'm4'
+      ? [{ id: 'c2', name: 'A+ Education Partnership' }]
+      : [{ id: 'c1', name: 'Banks & Associates' }],
+    _deals: rawMeeting.id === 'm4'
+      ? [{ id: 'd2', dealname: 'A+ Education Partnership - New Deal' }]
+      : [{ id: 'd1', dealname: 'Banks & Associates - Xavier Marco - 2026-06-04' }],
+  });
+
+  const meetings = await workflow.meetingsForTomorrow(
+    { name: 'Xavier Marco', hubspotOwnerId: '89305622' },
+    new Date('2026-06-03T18:00:00.000Z'),
+  );
+
+  assert.deepEqual(meetings.map(item => item.id), ['m1', 'm4']);
+});
+
 test('sales admin compacts long Grain summaries for HubSpot next step', async () => {
   const extraction = await require('../sales_admin/workflow').extractNextSteps({
     anthropic: null,
