@@ -433,6 +433,51 @@ test('sales admin post-meeting scan skips automatic prompts for closed deals', a
   assert.equal(grainFetchCount, 0);
 });
 
+test('sales admin post-meeting prompt defaults to no-show when no Grain recording exists', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-no-grain-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [{
+    id: 'no-grain-meeting',
+    properties: {
+      hs_meeting_title: 'Intro to Truewind',
+      hs_meeting_start_time: '2026-06-03T17:00:00.000Z',
+      hs_meeting_end_time: '2026-06-03T17:30:00.000Z',
+    },
+    _companies: [{ id: 'c1', name: 'Mysite' }],
+    _deals: [],
+  }];
+  workflow.fetchGrainForMeeting = async () => ({ recording: null, grainUrl: '', source: 'no_grain_recording' });
+  workflow.buildStageDecisionForMeeting = async () => null;
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(stats.prompted, 1);
+  const headerBlock = posts[0].blocks[0];
+  assert.match(headerBlock.text.text, /No Grain recording was found/);
+  assert.match(headerBlock.text.text, /default to \*No-Show\*/);
+  const contextBlock = posts[0].blocks.find(block => block.type === 'context' && block.elements?.[0]?.text?.includes('Click *No-Show*'));
+  assert.ok(contextBlock);
+  const actions = posts[0].blocks.find(block => block.type === 'actions');
+  assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['No-Show', 'Confirm Completed', 'Edit Notes', 'Not this meeting']);
+  assert.equal(actions.elements[0].style, 'primary');
+  assert.equal(actions.elements[0].action_id, POST_ACTIONS.noShow);
+  assert.equal(workflow.state.get('post:no-grain-meeting:89305622').grainSource, 'no_grain_recording');
+});
+
 test('sales admin confirmation updates HubSpot deal next step summary', async () => {
   const propertyUpdates = [];
   const notes = [];

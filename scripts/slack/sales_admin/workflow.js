@@ -626,6 +626,11 @@ function selectedStageLabel(stageDecision, stageId) {
   return stageDecision?.options?.find(stage => stage.id === stageId)?.label || '';
 }
 
+function shouldDefaultNoShow({ grainSource = '', extraction = null } = {}) {
+  const source = String(grainSource || extraction?.source || '').trim().toLowerCase();
+  return source === 'no_grain_recording';
+}
+
 function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hubspotNextStep = '', stageDecision = null, selectedStageId = '', stageUpdate = null, nextStepPropertyUpdate = null }) {
   const lines = [
     'Sales Admin Confirmed Meeting Outcome',
@@ -659,9 +664,37 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hu
   return lines.join('\n');
 }
 
-function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, stageDecision }) {
+function postMeetingActionElements(promptKey, defaultNoShow = false) {
+  if (defaultNoShow) {
+    return [
+      { type: 'button', text: { type: 'plain_text', text: 'No-Show' }, style: 'primary', action_id: POST_ACTIONS.noShow, value: promptKey },
+      { type: 'button', text: { type: 'plain_text', text: 'Confirm Completed' }, action_id: POST_ACTIONS.confirm, value: promptKey },
+      { type: 'button', text: { type: 'plain_text', text: 'Edit Notes' }, action_id: POST_ACTIONS.edit, value: promptKey },
+      {
+        type: 'overflow',
+        action_id: POST_ACTIONS.ignore,
+        options: [{ text: { type: 'plain_text', text: 'Not this meeting', emoji: true }, value: promptKey }],
+      },
+    ];
+  }
+  return [
+    { type: 'button', text: { type: 'plain_text', text: 'Confirm & Save' }, style: 'primary', action_id: POST_ACTIONS.confirm, value: promptKey },
+    { type: 'button', text: { type: 'plain_text', text: 'Edit Notes' }, action_id: POST_ACTIONS.edit, value: promptKey },
+    { type: 'button', text: { type: 'plain_text', text: 'No-Show' }, style: 'danger', action_id: POST_ACTIONS.noShow, value: promptKey },
+    {
+      type: 'overflow',
+      action_id: POST_ACTIONS.ignore,
+      options: [{ text: { type: 'plain_text', text: 'Not this meeting', emoji: true }, value: promptKey }],
+    },
+  ];
+}
+
+function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, grainSource = '', stageDecision }) {
   const companyName = companyNameForMeeting(meeting);
-  const text = `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. Meeting completed; review next steps.`;
+  const defaultNoShow = shouldDefaultNoShow({ grainSource, extraction });
+  const text = defaultNoShow
+    ? `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. No Grain recording was found, so default to *No-Show* unless this meeting happened.`
+    : `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. Meeting completed; review next steps.`;
   return [
     { type: 'section', text: { type: 'mrkdwn', text } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
@@ -677,23 +710,16 @@ function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, g
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: stageDecision
+        text: defaultNoShow
+          ? ':information_source: Click *No-Show* if the meeting did not happen. If it did happen, use *Confirm Completed* or *Edit Notes*.'
+          : stageDecision
           ? ':information_source: *Confirm & Save* updates HubSpot `Next step`, writes a note, and applies the selected deal stage.'
           : ':information_source: *Confirm & Save* updates HubSpot `Next step` and writes a note.',
       }],
     },
     {
       type: 'actions',
-      elements: [
-        { type: 'button', text: { type: 'plain_text', text: 'Confirm & Save' }, style: 'primary', action_id: POST_ACTIONS.confirm, value: promptKey },
-        { type: 'button', text: { type: 'plain_text', text: 'Edit Notes' }, action_id: POST_ACTIONS.edit, value: promptKey },
-        { type: 'button', text: { type: 'plain_text', text: 'No-Show' }, style: 'danger', action_id: POST_ACTIONS.noShow, value: promptKey },
-        {
-          type: 'overflow',
-          action_id: POST_ACTIONS.ignore,
-          options: [{ text: { type: 'plain_text', text: 'Not this meeting', emoji: true }, value: promptKey }],
-        },
-      ],
+      elements: postMeetingActionElements(promptKey, defaultNoShow),
     },
   ];
 }
@@ -1023,6 +1049,7 @@ class SalesAdminWorkflow {
               meeting,
               meetingId: meeting.id,
               grainRecordingId: getGrainRecordingId(grain.recording),
+              grainSource: grain.source,
               grainUrl: grain.grainUrl,
               extraction,
               stageDecision,
@@ -1031,7 +1058,7 @@ class SalesAdminWorkflow {
             this.state.set(key, promptRecord);
             const posted = await this.safePostMessage(ae, {
               text: `Post-meeting check: ${meetingTitle(meeting)}`,
-              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, stageDecision: promptRecord.stageDecision }),
+              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, grainSource: grain.source, stageDecision: promptRecord.stageDecision }),
             });
             this.state.update(key, { slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'prompted' });
             stats.prompted += 1;
