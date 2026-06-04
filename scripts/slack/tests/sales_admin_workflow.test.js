@@ -342,7 +342,12 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
     { id: 'target-me', properties: { hs_meeting_title: 'EdOps / Truewind', hs_meeting_start_time: '2026-06-03T20:30:00Z', hs_meeting_end_time: '2026-06-03T21:30:00Z' } },
   ];
   workflow.fetchGrainForMeeting = async () => ({
-    recording: { id: 'grain-1', title: 'EdOps / Truewind', ai_summary: { summary: 'EdOps is evaluating Truewind for finance workflow automation and needs a follow-up on implementation scope.' }, ai_action_items: [{ text: 'Send follow-up' }] },
+    recording: {
+      id: 'grain-1',
+      title: 'EdOps / Truewind',
+      ai_summary: { summary: 'EdOps is evaluating Truewind for finance workflow automation and needs a follow-up on implementation scope.' },
+      ai_action_items: [{ text: 'Send implementation pricing, confirm decision timeline, and identify finance owner for close plan', due_date: '2026-06-10' }],
+    },
     grainUrl: 'https://grain.com/share/recording/grain-1',
     source: 'grain_matched',
   });
@@ -364,7 +369,8 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.match(posts[0].blocks[0].text.text, /^\*EdOps \/ Truewind\*/);
   assert.match(posts[0].blocks[0].text.text, /Meeting completed; review next steps/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
-  assert.ok(posts[0].blocks.some(block => block.text?.text?.includes('*Suggested follow-up from Grain*')));
+  const nextStepsBlock = posts[0].blocks.find(block => block.text?.text?.includes('*Suggested follow-up from Grain*'));
+  assert.match(nextStepsBlock.text.text, /1\. 06\/10: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
   const hubspotNextStepBlock = posts[0].blocks.find(block => block.text?.text?.includes('*HubSpot Next Step*'));
   assert.match(hubspotNextStepBlock.text.text, /saved to HubSpot under `Next step`/);
   assert.match(hubspotNextStepBlock.text.text, /EdOps is evaluating Truewind/);
@@ -480,6 +486,7 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
   assert.equal(updated.hubspotNextStep, 'Acme is interested in AP automation and needs pricing follow-up.');
   assert.equal(updated.nextStepPropertyUpdate.updated, true);
   assert.match(notes[0], /HubSpot Next step: Acme is interested/);
+  assert.match(notes[0], /- \?\?\/\?\?: Send pricing; Acme is interested in AP automation and needs pricing follow-up/);
 });
 
 test('sales admin edit action acks before opening modal', async () => {
@@ -561,7 +568,7 @@ test('sales admin writeback note records selected deal stage movement', () => {
     ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com' },
     meeting: meeting({ hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }),
     status: 'confirmed',
-    extraction: { outcome: 'Meeting completed', summary: 'Prospect is ready for proposal follow-up.', nextSteps: [{ text: 'Send proposal' }] },
+    extraction: { outcome: 'Meeting completed', summary: 'Prospect is ready for proposal follow-up.', nextSteps: [{ text: 'Send proposal package and confirm final approval path with finance sponsor', dueDate: '2026-06-12' }] },
     hubspotNextStep: 'Prospect is ready for proposal follow-up.',
     stageDecision,
     selectedStageId: '190380583',
@@ -571,4 +578,5 @@ test('sales admin writeback note records selected deal stage movement', () => {
   assert.match(note, /Confirmed deal stage: Stage 3: Awaiting Materials/);
   assert.match(note, /Deal stage updated in HubSpot: Stage 2: SQL \(Full Product Demo\) -> Stage 3: Awaiting Materials/);
   assert.match(note, /HubSpot Next step: Prospect is ready for proposal follow-up/);
+  assert.match(note, /06\/12: Send proposal package and confirm final approval path with finance sponsor/);
 });

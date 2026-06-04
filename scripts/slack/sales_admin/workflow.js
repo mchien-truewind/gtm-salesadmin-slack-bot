@@ -351,6 +351,51 @@ function compactSalesLeaderSummary(value, maxLength = 280) {
   return truncateText(summary, maxLength);
 }
 
+function wordParts(value) {
+  return String(value || '').trim().split(/\s+/).filter(Boolean);
+}
+
+function compactCroNextStepPhrase(value, extraction = null) {
+  let phrase = cleanSalesSummaryText(value)
+    .replace(/^(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}-\d{1,2}-\d{1,2}|\?\?\/\?\?|tbd)\s*:\s*/i, '')
+    .replace(/\s*\((?:owner|due):[^)]*\)/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const summary = cleanSalesSummaryText(extraction?.summary || '');
+  if (wordParts(phrase).length < 10 && summary) {
+    phrase = `${phrase}; ${summary}`.replace(/\s+/g, ' ').trim();
+  }
+  const words = wordParts(phrase);
+  if (words.length > 20) return words.slice(0, 20).join(' ');
+  return phrase;
+}
+
+function formatNextStepDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '??/??';
+  const numeric = raw.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?\b/);
+  if (numeric) return `${numeric[1].padStart(2, '0')}/${numeric[2].padStart(2, '0')}`;
+  const iso = raw.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
+  if (iso) return `${iso[2].padStart(2, '0')}/${iso[3].padStart(2, '0')}`;
+  const parsed = Date.parse(raw);
+  if (Number.isFinite(parsed)) {
+    const date = new Date(parsed);
+    return `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
+  }
+  return '??/??';
+}
+
+function splitLeadingNextStepDate(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/^(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}-\d{1,2}-\d{1,2})\s*:\s*(.+)$/);
+  if (!match) return { dueDate: '', text };
+  return { dueDate: match[1], text: match[2].trim() };
+}
+
+function formatCroNextStepLine(step, extraction = null) {
+  return `${formatNextStepDate(step?.dueDate)}: ${compactCroNextStepPhrase(step?.text, extraction)}`;
+}
+
 async function summarizeSalesLeaderText({ anthropic, text, logger = console }) {
   const fallback = compactSalesLeaderSummary(text);
   if (!text || !anthropic) return fallback;
@@ -377,11 +422,15 @@ function normalizeExtraction(raw = {}) {
   return {
     outcome: String(raw.outcome || '').trim() || 'Needs AE confirmation',
     summary: compactSalesLeaderSummary(raw.summary || raw.sales_summary || ''),
-    nextSteps: nextSteps.map(step => ({
-      text: String(step.text || step.description || step.action || step || '').trim(),
-      owner: String(step.owner || '').trim(),
-      dueDate: String(step.due_date || step.dueDate || '').trim(),
-    })).filter(step => step.text),
+    nextSteps: nextSteps.map(step => {
+      const rawText = String(step.text || step.description || step.action || step || '').trim();
+      const leadingDate = splitLeadingNextStepDate(rawText);
+      return {
+        text: leadingDate.text,
+        owner: String(step.owner || '').trim(),
+        dueDate: String(step.due_date || step.dueDate || leadingDate.dueDate || '').trim(),
+      };
+    }).filter(step => step.text),
     confidence: ['high', 'medium', 'low'].includes(String(raw.confidence || '').toLowerCase())
       ? String(raw.confidence).toLowerCase()
       : 'low',
@@ -413,10 +462,10 @@ async function extractNextSteps({ anthropic, recording, logger = console }) {
     const res = await anthropic.messages.create({
       model: process.env.SALES_ADMIN_CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 700,
-      system: 'Extract a short sales-leader summary and explicit next steps. Return only valid JSON. Never invent facts.',
+      system: 'Extract CRO-readable sales meeting next steps. Return only valid JSON. Never invent facts.',
       messages: [{
         role: 'user',
-        content: `From these meeting notes/transcript, extract a very short sales-leader summary and explicit follow-up items. If no follow-up items are explicit, return an empty next_steps array and confidence low.\n\nJSON schema:\n{"outcome":"Meeting completed; review next steps.","summary":"1-2 short sentences for a sales leader","next_steps":[{"text":"string","owner":"string","due_date":"string"}],"confidence":"high|medium|low"}\n\nMeeting content:\n${text}`,
+        content: `From these meeting notes/transcript, extract a very short sales-leader summary and explicit follow-up items for a CRO to scan deal health and close likelihood. If no follow-up items are explicit, return an empty next_steps array and confidence low.\n\nRules for next_steps:\n- text must be a concise 10-20 word phrase.\n- Include buyer status, close path, risk, or decision momentum only if explicitly discussed.\n- due_date must be an explicit date from the meeting, preferably YYYY-MM-DD. Leave blank if no date was stated. Do not invent dates.\n\nJSON schema:\n{"outcome":"Meeting completed; review next steps.","summary":"1-2 short sentences for a sales leader","next_steps":[{"text":"10-20 word CRO-readable phrase","owner":"string","due_date":"YYYY-MM-DD or blank"}],"confidence":"high|medium|low"}\n\nMeeting content:\n${text}`,
       }],
     });
     const responseText = res.content?.find(block => block.type === 'text')?.text || '{}';
@@ -473,10 +522,7 @@ function nextStepsBlockText(extraction) {
   if (!steps.length) {
     return '*Suggested follow-up from Grain*\n_No follow-up items were found in Grain._';
   }
-  const lines = steps.slice(0, 8).map((step, index) => {
-    const suffix = [step.owner ? `Owner: ${slackMrkdwn(step.owner)}` : '', step.dueDate ? `Due: ${slackMrkdwn(step.dueDate)}` : ''].filter(Boolean).join(', ');
-    return `${index + 1}. ${slackMrkdwn(step.text)}${suffix ? ` _(${suffix})_` : ''}`;
-  });
+  const lines = steps.slice(0, 8).map((step, index) => `${index + 1}. ${slackMrkdwn(formatCroNextStepLine(step, extraction))}`);
   if (steps.length > lines.length) lines.push(`_${steps.length - lines.length} more follow-up items omitted._`);
   return truncateText(`*Suggested follow-up from Grain*\n${lines.join('\n')}`);
 }
@@ -605,7 +651,7 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hu
     const steps = extraction?.nextSteps || [];
     lines.push('Grain suggested follow-up:');
     if (steps.length) {
-      for (const step of steps) lines.push(`- ${step.text}${step.owner ? ` (Owner: ${step.owner})` : ''}${step.dueDate ? ` (Due: ${step.dueDate})` : ''}`);
+      for (const step of steps) lines.push(`- ${formatCroNextStepLine(step, extraction)}`);
     } else {
       lines.push('- None confirmed');
     }
