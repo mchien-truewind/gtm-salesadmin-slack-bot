@@ -513,6 +513,10 @@ function stageLabel(stage) {
   return stage?.label || stage?.id || '';
 }
 
+function isClosedStage(stage) {
+  return String(stage?.metadata?.isClosed || '').trim().toLowerCase() === 'true';
+}
+
 function buildStageDecision({ deal, stages = [] } = {}) {
   if (!deal?.id || !Array.isArray(stages) || stages.length === 0) return null;
   const currentStageId = String(deal.dealstage || '').trim();
@@ -528,6 +532,7 @@ function buildStageDecision({ deal, stages = [] } = {}) {
     pipelineId: deal.pipeline || '105321581',
     currentStageId,
     currentStageLabel: stageLabel(currentStage),
+    currentStageIsClosed: isClosedStage(currentStage),
     recommendedStageId: recommendedStage.id,
     recommendedStageLabel: stageLabel(recommendedStage),
     options,
@@ -535,6 +540,10 @@ function buildStageDecision({ deal, stages = [] } = {}) {
       ? 'Deal is already in the last configured stage.'
       : 'Default recommendation is the next pipeline stage after this meeting.',
   };
+}
+
+function shouldSkipAutomaticPostMeetingPrompt(stageDecision) {
+  return Boolean(stageDecision?.currentStageIsClosed);
 }
 
 function stageSelectElement(stageDecision, selectedStageId) {
@@ -950,6 +959,11 @@ class SalesAdminWorkflow {
             if (!force && this.state.has(key)) { stats.skipped += 1; continue; }
             const endMs = meetingEndMs(meeting);
             if (!force && (!endMs || now.getTime() < endMs + this.config.postMeetingDelayMin * 60 * 1000)) { stats.skipped += 1; continue; }
+            const stageDecision = await this.buildStageDecisionForMeeting(meeting);
+            if (!force && shouldSkipAutomaticPostMeetingPrompt(stageDecision)) {
+              stats.skipped += 1;
+              continue;
+            }
             const grain = await this.fetchGrainForMeeting(ae, meeting).catch(err => {
               this.logger.warn(`Sales admin Grain match failed for meeting ${meeting.id}: ${err.message}`);
               return { recording: null, grainUrl: '', source: 'grain_error' };
@@ -963,7 +977,7 @@ class SalesAdminWorkflow {
               grainRecordingId: getGrainRecordingId(grain.recording),
               grainUrl: grain.grainUrl,
               extraction,
-              stageDecision: await this.buildStageDecisionForMeeting(meeting),
+              stageDecision,
               status: 'pending',
             };
             this.state.set(key, promptRecord);

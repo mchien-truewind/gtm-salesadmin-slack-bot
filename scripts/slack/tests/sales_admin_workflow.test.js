@@ -84,6 +84,16 @@ test('sales admin stage decision defaults to next stage and includes current plu
   assert.deepEqual(decision.options.map(stage => stage.id), ['190380582', '190380583', '190380586', '190380584', '1166230571', '190380587']);
 });
 
+test('sales admin stage decision marks HubSpot closed stages', () => {
+  const decision = buildStageDecision({
+    deal: { id: 'deal-1', dealname: 'PKF', pipeline: '105321581', dealstage: '190380587' },
+    stages: STAGES.map(stage => stage.id === '190380587' ? { ...stage, metadata: { isClosed: 'true' } } : stage),
+  });
+
+  assert.equal(decision.currentStageLabel, 'Stage 7: Closed/Lost');
+  assert.equal(decision.currentStageIsClosed, true);
+});
+
 test('sales admin stage decision stays on final stage when already terminal', () => {
   const decision = buildStageDecision({
     deal: { id: 'deal-1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380587' },
@@ -365,6 +375,51 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['Confirm & Save', 'Edit Notes', 'No-Show', 'Not this meeting']);
   assert.equal(actions.elements[3].type, 'overflow');
   assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
+});
+
+test('sales admin post-meeting scan skips automatic prompts for closed deals', async () => {
+  const posts = [];
+  let grainFetchCount = 0;
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-closed-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [{
+    id: 'pkf-meeting',
+    properties: {
+      hs_meeting_title: 'Alex <> Nkrumah: Connect',
+      hs_meeting_start_time: '2026-06-03T20:00:00.000Z',
+      hs_meeting_end_time: '2026-06-03T20:30:00.000Z',
+    },
+    _companies: [{ id: 'c1', name: "PKF O'Connor Davies" }],
+    _deals: [{ id: 'deal-1', dealname: "PKF O'Connor Davies - New Deal", pipeline: '105321581', dealstage: '190380587' }],
+  }];
+  workflow.buildStageDecisionForMeeting = async () => buildStageDecision({
+    deal: { id: 'deal-1', dealname: "PKF O'Connor Davies - New Deal", pipeline: '105321581', dealstage: '190380587' },
+    stages: STAGES.map(stage => stage.id === '190380587' ? { ...stage, metadata: { isClosed: 'true' } } : stage),
+  });
+  workflow.fetchGrainForMeeting = async () => {
+    grainFetchCount += 1;
+    return { recording: null, grainUrl: '', source: 'no_grain_recording' };
+  };
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-03T21:00:00.000Z'));
+
+  assert.equal(stats.prompted, 0);
+  assert.equal(stats.skipped, 1);
+  assert.equal(posts.length, 0);
+  assert.equal(grainFetchCount, 0);
 });
 
 test('sales admin confirmation updates HubSpot deal next step summary', async () => {
