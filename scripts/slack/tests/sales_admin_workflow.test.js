@@ -206,7 +206,7 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
       id: 'm1',
       properties: { hs_meeting_title: 'Truewind Full Demo', hs_meeting_start_time: '2026-06-04T16:30:00.000Z' },
       _companies: [{ id: 'c1', name: 'Acme' }],
-      _deals: [{ id: 'd1', dealname: 'Acme - New Deal' }],
+      _deals: [{ id: 'd1', dealname: 'Acme - New Deal', pipeline: '105321581', dealstage: '190380582' }],
       _contacts: [{ id: 'ct1', firstname: 'Ava', lastname: 'Buyer', email: 'ava@example.com' }],
     },
     {
@@ -214,6 +214,10 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
       properties: { hs_meeting_title: 'Canceled: Old Intro', hs_meeting_start_time: '2026-06-04T20:00:00.000Z' },
     },
   ];
+  workflow.buildStageDecisionForMeeting = async meeting => buildStageDecision({
+    deal: meeting._deals?.[0],
+    stages: STAGES,
+  });
 
   const stats = await workflow.runTomorrowSummaries(new Date('2026-06-03T18:00:00.000Z'));
 
@@ -224,6 +228,7 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.match(posts[0].text, /<@U09QC3B292R>/);
   assert.match(posts[0].text, /\*9:30 AM — Acme\*/);
   assert.match(posts[0].text, /Truewind Full Demo/);
+  assert.match(posts[0].text, /Deal stage: Stage 2: SQL \(Full Product Demo\)/);
   assert.match(posts[0].text, /HubSpot meeting/);
   assert.match(posts[0].text, /Cancelled tomorrow/);
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');

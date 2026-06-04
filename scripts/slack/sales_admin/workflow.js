@@ -257,13 +257,14 @@ function meetingLinks(hubspot, meeting) {
   return links.join(' | ');
 }
 
-function tomorrowMeetingText({ hubspot, meeting, timeZone }) {
+function tomorrowMeetingText({ hubspot, meeting, timeZone, stageDecision = null }) {
   const companyName = companyNameForMeeting(meeting);
   const title = meetingTitle(meeting);
   const lines = [
     `*${formatLocalTime(meeting.properties?.hs_meeting_start_time, timeZone)} — ${slackMrkdwn(companyName)}*`,
   ];
   if (title && title !== companyName) lines.push(slackMrkdwn(title));
+  if (stageDecision?.currentStageLabel) lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
   lines.push(meetingLinks(hubspot, meeting));
   return lines.join('\n');
 }
@@ -839,7 +840,8 @@ class SalesAdminWorkflow {
             lines.push('\nNo scheduled calls found for tomorrow.');
           } else {
             for (const meeting of scheduled) {
-              lines.push(`\n${tomorrowMeetingText({ hubspot: this.hubspot, meeting, timeZone: this.config.timezone })}`);
+              const stageDecision = await this.buildStageDecisionForMeeting(meeting);
+              lines.push(`\n${tomorrowMeetingText({ hubspot: this.hubspot, meeting, timeZone: this.config.timezone, stageDecision })}`);
             }
           }
           if (cancelled.length > 0) {
