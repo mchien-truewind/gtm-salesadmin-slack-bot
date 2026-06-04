@@ -396,6 +396,16 @@ function formatCroNextStepLine(step, extraction = null) {
   return `${formatNextStepDate(step?.dueDate)}: ${compactCroNextStepPhrase(step?.text, extraction)}`;
 }
 
+function hubspotNextStepFromExtraction({ meeting, extraction } = {}) {
+  const steps = extraction?.nextSteps || [];
+  if (steps.length) {
+    return truncateText(steps.slice(0, 5).map(step => formatCroNextStepLine(step, extraction)).join('\n'), 700);
+  }
+  const summary = String(extraction?.summary || '').trim();
+  if (summary) return `??/??: ${compactCroNextStepPhrase(summary, extraction)}`;
+  return `??/??: Meeting completed for ${companyNameForMeeting(meeting)}; AE to confirm next step.`;
+}
+
 async function summarizeSalesLeaderText({ anthropic, text, logger = console }) {
   const fallback = compactSalesLeaderSummary(text);
   if (!text || !anthropic) return fallback;
@@ -522,19 +532,16 @@ function nextStepsBlockText(extraction) {
   if (!steps.length) {
     return '*Suggested follow-up from Grain*\n_No follow-up items were found in Grain._';
   }
-  const lines = steps.slice(0, 8).map((step, index) => `${index + 1}. ${slackMrkdwn(formatCroNextStepLine(step, extraction))}`);
+  const lines = steps.slice(0, 8).map((step, index) => {
+    const suffix = [step.owner ? `Owner: ${slackMrkdwn(step.owner)}` : '', step.dueDate ? `Due: ${slackMrkdwn(step.dueDate)}` : ''].filter(Boolean).join(', ');
+    return `${index + 1}. ${slackMrkdwn(step.text)}${suffix ? ` _(${suffix})_` : ''}`;
+  });
   if (steps.length > lines.length) lines.push(`_${steps.length - lines.length} more follow-up items omitted._`);
   return truncateText(`*Suggested follow-up from Grain*\n${lines.join('\n')}`);
 }
 
 function hubspotNextStepSummary({ meeting, extraction } = {}) {
-  const summary = String(extraction?.summary || '').trim();
-  if (summary) return compactSalesLeaderSummary(summary);
-  const steps = extraction?.nextSteps || [];
-  if (steps.length) {
-    return compactSalesLeaderSummary(steps.slice(0, 2).map(step => step.text).filter(Boolean).join(' '));
-  }
-  return `Meeting completed for ${companyNameForMeeting(meeting)}; AE to confirm next step.`;
+  return hubspotNextStepFromExtraction({ meeting, extraction });
 }
 
 function hubspotNextStepBlockText({ meeting, extraction } = {}) {
@@ -656,7 +663,7 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hu
     const steps = extraction?.nextSteps || [];
     lines.push('Grain suggested follow-up:');
     if (steps.length) {
-      for (const step of steps) lines.push(`- ${formatCroNextStepLine(step, extraction)}`);
+      for (const step of steps) lines.push(`- ${step.text}${step.owner ? ` (Owner: ${step.owner})` : ''}${step.dueDate ? ` (Due: ${step.dueDate})` : ''}`);
     } else {
       lines.push('- None confirmed');
     }

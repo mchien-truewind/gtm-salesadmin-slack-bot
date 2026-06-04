@@ -370,10 +370,10 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.match(posts[0].blocks[0].text.text, /Meeting completed; review next steps/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
   const nextStepsBlock = posts[0].blocks.find(block => block.text?.text?.includes('*Suggested follow-up from Grain*'));
-  assert.match(nextStepsBlock.text.text, /1\. 06\/10: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
+  assert.match(nextStepsBlock.text.text, /1\. Send implementation pricing, confirm decision timeline, and identify finance owner for close plan _\(Due: 2026-06-10\)_/);
   const hubspotNextStepBlock = posts[0].blocks.find(block => block.text?.text?.includes('*HubSpot Next Step*'));
   assert.match(hubspotNextStepBlock.text.text, /saved to HubSpot under `Next step`/);
-  assert.match(hubspotNextStepBlock.text.text, /EdOps is evaluating Truewind/);
+  assert.match(hubspotNextStepBlock.text.text, /06\/10: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('```')));
   const stageBlock = posts[0].blocks.find(block => block.block_id === 'deal_stage');
   assert.match(stageBlock.text.text, /Deal stage: EdOps - New Deal/);
@@ -527,11 +527,11 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
     slackUserId: 'U_TEST',
   });
 
-  assert.deepEqual(propertyUpdates, [{ dealId: 'deal-1', propertyName: 'hs_next_step', value: 'Acme is interested in AP automation and needs pricing follow-up.' }]);
-  assert.equal(updated.hubspotNextStep, 'Acme is interested in AP automation and needs pricing follow-up.');
+  assert.deepEqual(propertyUpdates, [{ dealId: 'deal-1', propertyName: 'hs_next_step', value: '??/??: Send pricing; Acme is interested in AP automation and needs pricing follow-up.' }]);
+  assert.equal(updated.hubspotNextStep, '??/??: Send pricing; Acme is interested in AP automation and needs pricing follow-up.');
   assert.equal(updated.nextStepPropertyUpdate.updated, true);
-  assert.match(notes[0], /HubSpot Next step: Acme is interested/);
-  assert.match(notes[0], /- \?\?\/\?\?: Send pricing; Acme is interested in AP automation and needs pricing follow-up/);
+  assert.match(notes[0], /HubSpot Next step: \?\?\/\?\?: Send pricing; Acme is interested/);
+  assert.match(notes[0], /- Send pricing/);
 });
 
 test('sales admin edit action acks before opening modal', async () => {
@@ -623,5 +623,5 @@ test('sales admin writeback note records selected deal stage movement', () => {
   assert.match(note, /Confirmed deal stage: Stage 3: Awaiting Materials/);
   assert.match(note, /Deal stage updated in HubSpot: Stage 2: SQL \(Full Product Demo\) -> Stage 3: Awaiting Materials/);
   assert.match(note, /HubSpot Next step: Prospect is ready for proposal follow-up/);
-  assert.match(note, /06\/12: Send proposal package and confirm final approval path with finance sponsor/);
+  assert.match(note, /- Send proposal package and confirm final approval path with finance sponsor \(Due: 2026-06-12\)/);
 });
