@@ -5219,6 +5219,7 @@ function startHttpServer() {
           ownerId: params.get('owner_id') || params.get('ownerId') || '',
           meetingId: params.get('meeting_id') || params.get('meetingId') || '',
           force: params.get('force') || '',
+          allowClosed: params.get('allow_closed') || params.get('allowClosed') || '',
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(stats));

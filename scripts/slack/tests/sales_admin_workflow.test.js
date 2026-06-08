@@ -50,6 +50,51 @@ test('sales admin cancellation source labeling distinguishes CalendarSync and Ca
   assert.equal(cancellationSourceLabel(meeting({ hs_meeting_title: 'Canceled: Unknown' })), 'Unknown');
 });
 
+test('sales admin cancellation alerts dedupe even when HubSpot note write fails', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: String(posts.length), channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-cancel-dedupe-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  const rawMeetings = [
+    { id: 'cancel-1', properties: { hs_meeting_title: '[Canceled] Calendly: Truewind Introductions', hs_meeting_start_time: '2026-06-04T14:00:00.000Z', hs_object_source_detail_1: 'Calendly' } },
+    { id: 'cancel-2', properties: { hs_meeting_title: 'Canceled: Calendly: Truewind Introductions', hs_meeting_start_time: '2026-06-04T14:00:00.000Z', hs_object_source_detail_1: 'Calendly' } },
+  ];
+  workflow.hubspot.searchRecentlyUpdatedMeetingsForOwner = async () => rawMeetings;
+  workflow.hubspot.attachAssociations = async rawMeeting => ({
+    ...rawMeeting,
+    _contacts: [{ id: 'ct1', firstname: 'Jeremiah', lastname: 'Paul', email: 'jeremiah@example.com', company: 'StartHub' }],
+    _companies: [{ id: 'c1', name: 'StartHub' }],
+    _deals: [{ id: 'd1', dealname: 'StartHub - Sarah Elix - 2026-06-04' }],
+  });
+  workflow.hubspot.createNote = async () => {
+    throw new Error('HubSpot 400: Invalid Association Creation Requests');
+  };
+
+  const first = await workflow.runCancellationScan(new Date('2026-06-04T14:05:00.000Z'));
+  const second = await workflow.runCancellationScan(new Date('2026-06-04T14:10:00.000Z'));
+
+  assert.equal(first.alerted, 1);
+  assert.equal(first.skipped, 1);
+  assert.equal(second.alerted, 0);
+  assert.equal(second.skipped, 2);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /meeting cancelled/);
+  const stored = Object.values(workflow.state.load().records).filter(record => record.type === 'cancel');
+  assert.ok(stored.some(record => record.hubspotNoteStatus === 'failed'));
+});
+
 
 test('sales admin Grain matching can use direct HubSpot and calendar metadata', () => {
   assert.equal(recordingDirectlyMatchesMeeting({ hubspot: { meeting_id: '12345' } }, { id: '12345', properties: {} }), true);
@@ -373,7 +418,7 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.match(nextStepsBlock.text.text, /1\. Send implementation pricing, confirm decision timeline, and identify finance owner for close plan _\(Due: 2026-06-10\)_/);
   const hubspotNextStepBlock = posts[0].blocks.find(block => block.text?.text?.includes('*HubSpot Next Step*'));
   assert.match(hubspotNextStepBlock.text.text, /saved to HubSpot under `Next step`/);
-  assert.match(hubspotNextStepBlock.text.text, /06\/10: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
+  assert.match(hubspotNextStepBlock.text.text, /\d{2}\/\d{2}: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('```')));
   const stageBlock = posts[0].blocks.find(block => block.block_id === 'deal_stage');
   assert.match(stageBlock.text.text, /Deal stage: EdOps - New Deal/);
@@ -429,6 +474,17 @@ test('sales admin post-meeting scan skips automatic prompts for closed deals', a
 
   assert.equal(stats.prompted, 0);
   assert.equal(stats.skipped, 1);
+  assert.equal(posts.length, 0);
+  assert.equal(grainFetchCount, 0);
+
+  const forcedStats = await workflow.runPostMeetingScan(new Date('2026-06-03T21:00:00.000Z'), {
+    ownerId: '89305622',
+    meetingId: 'pkf-meeting',
+    force: true,
+  });
+
+  assert.equal(forcedStats.prompted, 0);
+  assert.equal(forcedStats.skipped, 1);
   assert.equal(posts.length, 0);
   assert.equal(grainFetchCount, 0);
 });
@@ -515,6 +571,7 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
     ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com', hubspotOwnerId: '84547076' },
     meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }, _deals: [{ id: 'deal-1' }] },
     extraction: { summary: 'Acme is interested in AP automation and needs pricing follow-up.', nextSteps: [{ text: 'Send pricing' }] },
+    nextStepDatePrefix: '06/08',
     grainUrl: 'https://grain.com/share/recording/grain-1',
     stageDecision,
     slackChannel: 'C_SARAH',
@@ -527,10 +584,10 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
     slackUserId: 'U_TEST',
   });
 
-  assert.deepEqual(propertyUpdates, [{ dealId: 'deal-1', propertyName: 'hs_next_step', value: '??/??: Send pricing; Acme is interested in AP automation and needs pricing follow-up.' }]);
-  assert.equal(updated.hubspotNextStep, '??/??: Send pricing; Acme is interested in AP automation and needs pricing follow-up.');
+  assert.deepEqual(propertyUpdates, [{ dealId: 'deal-1', propertyName: 'hs_next_step', value: '06/08: Send pricing; Acme is interested in AP automation and needs pricing follow-up.' }]);
+  assert.equal(updated.hubspotNextStep, '06/08: Send pricing; Acme is interested in AP automation and needs pricing follow-up.');
   assert.equal(updated.nextStepPropertyUpdate.updated, true);
-  assert.match(notes[0], /HubSpot Next step: \?\?\/\?\?: Send pricing; Acme is interested/);
+  assert.match(notes[0], /HubSpot Next step: 06\/08: Send pricing; Acme is interested/);
   assert.match(notes[0], /- Send pricing/);
 });
 

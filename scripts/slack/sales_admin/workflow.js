@@ -199,6 +199,26 @@ function cancellationSourceLabel(meeting) {
   return 'Unknown';
 }
 
+function cancellationDedupeTitle(meeting) {
+  return normalizeDigestText(meetingTitle(meeting))
+    .replace(/^\[cancell?ed\]\s*/, '')
+    .replace(/^cancell?ed:\s*/, '')
+    .replace(/^calendly:\s*/, '')
+    .trim();
+}
+
+function cancellationStateKeys(meeting, ae) {
+  const startMs = Date.parse(meeting?.properties?.hs_meeting_start_time || '');
+  const contact = primaryContact(meeting);
+  const company = primaryCompany(meeting);
+  const participantKey = normalizeDigestText(contact?.email || contactLabel(contact) || company?.name || companyNameForMeeting(meeting));
+  const titleKey = cancellationDedupeTitle(meeting);
+  return [
+    `cancel:${meeting.id}:${ae.hubspotOwnerId}`,
+    `cancel-dedupe:${ae.hubspotOwnerId}:${Number.isFinite(startMs) ? startMs : ''}:${participantKey}:${titleKey}`,
+  ];
+}
+
 function meetingEndMs(meeting, defaultDurationMin = 60) {
   const props = meeting?.properties || {};
   const end = props.hs_meeting_end_time ? Date.parse(props.hs_meeting_end_time) : 0;
@@ -370,19 +390,14 @@ function compactCroNextStepPhrase(value, extraction = null) {
   return phrase;
 }
 
-function formatNextStepDate(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return '??/??';
-  const numeric = raw.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-]\d{2,4})?\b/);
-  if (numeric) return `${numeric[1].padStart(2, '0')}/${numeric[2].padStart(2, '0')}`;
-  const iso = raw.match(/\b(\d{4})-(\d{1,2})-(\d{1,2})\b/);
-  if (iso) return `${iso[2].padStart(2, '0')}/${iso[3].padStart(2, '0')}`;
-  const parsed = Date.parse(raw);
-  if (Number.isFinite(parsed)) {
-    const date = new Date(parsed);
-    return `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
-  }
-  return '??/??';
+function formatPacificDatePrefix(date = new Date(), timeZone = 'America/Los_Angeles') {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.month}/${values.day}`;
 }
 
 function splitLeadingNextStepDate(value) {
@@ -392,18 +407,41 @@ function splitLeadingNextStepDate(value) {
   return { dueDate: match[1], text: match[2].trim() };
 }
 
-function formatCroNextStepLine(step, extraction = null) {
-  return `${formatNextStepDate(step?.dueDate)}: ${compactCroNextStepPhrase(step?.text, extraction)}`;
+function futureNextStepScore(step) {
+  const text = normalizeDigestText(step?.text || '');
+  let score = 0;
+  if (/\b(schedule|call|meeting|demo|follow|reach|circle|send|share|confirm|proposal|pricing|contract|next week|tomorrow)\b/.test(text)) score += 6;
+  if (/\b(decision|timeline|close|approval|buyer|sponsor|scope|pilot|poc|legal|procurement)\b/.test(text)) score += 3;
+  if (/\b(internal|internally|debrief|regroup)\b/.test(text)) score -= 2;
+  if (/\b(no action|none|n\/a)\b/.test(text)) score -= 10;
+  return score;
 }
 
-function hubspotNextStepFromExtraction({ meeting, extraction } = {}) {
+function futureFacingNextStepPhrase(step, extraction = null) {
+  const rawText = String(step?.text || '').trim();
+  const normalized = normalizeDigestText(rawText);
+  if (/\b(internal|internally|debrief)\b/.test(normalized) && /\b(decide|move forward|decision)\b/.test(normalized)) {
+    return 'Circle back internally and reach back out next week to confirm decision path';
+  }
+  if (/\bregroup\b/.test(normalized) && /\bnext week|tomorrow|call|meeting\b/.test(normalized)) {
+    return 'Schedule regroup call and confirm decision path, timing, and next buyer milestone';
+  }
+  return compactCroNextStepPhrase(rawText, extraction);
+}
+
+function formatCroNextStepLine(step, extraction = null, datePrefix = formatPacificDatePrefix()) {
+  return `${datePrefix}: ${futureFacingNextStepPhrase(step, extraction)}`;
+}
+
+function hubspotNextStepFromExtraction({ meeting, extraction, datePrefix = formatPacificDatePrefix() } = {}) {
   const steps = extraction?.nextSteps || [];
   if (steps.length) {
-    return truncateText(steps.slice(0, 5).map(step => formatCroNextStepLine(step, extraction)).join('\n'), 700);
+    const selectedStep = [...steps].sort((left, right) => futureNextStepScore(right) - futureNextStepScore(left))[0];
+    return truncateText(formatCroNextStepLine(selectedStep, extraction, datePrefix), 700);
   }
   const summary = String(extraction?.summary || '').trim();
-  if (summary) return `??/??: ${compactCroNextStepPhrase(summary, extraction)}`;
-  return `??/??: Meeting completed for ${companyNameForMeeting(meeting)}; AE to confirm next step.`;
+  if (summary) return `${datePrefix}: ${compactCroNextStepPhrase(summary, extraction)}`;
+  return `${datePrefix}: AE to confirm next follow-up for ${companyNameForMeeting(meeting)}`;
 }
 
 async function summarizeSalesLeaderText({ anthropic, text, logger = console }) {
@@ -540,15 +578,15 @@ function nextStepsBlockText(extraction) {
   return truncateText(`*Suggested follow-up from Grain*\n${lines.join('\n')}`);
 }
 
-function hubspotNextStepSummary({ meeting, extraction } = {}) {
-  return hubspotNextStepFromExtraction({ meeting, extraction });
+function hubspotNextStepSummary({ meeting, extraction, datePrefix = formatPacificDatePrefix() } = {}) {
+  return hubspotNextStepFromExtraction({ meeting, extraction, datePrefix });
 }
 
-function hubspotNextStepBlockText({ meeting, extraction } = {}) {
+function hubspotNextStepBlockText({ meeting, extraction, datePrefix } = {}) {
   return truncateText([
     '*HubSpot Next Step*',
     'Please confirm this short summary should be saved to HubSpot under `Next step`:',
-    `>${slackMrkdwn(hubspotNextStepSummary({ meeting, extraction }))}`,
+    `>${slackMrkdwn(hubspotNextStepSummary({ meeting, extraction, datePrefix }))}`,
   ].join('\n'));
 }
 
@@ -638,7 +676,7 @@ function shouldDefaultNoShow({ grainSource = '', extraction = null } = {}) {
   return source === 'no_grain_recording';
 }
 
-function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hubspotNextStep = '', stageDecision = null, selectedStageId = '', stageUpdate = null, nextStepPropertyUpdate = null }) {
+function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hubspotNextStep = '', nextStepDatePrefix = '', stageDecision = null, selectedStageId = '', stageUpdate = null, nextStepPropertyUpdate = null }) {
   const lines = [
     'Sales Admin Confirmed Meeting Outcome',
     `AE: ${ae.name} <${ae.email}>`,
@@ -657,7 +695,7 @@ function buildWritebackNote({ ae, meeting, status, extraction, grainUrl = '', hu
     lines.push('Outcome: No show');
   } else {
     lines.push('Outcome: Meeting completed; review next steps.');
-    lines.push(`HubSpot Next step: ${hubspotNextStep || hubspotNextStepSummary({ meeting, extraction })}`);
+    lines.push(`HubSpot Next step: ${hubspotNextStep || hubspotNextStepSummary({ meeting, extraction, datePrefix: nextStepDatePrefix })}`);
     if (nextStepPropertyUpdate?.updated) lines.push(`HubSpot Next step property updated: ${nextStepPropertyUpdate.propertyName}`);
     if (nextStepPropertyUpdate && !nextStepPropertyUpdate.updated) lines.push(`HubSpot Next step property update: ${nextStepPropertyUpdate.reason}`);
     const steps = extraction?.nextSteps || [];
@@ -696,7 +734,7 @@ function postMeetingActionElements(promptKey, defaultNoShow = false) {
   ];
 }
 
-function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, grainSource = '', stageDecision }) {
+function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, grainSource = '', nextStepDatePrefix = '', stageDecision }) {
   const companyName = companyNameForMeeting(meeting);
   const defaultNoShow = shouldDefaultNoShow({ grainSource, extraction });
   const text = defaultNoShow
@@ -712,7 +750,7 @@ function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, g
       accessory: stageSelectElement(stageDecision, stageDecision.recommendedStageId),
     }] : []),
     { type: 'section', text: { type: 'mrkdwn', text: nextStepsBlockText(extraction) } },
-    { type: 'section', text: { type: 'mrkdwn', text: hubspotNextStepBlockText({ meeting, extraction }) } },
+    { type: 'section', text: { type: 'mrkdwn', text: hubspotNextStepBlockText({ meeting, extraction, datePrefix: nextStepDatePrefix }) } },
     {
       type: 'context',
       elements: [{
@@ -951,9 +989,9 @@ class SalesAdminWorkflow {
           const meetings = await this.hubspot.searchRecentlyUpdatedMeetingsForOwner(ae.hubspotOwnerId, updatedSince, startAfter);
           for (const rawMeeting of meetings) {
             if (classifyMeetingStatus(rawMeeting) !== 'cancelled') continue;
-            const key = `cancel:${rawMeeting.id}:${ae.hubspotOwnerId}`;
-            if (this.state.has(key)) { stats.skipped += 1; continue; }
             const meeting = await this.hubspot.attachAssociations(rawMeeting);
+            const keys = cancellationStateKeys(meeting, ae);
+            if (keys.some(key => this.state.has(key))) { stats.skipped += 1; continue; }
             const source = cancellationSourceLabel(meeting);
             const text = [
               `:warning: <@${ae.slackUserId}> meeting cancelled: *${meetingTitle(meeting)}*`,
@@ -962,21 +1000,28 @@ class SalesAdminWorkflow {
               meetingLinks(this.hubspot, meeting),
             ].join('\n');
             const posted = await this.safePostMessage(ae, { text });
-            const note = await this.hubspot.createNote({
-              meeting,
-              contacts: meeting._contacts,
-              companies: meeting._companies,
-              deals: meeting._deals,
-              body: [
-                'Sales Admin cancellation notification',
-                `AE notified: ${ae.name} <${ae.email}>`,
-                `Slack channel: ${posted.channel || this.channelFor(ae)}`,
-                `Slack timestamp: ${posted.ts}`,
-                `Detected source: ${source}`,
-                `Cancellation signal: ${meeting.properties?.hs_meeting_title || ''}`,
-              ].join('\n'),
-            });
-            this.state.set(key, { type: 'cancel', ae, meetingId: meeting.id, source, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), hubspotNoteId: note.id, status: 'alerted' });
+            const alertRecord = { type: 'cancel', ae, meetingId: meeting.id, source, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'alerted', hubspotNoteStatus: 'pending' };
+            for (const key of keys) this.state.set(key, alertRecord);
+            try {
+              const note = await this.hubspot.createNote({
+                meeting,
+                contacts: meeting._contacts,
+                companies: meeting._companies,
+                deals: meeting._deals,
+                body: [
+                  'Sales Admin cancellation notification',
+                  `AE notified: ${ae.name} <${ae.email}>`,
+                  `Slack channel: ${posted.channel || this.channelFor(ae)}`,
+                  `Slack timestamp: ${posted.ts}`,
+                  `Detected source: ${source}`,
+                  `Cancellation signal: ${meeting.properties?.hs_meeting_title || ''}`,
+                ].join('\n'),
+              });
+              for (const key of keys) this.state.update(key, { hubspotNoteId: note.id, hubspotNoteStatus: 'created' });
+            } catch (err) {
+              this.logger.warn(`Sales admin cancellation note write failed for meeting ${meeting.id}: ${err.message}`);
+              for (const key of keys) this.state.update(key, { hubspotNoteStatus: 'failed', hubspotNoteError: err.message });
+            }
             stats.alerted += 1;
           }
         } catch (err) {
@@ -1028,6 +1073,7 @@ class SalesAdminWorkflow {
       const ownerId = String(options.ownerId || options.owner_id || '').trim();
       const meetingId = String(options.meetingId || options.meeting_id || '').trim();
       const force = options.force === true || options.force === 'true' || options.force === '1';
+      const allowClosed = options.allowClosed === true || options.allowClosed === 'true' || options.allowClosed === '1' || options.allow_closed === 'true' || options.allow_closed === '1';
       for (const ae of this.config.roster) {
         if (ownerId && ae.hubspotOwnerId !== ownerId) { stats.skipped += 1; continue; }
         if (!this.isAeChannelReady(ae)) { stats.skipped += 1; continue; }
@@ -1041,7 +1087,7 @@ class SalesAdminWorkflow {
             const endMs = meetingEndMs(meeting);
             if (!force && (!endMs || now.getTime() < endMs + this.config.postMeetingDelayMin * 60 * 1000)) { stats.skipped += 1; continue; }
             const stageDecision = await this.buildStageDecisionForMeeting(meeting);
-            if (!force && shouldSkipAutomaticPostMeetingPrompt(stageDecision)) {
+            if (!allowClosed && shouldSkipAutomaticPostMeetingPrompt(stageDecision)) {
               stats.skipped += 1;
               continue;
             }
@@ -1059,13 +1105,14 @@ class SalesAdminWorkflow {
               grainSource: grain.source,
               grainUrl: grain.grainUrl,
               extraction,
+              nextStepDatePrefix: formatPacificDatePrefix(new Date(), this.config.timezone),
               stageDecision,
               status: 'pending',
             };
             this.state.set(key, promptRecord);
             const posted = await this.safePostMessage(ae, {
               text: `Post-meeting check: ${meetingTitle(meeting)}`,
-              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, grainSource: grain.source, stageDecision: promptRecord.stageDecision }),
+              blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, grainSource: grain.source, nextStepDatePrefix: promptRecord.nextStepDatePrefix, stageDecision: promptRecord.stageDecision }),
             });
             this.state.update(key, { slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'prompted' });
             stats.prompted += 1;
@@ -1116,7 +1163,7 @@ class SalesAdminWorkflow {
     const ae = record.ae;
     const effectiveStageId = status === 'no_show' ? '' : (selectedStageId || record.stageDecision?.recommendedStageId || '');
     const stageUpdate = status === 'no_show' ? { updated: false, reason: 'No-show confirmation does not move deal stage.' } : await this.applySelectedStage(record, effectiveStageId);
-    const effectiveHubSpotNextStep = status === 'no_show' ? '' : (hubspotNextStep || hubspotNextStepSummary({ meeting, extraction: record.extraction }));
+    const effectiveHubSpotNextStep = status === 'no_show' ? '' : (hubspotNextStep || hubspotNextStepSummary({ meeting, extraction: record.extraction, datePrefix: record.nextStepDatePrefix }));
     const nextStepPropertyUpdate = status === 'no_show'
       ? { updated: false, reason: 'No-show confirmation does not update HubSpot Next step.' }
       : await this.updateHubSpotNextStep(record, effectiveHubSpotNextStep).catch(err => ({ updated: false, reason: err.message }));
@@ -1127,6 +1174,7 @@ class SalesAdminWorkflow {
       extraction: record.extraction,
       grainUrl: record.grainUrl,
       hubspotNextStep: effectiveHubSpotNextStep,
+      nextStepDatePrefix: record.nextStepDatePrefix,
       stageDecision: record.stageDecision,
       selectedStageId: effectiveStageId,
       stageUpdate,
@@ -1247,7 +1295,7 @@ class SalesAdminWorkflow {
             close: { type: 'plain_text', text: 'Cancel' },
             blocks: [
               { type: 'section', text: { type: 'mrkdwn', text: 'Edit the short text that will be saved to the HubSpot deal `Next step` field.' } },
-              { type: 'input', block_id: 'hubspot_next_step', label: { type: 'plain_text', text: 'HubSpot Next step' }, element: inputElement(record.hubspotNextStep || hubspotNextStepSummary({ meeting: record.meeting, extraction: record.extraction })) },
+              { type: 'input', block_id: 'hubspot_next_step', label: { type: 'plain_text', text: 'HubSpot Next step' }, element: inputElement(record.hubspotNextStep || hubspotNextStepSummary({ meeting: record.meeting, extraction: record.extraction, datePrefix: record.nextStepDatePrefix })) },
               ...(record.stageDecision ? [{ type: 'input', block_id: 'deal_stage', label: { type: 'plain_text', text: 'Confirm deal stage' }, element: stageSelectElement(record.stageDecision, selectedStageId) }] : []),
             ],
           },
