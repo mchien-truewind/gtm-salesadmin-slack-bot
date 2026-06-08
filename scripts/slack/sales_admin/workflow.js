@@ -143,6 +143,14 @@ function getLocalDayRange(now = new Date(), timeZone = 'America/Los_Angeles', da
   return { start, end, dateKey: parts.dateKey };
 }
 
+function isWeekendLocalDate(date = new Date(), timeZone = 'America/Los_Angeles') {
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    weekday: 'short',
+  }).format(date);
+  return weekday === 'Sat' || weekday === 'Sun';
+}
+
 function formatLocalDate(date, timeZone = 'America/Los_Angeles') {
   return new Intl.DateTimeFormat('en-US', {
     timeZone,
@@ -899,6 +907,9 @@ class SalesAdminWorkflow {
 
   async runMorningSummaries(now = new Date()) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
+    if (isWeekendLocalDate(now, this.config.timezone)) {
+      return { posted: 0, skipped: this.config.roster.length, errors: 0, reason: 'weekend' };
+    }
     return this.withLock('morning', async () => {
       const { dateKey } = getLocalDayRange(now, this.config.timezone);
       const stats = { posted: 0, skipped: 0, errors: 0 };
@@ -937,8 +948,12 @@ class SalesAdminWorkflow {
 
   async runTomorrowSummaries(now = new Date()) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
+    const targetDay = getLocalDayRange(now, this.config.timezone, 1);
+    if (isWeekendLocalDate(targetDay.start, this.config.timezone)) {
+      return { posted: 0, skipped: this.config.roster.length, errors: 0, reason: 'weekend_tomorrow', dateKey: targetDay.dateKey };
+    }
     return this.withLock('tomorrow', async () => {
-      const { start, dateKey } = getLocalDayRange(now, this.config.timezone, 1);
+      const { start, dateKey } = targetDay;
       const dateLabel = formatLocalDate(start, this.config.timezone);
       const stats = { posted: 0, skipped: 0, errors: 0 };
       for (const ae of this.config.roster) {
@@ -1068,11 +1083,14 @@ class SalesAdminWorkflow {
 
   async runPostMeetingScan(now = new Date(), options = {}) {
     if (!this.isEnabled()) return { skipped: true, reason: 'disabled' };
+    const force = options.force === true || options.force === 'true' || options.force === '1';
+    if (!force && isWeekendLocalDate(now, this.config.timezone)) {
+      return { prompted: 0, skipped: this.config.roster.length, errors: 0, reason: 'weekend' };
+    }
     return this.withLock('post', async () => {
       const stats = { prompted: 0, skipped: 0, errors: 0 };
       const ownerId = String(options.ownerId || options.owner_id || '').trim();
       const meetingId = String(options.meetingId || options.meeting_id || '').trim();
-      const force = options.force === true || options.force === 'true' || options.force === '1';
       const allowClosed = options.allowClosed === true || options.allowClosed === 'true' || options.allowClosed === '1' || options.allow_closed === 'true' || options.allow_closed === '1';
       for (const ae of this.config.roster) {
         if (ownerId && ae.hubspotOwnerId !== ownerId) { stats.skipped += 1; continue; }
