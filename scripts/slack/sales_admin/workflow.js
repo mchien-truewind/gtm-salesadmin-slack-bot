@@ -71,6 +71,7 @@ function buildConfig(env = process.env) {
     tomorrowHour: parseNumber(env.SALES_ADMIN_TOMORROW_HOUR, 17),
     tomorrowMinute: parseNumber(env.SALES_ADMIN_TOMORROW_MINUTE, 0),
     postMeetingDelayMin: parseNumber(env.SALES_ADMIN_POST_MEETING_DELAY_MIN, 10),
+    postMeetingLookbackHours: parseNumber(env.SALES_ADMIN_POST_MEETING_LOOKBACK_HOURS, 2),
     scanIntervalMin: parseNumber(env.SALES_ADMIN_SCAN_MIN, 5),
     cancelScanMin: parseNumber(env.SALES_ADMIN_CANCEL_SCAN_MIN, 5),
     cancelLookbackMin: parseNumber(env.SALES_ADMIN_CANCEL_LOOKBACK_MIN, 30),
@@ -225,6 +226,10 @@ function cancellationStateKeys(meeting, ae) {
     `cancel:${meeting.id}:${ae.hubspotOwnerId}`,
     `cancel-dedupe:${ae.hubspotOwnerId}:${Number.isFinite(startMs) ? startMs : ''}:${participantKey}:${titleKey}`,
   ];
+}
+
+function postPromptMarker(meetingId, ownerId) {
+  return `sales_admin_post_prompt:${ownerId}:${meetingId}`;
 }
 
 function meetingEndMs(meeting, defaultDurationMin = 60) {
@@ -1113,10 +1118,23 @@ class SalesAdminWorkflow {
             if (!force && this.state.has(key)) { stats.skipped += 1; continue; }
             const endMs = meetingEndMs(meeting);
             if (!force && (!endMs || now.getTime() < endMs + this.config.postMeetingDelayMin * 60 * 1000)) { stats.skipped += 1; continue; }
+            if (!force && this.config.postMeetingLookbackHours > 0 && now.getTime() > endMs + this.config.postMeetingLookbackHours * 60 * 60 * 1000) { stats.skipped += 1; continue; }
             const stageDecision = await this.buildStageDecisionForMeeting(meeting);
             if (!allowClosed && shouldSkipAutomaticPostMeetingPrompt(stageDecision)) {
               stats.skipped += 1;
               continue;
+            }
+            const marker = postPromptMarker(meeting.id, ae.hubspotOwnerId);
+            if (!force) {
+              const alreadyPrompted = await this.hubspot.hasMeetingNoteContaining(meeting.id, marker).catch(err => {
+                this.logger.warn(`Sales admin post prompt marker check failed for meeting ${meeting.id}: ${err.message}`);
+                return false;
+              });
+              if (alreadyPrompted) {
+                this.state.set(key, { type: 'post', ae, meetingId: meeting.id, promptMarker: marker, status: 'prompted', source: 'hubspot_marker' });
+                stats.skipped += 1;
+                continue;
+              }
             }
             const grain = await this.fetchGrainForMeeting(ae, meeting).catch(err => {
               this.logger.warn(`Sales admin Grain match failed for meeting ${meeting.id}: ${err.message}`);
@@ -1132,6 +1150,7 @@ class SalesAdminWorkflow {
               grainSource: grain.source,
               grainUrl: grain.grainUrl,
               extraction,
+              promptMarker: marker,
               nextStepDatePrefix: formatPacificDatePrefix(new Date(), this.config.timezone),
               stageDecision,
               status: 'pending',
@@ -1141,7 +1160,24 @@ class SalesAdminWorkflow {
               text: `Post-meeting check: ${meetingTitle(meeting)}`,
               blocks: buildPostMeetingBlocks({ ae, meeting, hubspot: this.hubspot, extraction, promptKey: key, grainUrl: grain.grainUrl, grainSource: grain.source, nextStepDatePrefix: promptRecord.nextStepDatePrefix, stageDecision: promptRecord.stageDecision }),
             });
-            this.state.update(key, { slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'prompted' });
+            const slackChannel = posted.channel || this.channelFor(ae);
+            this.state.update(key, { slackTs: posted.ts, slackChannel, status: 'prompted' });
+            try {
+              const note = await this.hubspot.createPostPromptMarker({
+                marker,
+                meeting,
+                ae,
+                slackChannel,
+                slackTs: posted.ts,
+                promptKey: key,
+                grainUrl: grain.grainUrl,
+                grainSource: grain.source,
+              });
+              this.state.update(key, { hubspotPromptMarkerNoteId: note.id, hubspotPromptMarkerStatus: 'created' });
+            } catch (err) {
+              this.logger.warn(`Sales admin post prompt marker write failed for meeting ${meeting.id}: ${err.message}`);
+              this.state.update(key, { hubspotPromptMarkerStatus: 'failed', hubspotPromptMarkerError: err.message });
+            }
             stats.prompted += 1;
           }
         } catch (err) {

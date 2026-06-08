@@ -239,6 +239,36 @@ class HubSpotSalesAdminClient {
     return note;
   }
 
+  async hasMeetingNoteContaining(meetingId, marker) {
+    if (!meetingId || !marker) return false;
+    const noteIds = await this.getAssociations('meetings', meetingId, 'notes');
+    for (const noteId of noteIds.slice(0, 100)) {
+      try {
+        const note = await this.getObject('notes', noteId, ['hs_note_body']);
+        if (String(note.properties?.hs_note_body || '').includes(marker)) return true;
+      } catch (err) {
+        this.logger.warn(`Sales admin note marker fetch failed for note ${noteId}: ${err.message}`);
+      }
+    }
+    return false;
+  }
+
+  async createPostPromptMarker({ marker, meeting, ae, slackChannel, slackTs, promptKey, grainUrl = '', grainSource = '' }) {
+    return this.createNote({
+      meeting,
+      body: [
+        'Sales Admin post-meeting prompt sent',
+        `Marker: ${marker}`,
+        `Prompt key: ${promptKey}`,
+        `AE notified: ${ae?.name || ''} <${ae?.email || ''}>`,
+        `Slack channel: ${slackChannel || ''}`,
+        `Slack timestamp: ${slackTs || ''}`,
+        `Grain source: ${grainSource || ''}`,
+        grainUrl ? `Grain recording: ${grainUrl}` : '',
+      ].filter(Boolean).join('\n'),
+    });
+  }
+
   async createTask({ subject, body, dueDate, ownerId, meeting, contacts = [], companies = [], deals = [] }) {
     const parsedDueDate = dueDate ? new Date(dueDate) : null;
     const timestamp = parsedDueDate && Number.isFinite(parsedDueDate.getTime())

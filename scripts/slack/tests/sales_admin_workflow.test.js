@@ -171,6 +171,7 @@ test('sales admin config defaults disabled and channel roster is available', () 
   const config = buildConfig({});
   assert.equal(config.enabled, false);
   assert.equal(config.postMeetingDelayMin, 10);
+  assert.equal(config.postMeetingLookbackHours, 2);
   assert.equal(config.cancelScanMin, 5);
   assert.equal(config.tomorrowHour, 17);
   assert.equal(config.tomorrowMinute, 0);
@@ -539,6 +540,133 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['Confirm & Save', 'Edit Notes', 'No-Show', 'Not this meeting']);
   assert.equal(actions.elements[3].type, 'overflow');
   assert.equal(workflow.state.get('post:target-me:84547076').grainUrl, 'https://grain.com/share/recording/grain-1');
+});
+
+test('sales admin post-meeting scan skips meetings with HubSpot prompt marker after restart', async () => {
+  const posts = [];
+  const markerChecks = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-marker-skip-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [
+    { id: 'trove-meeting', properties: { hs_meeting_title: 'Trove x Truewind', hs_meeting_start_time: '2026-06-08T15:00:00.000Z', hs_meeting_end_time: '2026-06-08T16:00:00.000Z' } },
+  ];
+  workflow.buildStageDecisionForMeeting = async () => null;
+  workflow.fetchGrainForMeeting = async () => {
+    throw new Error('should not fetch Grain when HubSpot marker exists');
+  };
+  workflow.hubspot.hasMeetingNoteContaining = async (meetingId, marker) => {
+    markerChecks.push({ meetingId, marker });
+    return true;
+  };
+  workflow.hubspot.createPostPromptMarker = async () => {
+    throw new Error('should not create duplicate marker');
+  };
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-08T17:00:00.000Z'));
+
+  assert.equal(stats.prompted, 0);
+  assert.equal(stats.skipped, 1);
+  assert.equal(posts.length, 0);
+  assert.deepEqual(markerChecks, [{ meetingId: 'trove-meeting', marker: 'sales_admin_post_prompt:89305622:trove-meeting' }]);
+  assert.equal(workflow.state.get('post:trove-meeting:89305622').source, 'hubspot_marker');
+});
+
+test('sales admin post-meeting scan skips stale meetings after lookback unless forced', async () => {
+  const posts = [];
+  let grainFetchCount = 0;
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: String(posts.length), channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_POST_MEETING_LOOKBACK_HOURS: '2',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-stale-post-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [
+    { id: 'old-trove-meeting', properties: { hs_meeting_title: 'Trove x Truewind', hs_meeting_start_time: '2026-06-08T15:00:00.000Z', hs_meeting_end_time: '2026-06-08T15:30:00.000Z' } },
+  ];
+  workflow.buildStageDecisionForMeeting = async () => null;
+  workflow.hubspot.hasMeetingNoteContaining = async () => false;
+  workflow.hubspot.createPostPromptMarker = async () => ({ id: 'note-1' });
+  workflow.fetchGrainForMeeting = async () => {
+    grainFetchCount += 1;
+    return { recording: null, grainUrl: '', source: 'no_grain_recording' };
+  };
+
+  const automatic = await workflow.runPostMeetingScan(new Date('2026-06-08T18:00:00.000Z'));
+  const forced = await workflow.runPostMeetingScan(new Date('2026-06-08T18:00:00.000Z'), { force: true });
+
+  assert.equal(automatic.prompted, 0);
+  assert.equal(automatic.skipped, 1);
+  assert.equal(forced.prompted, 1);
+  assert.equal(posts.length, 1);
+  assert.equal(grainFetchCount, 1);
+});
+
+test('sales admin post-meeting scan writes HubSpot prompt marker after posting', async () => {
+  const posts = [];
+  const markers = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1.234', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-marker-write-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [
+    { id: 'trove-meeting', properties: { hs_meeting_title: 'Trove x Truewind', hs_meeting_start_time: '2026-06-08T15:00:00.000Z', hs_meeting_end_time: '2026-06-08T16:00:00.000Z' } },
+  ];
+  workflow.buildStageDecisionForMeeting = async () => null;
+  workflow.fetchGrainForMeeting = async () => ({
+    recording: null,
+    grainUrl: '',
+    source: 'no_grain_recording',
+  });
+  workflow.hubspot.hasMeetingNoteContaining = async () => false;
+  workflow.hubspot.createPostPromptMarker = async marker => {
+    markers.push(marker);
+    return { id: 'note-1' };
+  };
+
+  const stats = await workflow.runPostMeetingScan(new Date('2026-06-08T17:00:00.000Z'));
+
+  assert.equal(stats.prompted, 1);
+  assert.equal(posts.length, 1);
+  assert.equal(markers.length, 1);
+  assert.equal(markers[0].marker, 'sales_admin_post_prompt:89305622:trove-meeting');
+  assert.equal(markers[0].promptKey, 'post:trove-meeting:89305622');
+  assert.equal(markers[0].slackChannel, 'C_XAVIER');
+  assert.equal(markers[0].slackTs, '1.234');
+  assert.equal(workflow.state.get('post:trove-meeting:89305622').hubspotPromptMarkerStatus, 'created');
 });
 
 test('sales admin post-meeting scan skips automatic prompts for closed deals', async () => {
