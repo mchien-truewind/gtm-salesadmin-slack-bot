@@ -91,6 +91,7 @@ test('sales admin cancellation alerts dedupe even when HubSpot note write fails'
   assert.equal(second.skipped, 2);
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /meeting cancelled/);
+  assert.match(posts[0].text, /HubSpot deal: <https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/d1\|StartHub - Sarah Elix - 2026-06-04> \(ID: d1\)/);
   const stored = Object.values(workflow.state.load().records).filter(record => record.type === 'cancel');
   assert.ok(stored.some(record => record.hubspotNoteStatus === 'failed'));
 });

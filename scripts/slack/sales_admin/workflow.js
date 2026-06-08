@@ -285,6 +285,14 @@ function meetingLinks(hubspot, meeting) {
   return links.join(' | ');
 }
 
+function hubspotDealLine(hubspot, meeting) {
+  const deal = primaryDeal(meeting);
+  if (!deal) return 'HubSpot deal: No associated deal found';
+  const dealName = deal.dealname || 'Associated deal';
+  const dealRecord = deal.id ? slackLink(hubspot.recordUrl('deals', deal.id), dealName) : slackMrkdwn(dealName);
+  return `HubSpot deal: ${dealRecord}${deal.id ? ` (ID: ${deal.id})` : ''}`;
+}
+
 function tomorrowMeetingText({ hubspot, meeting, timeZone, stageDecision = null }) {
   const companyName = companyNameForMeeting(meeting);
   const title = meetingTitle(meeting);
@@ -1012,6 +1020,7 @@ class SalesAdminWorkflow {
               `:warning: <@${ae.slackUserId}> meeting cancelled: *${meetingTitle(meeting)}*`,
               `Original time: ${formatLocalDateTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)}`,
               `Source: ${source}`,
+              hubspotDealLine(this.hubspot, meeting),
               meetingLinks(this.hubspot, meeting),
             ].join('\n');
             const posted = await this.safePostMessage(ae, { text });
