@@ -18,6 +18,10 @@ function compact(value) {
   return Object.fromEntries(Object.entries(value || {}).filter(([, item]) => item !== undefined && item !== null && item !== ''));
 }
 
+function uniqueValues(values = []) {
+  return [...new Set(values.map(value => String(value || '').trim()).filter(Boolean))];
+}
+
 function hubspotRecordUrl(portalId, objectTypeId, recordId) {
   if (!recordId) return '';
   return `https://app.hubspot.com/contacts/${portalId}/record/${objectTypeId}/${recordId}`;
@@ -139,6 +143,25 @@ class HubSpotSalesAdminClient {
     });
   }
 
+  async fallbackDealIdsForMeeting(contactIds = [], companyIds = []) {
+    const dealIds = [];
+    for (const companyId of companyIds.slice(0, 3)) {
+      const ids = await this.getAssociations('companies', companyId, 'deals').catch(err => {
+        this.logger.warn(`Sales admin company deal associations failed for company ${companyId}: ${err.message}`);
+        return [];
+      });
+      dealIds.push(...ids);
+    }
+    for (const contactId of contactIds.slice(0, 5)) {
+      const ids = await this.getAssociations('contacts', contactId, 'deals').catch(err => {
+        this.logger.warn(`Sales admin contact deal associations failed for contact ${contactId}: ${err.message}`);
+        return [];
+      });
+      dealIds.push(...ids);
+    }
+    return uniqueValues(dealIds);
+  }
+
   async attachAssociations(meeting) {
     const enriched = {
       ...meeting,
@@ -166,7 +189,8 @@ class HubSpotSalesAdminClient {
     ]);
     enriched._contactIds = contactIds;
     enriched._companyIds = companyIds;
-    enriched._dealIds = dealIds;
+    const directDealIds = uniqueValues(dealIds);
+    enriched._dealIds = directDealIds;
 
     enriched._contacts = await Promise.all(contactIds.slice(0, 5).map(async contactId => {
       const contact = await this.getObject('contacts', contactId, ['firstname', 'lastname', 'email', 'company', 'jobtitle']);
@@ -178,9 +202,13 @@ class HubSpotSalesAdminClient {
       return { id: company.id, ...(company.properties || {}) };
     })).catch(() => []);
 
-    enriched._deals = await Promise.all(dealIds.slice(0, 3).map(async dealId => {
+    if (enriched._dealIds.length === 0) {
+      enriched._dealIds = await this.fallbackDealIdsForMeeting(contactIds, companyIds);
+    }
+
+    enriched._deals = await Promise.all(enriched._dealIds.slice(0, 3).map(async dealId => {
       const deal = await this.getObject('deals', dealId, ['dealname', 'dealstage', 'pipeline', 'amount', 'closedate']);
-      return { id: deal.id, ...(deal.properties || {}) };
+      return { id: deal.id, ...(deal.properties || {}), _associationSource: directDealIds.includes(dealId) ? 'meeting' : 'fallback' };
     })).catch(() => []);
 
     return enriched;

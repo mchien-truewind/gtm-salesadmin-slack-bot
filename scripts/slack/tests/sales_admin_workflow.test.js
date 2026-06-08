@@ -21,6 +21,7 @@ const {
   selectedStageFromInteraction,
 } = require('../sales_admin/workflow');
 const { createSalesAdminState } = require('../sales_admin/state');
+const { HubSpotSalesAdminClient } = require('../sales_admin/hubspot_sales_admin');
 
 function meeting(properties = {}) {
   return { id: 'm1', properties };
@@ -101,6 +102,35 @@ test('sales admin Grain matching can use direct HubSpot and calendar metadata', 
   assert.equal(recordingDirectlyMatchesMeeting({ hubspot: { meeting_id: '12345' } }, { id: '12345', properties: {} }), true);
   assert.equal(recordingDirectlyMatchesMeeting({ calendar_event: { id: 'calendar-event-1' } }, meeting({ hs_meeting_source_id: 'calendar-event-1' })), true);
   assert.equal(recordingDirectlyMatchesMeeting({ calendar_event: { id: 'other' } }, meeting({ hs_meeting_source_id: 'calendar-event-1' })), false);
+});
+
+test('sales admin HubSpot enrichment falls back to company and contact deals', async () => {
+  const client = new HubSpotSalesAdminClient({
+    hubspotRequest: async () => {
+      throw new Error('unexpected raw HubSpot request');
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  client.getAssociations = async (fromType, fromId, toType) => {
+    if (fromType === 'meetings' && fromId === 'm1' && toType === 'contacts') return ['ct1'];
+    if (fromType === 'meetings' && fromId === 'm1' && toType === 'companies') return ['co1'];
+    if (fromType === 'meetings' && fromId === 'm1' && toType === 'deals') return [];
+    if (fromType === 'companies' && fromId === 'co1' && toType === 'deals') return ['deal-from-company'];
+    if (fromType === 'contacts' && fromId === 'ct1' && toType === 'deals') return ['deal-from-contact', 'deal-from-company'];
+    return [];
+  };
+  client.getObject = async (objectType, objectId) => {
+    if (objectType === 'contacts') return { id: objectId, properties: { firstname: 'Alex', lastname: 'Hill', email: 'alex@trove.com', company: 'Trove' } };
+    if (objectType === 'companies') return { id: objectId, properties: { name: 'Trove' } };
+    if (objectType === 'deals') return { id: objectId, properties: { dealname: objectId === 'deal-from-company' ? 'Trove - New Deal' : 'Trove Expansion', pipeline: '105321581', dealstage: '190380582' } };
+    throw new Error(`unexpected object ${objectType}/${objectId}`);
+  };
+
+  const enriched = await client.attachAssociations(meeting({ hs_meeting_title: 'Trove x Truewind' }));
+
+  assert.deepEqual(enriched._dealIds, ['deal-from-company', 'deal-from-contact']);
+  assert.equal(enriched._deals[0].dealname, 'Trove - New Deal');
+  assert.equal(enriched._deals[0]._associationSource, 'fallback');
 });
 
 test('sales admin roster requires channel, Slack user, and HubSpot owner', () => {
@@ -336,6 +366,41 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
   assert.equal(stats.skipped, 1);
   assert.equal(posts.length, 1);
   assert.equal(posts[0].channel, 'C_SARAH');
+});
+
+test('sales admin morning summary includes HubSpot deal links', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Xavier Marco', hubspotOwnerId: '89305622', email: 'xavier@trytruewind.com', slackUserId: 'U0AKMHVCJMA', salesAdminChannel: 'gtm-salesadmin-xavier' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-morning-deal-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('89305622', 'C_XAVIER');
+  workflow.meetingsForToday = async () => [
+    {
+      id: 'trove-meeting',
+      properties: { hs_meeting_title: 'Trove x Truewind', hs_meeting_start_time: '2026-06-08T15:00:00.000Z' },
+      _contacts: [{ id: 'ct1', firstname: 'Alex', lastname: 'Hill', email: 'alex@trove.com', company: 'Trove' }],
+      _companies: [{ id: 'co1', name: 'Trove' }],
+      _deals: [{ id: 'deal-1', dealname: 'Trove - New Deal' }],
+    },
+  ];
+
+  const stats = await workflow.runMorningSummaries(new Date('2026-06-08T14:00:00.000Z'));
+
+  assert.equal(stats.posted, 1);
+  assert.equal(posts.length, 1);
+  assert.match(posts[0].text, /Trove x Truewind/);
+  assert.match(posts[0].text, /<https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/deal-1\|Trove - New Deal>/);
 });
 
 test('sales admin tomorrow summary posts next-day calls after 5pm schedule', async () => {
