@@ -368,12 +368,21 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
   assert.equal(posts[0].channel, 'C_SARAH');
 });
 
-test('sales admin morning summary includes HubSpot deal links', async () => {
+test('sales admin morning summary includes only HubSpot deal links and omits generic tips', async () => {
   const posts = [];
   const workflow = new SalesAdminWorkflow({
     app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
     hubspotRequest: async () => ({ results: [] }),
-    anthropic: null,
+    anthropic: {
+      messages: {
+        create: async () => ({
+          content: [{
+            type: 'text',
+            text: "• I'd be happy to help, but it looks like the actual meeting notes or transcript didn't come through — only the title was shared.\n• Could you paste the meeting content? I'll pull out the key reminders right away.",
+          }],
+        }),
+      },
+    },
     env: {
       SALES_ADMIN_ENABLED: 'true',
       SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
@@ -394,6 +403,13 @@ test('sales admin morning summary includes HubSpot deal links', async () => {
       _deals: [{ id: 'deal-1', dealname: 'Trove - New Deal' }],
     },
   ];
+  workflow.hubspot.findPriorMeeting = async () => ({
+    id: 'prior-1',
+    properties: {
+      hs_meeting_title: 'Prior Trove x Truewind',
+      hs_meeting_body: 'Trove discussed finance automation but the prior notes were sparse.',
+    },
+  });
 
   const stats = await workflow.runMorningSummaries(new Date('2026-06-08T14:00:00.000Z'));
 
@@ -401,6 +417,11 @@ test('sales admin morning summary includes HubSpot deal links', async () => {
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /Trove x Truewind/);
   assert.match(posts[0].text, /<https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/deal-1\|Trove - New Deal>/);
+  assert.doesNotMatch(posts[0].text, /HubSpot meeting/);
+  assert.doesNotMatch(posts[0].text, /Alex Hill/);
+  assert.doesNotMatch(posts[0].text, /<https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-2\/co1\|Trove>/);
+  assert.doesNotMatch(posts[0].text, /Tips:/);
+  assert.doesNotMatch(posts[0].text, /Could you paste/);
 });
 
 test('sales admin tomorrow summary posts next-day calls after 5pm schedule', async () => {
@@ -448,7 +469,9 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.match(posts[0].text, /\*9:30 AM — Acme\*/);
   assert.match(posts[0].text, /Truewind Full Demo/);
   assert.match(posts[0].text, /Deal stage: Stage 2: SQL \(Full Product Demo\)/);
-  assert.match(posts[0].text, /HubSpot meeting/);
+  assert.match(posts[0].text, /<https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/d1\|Acme - New Deal>/);
+  assert.doesNotMatch(posts[0].text, /HubSpot meeting/);
+  assert.doesNotMatch(posts[0].text, /Ava Buyer/);
   assert.match(posts[0].text, /Cancelled tomorrow/);
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
@@ -587,6 +610,10 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.match(posts[0].text, /EdOps/);
   assert.match(posts[0].blocks[0].text.text, /^\*EdOps \/ Truewind\*/);
   assert.match(posts[0].blocks[0].text.text, /Meeting completed; review next steps/);
+  const contextBlock = posts[0].blocks.find(block => block.type === 'context' && block.elements?.[0]?.text?.includes('EdOps - New Deal'));
+  assert.match(contextBlock.elements[0].text, /<https:\/\/app\.hubspot\.com\/contacts\/43974586\/record\/0-3\/deal-1\|EdOps - New Deal>/);
+  assert.doesNotMatch(contextBlock.elements[0].text, /HubSpot meeting/);
+  assert.doesNotMatch(contextBlock.elements[0].text, /Grain recording/);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
   const nextStepsBlock = posts[0].blocks.find(block => block.text?.text?.includes('*Suggested follow-up from Grain*'));
   assert.match(nextStepsBlock.text.text, /1\. Send implementation pricing, confirm decision timeline, and identify finance owner for close plan _\(Due: 2026-06-10\)_/);

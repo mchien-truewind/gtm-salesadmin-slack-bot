@@ -7,6 +7,7 @@ const path = require('path');
 const {
   CONFIG,
   buildDealName,
+  calendlyCancellationMeetingProperties,
   findAllowedHostUserUri,
   getCompanyIdentityFromPayload,
   getCompanyNameFromPayload,
@@ -220,11 +221,16 @@ function testOrganizerName() {
   );
 }
 
-function testConfigHasExpectedCloseLostStage() {
+function testCancellationDoesNotConfigureClosedLostStage() {
   assert.strictEqual(CONFIG.pipelineId, '105321581');
   assert.strictEqual(CONFIG.newDealStageId, '1307720553');
-  assert.strictEqual(CONFIG.closedLostStageId, '190380587');
-  assert.strictEqual(CONFIG.closedLostReason, 'no show');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(CONFIG, 'closedLostStageId'), false);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(CONFIG, 'closedLostReason'), false);
+  assert.deepStrictEqual(
+    calendlyCancellationMeetingProperties(),
+    { hs_meeting_outcome: 'CANCELED' },
+  );
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(calendlyCancellationMeetingProperties(), 'dealstage'), false);
 }
 
 async function run() {
@@ -238,7 +244,7 @@ async function run() {
   testCompanyNameExtraction();
   testCompanyIdentityExtraction();
   testOrganizerName();
-  testConfigHasExpectedCloseLostStage();
+  testCancellationDoesNotConfigureClosedLostStage();
 }
 
 run()
