@@ -23,8 +23,6 @@ const CONFIG = {
   hubSpotPortalId: '43974586',
   pipelineId: '105321581',
   newDealStageId: '1307720553',
-  closedLostStageId: '190380587',
-  closedLostReason: 'no show',
   allowedEventTypeUris: new Set([
     'https://api.calendly.com/event_types/e742a350-d2ef-4549-a07e-7e11b00a24ab',
     'https://api.calendly.com/event_types/71ad5a08-ca70-4cb6-9ea4-d4eb5ae78e68',
@@ -330,6 +328,10 @@ function buildDealName({ companyName, organizerName, startTime }) {
 function hubspotDateMs(date = new Date()) {
   const day = date.toISOString().slice(0, 10);
   return String(new Date(`${day}T00:00:00.000Z`).getTime());
+}
+
+function calendlyCancellationMeetingProperties() {
+  return { hs_meeting_outcome: 'CANCELED' };
 }
 
 function isCalendlyApiUri(uri) {
@@ -734,7 +736,6 @@ async function handleInviteeCanceled(payload, scheduledEvent, filter) {
   const inviteeUri = getInviteeUri(payload);
   const deal = await findDealByCalendlyIdentifiers({ inviteeUri, eventUri });
   const meeting = await findMeetingByCalendlyIdentifiers({ inviteeUri, eventUri });
-  const contact = payload.email ? await findContactByEmail(payload.email) : null;
 
   if (!deal) return { action: 'cancel_ignored_no_deal' };
 
@@ -742,23 +743,13 @@ async function handleInviteeCanceled(payload, scheduledEvent, filter) {
     return { action: 'reschedule_note_deferred_to_created_event', dealId: deal.id, meetingId: meeting?.id };
   }
 
-  await hubspotRequest(`/crm/v3/objects/deals/${deal.id}`, {
-    method: 'PATCH',
-    body: {
-      properties: {
-        dealstage: CONFIG.closedLostStageId,
-        closed_lost_reason: CONFIG.closedLostReason,
-        closedate: hubspotDateMs(),
-      },
-    },
-  });
   if (meeting) {
     await hubspotRequest(`/crm/v3/objects/meetings/${meeting.id}`, {
       method: 'PATCH',
-      body: { properties: { hs_meeting_outcome: 'NO_SHOW' } },
+      body: { properties: calendlyCancellationMeetingProperties() },
     }).catch(() => null);
   }
-  return { action: 'closed_lost_no_show', dealId: deal.id, meetingId: meeting?.id };
+  return { action: 'canceled_no_stage_change', dealId: deal.id, meetingId: meeting?.id };
 }
 
 async function processCalendlyWebhook(body) {
@@ -843,6 +834,7 @@ async function handleCalendlyHubSpotWebhook(req, res, { logger = console } = {})
 module.exports = {
   CONFIG,
   buildDealName,
+  calendlyCancellationMeetingProperties,
   findAllowedHostUserUri,
   getCompanyNameFromPayload,
   getCompanyIdentityFromPayload,
