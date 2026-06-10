@@ -279,15 +279,11 @@ function slackPlainText(value, maxLength = 75) {
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 3)}...`;
 }
 
-function meetingLinks(hubspot, meeting) {
-  const links = [slackLink(hubspot.recordUrl('meetings', meeting.id), 'HubSpot meeting')];
-  const contact = primaryContact(meeting);
-  const company = primaryCompany(meeting);
+function dealLink(hubspot, meeting, stageDecision = null) {
   const deal = primaryDeal(meeting);
-  if (contact?.id) links.push(slackLink(hubspot.recordUrl('contacts', contact.id), contactLabel(contact)));
-  if (company?.id) links.push(slackLink(hubspot.recordUrl('companies', company.id), company.name || 'Company'));
-  if (deal?.id) links.push(slackLink(hubspot.recordUrl('deals', deal.id), deal.dealname || 'Deal'));
-  return links.join(' | ');
+  const dealId = deal?.id || stageDecision?.dealId || '';
+  if (!dealId) return 'HubSpot deal: No associated deal found';
+  return slackLink(hubspot.recordUrl('deals', dealId), deal?.dealname || stageDecision?.dealName || 'HubSpot deal');
 }
 
 function hubspotDealLine(hubspot, meeting) {
@@ -306,7 +302,7 @@ function tomorrowMeetingText({ hubspot, meeting, timeZone, stageDecision = null 
   ];
   if (title && title !== companyName) lines.push(slackMrkdwn(title));
   if (stageDecision?.currentStageLabel) lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
-  lines.push(meetingLinks(hubspot, meeting));
+  lines.push(dealLink(hubspot, meeting));
   return lines.join('\n');
 }
 
@@ -547,28 +543,42 @@ async function extractNextSteps({ anthropic, recording, logger = console }) {
 }
 
 async function extractPriorTips({ anthropic, priorMeeting, logger = console }) {
-  if (!priorMeeting) return ['No prior meeting context found.'];
+  if (!priorMeeting) return [];
   const props = priorMeeting.properties || {};
   const text = [props.hs_meeting_title, props.hs_meeting_body].filter(Boolean).join('\n\n').slice(0, 5000);
-  if (!text) return ['Prior meeting found, but no notes were available.'];
-  if (!anthropic) return [String(props.hs_meeting_title || 'Review prior HubSpot meeting notes.')];
+  if (!text || !props.hs_meeting_body) return [];
+  if (!anthropic) return [];
   try {
     const res = await anthropic.messages.create({
       model: process.env.SALES_ADMIN_CLAUDE_MODEL || 'claude-sonnet-4-6',
       max_tokens: 300,
-      system: 'Extract concise reminders for an AE before a follow-up sales meeting.',
+      system: 'Extract concise reminders for an AE before a follow-up sales meeting. Never ask for more content.',
       messages: [{
         role: 'user',
-        content: `Return 1-3 short bullet reminders from this prior meeting. No preamble.\n\n${text}`,
+        content: `Return 1-3 short bullet reminders from this prior meeting. No preamble. If there are no concrete reminders in the notes, return no bullets.\n\n${text}`,
       }],
     });
     const responseText = res.content?.find(block => block.type === 'text')?.text || '';
-    const tips = responseText.split(/\n+/).map(line => line.replace(/^[-*•]\s*/, '').trim()).filter(Boolean).slice(0, 3);
-    return tips.length ? tips : ['Review prior HubSpot meeting notes.'];
+    return responseText
+      .split(/\n+/)
+      .map(line => line.replace(/^[-*•]\s*/, '').trim())
+      .filter(Boolean)
+      .filter(isUsefulPriorTip)
+      .slice(0, 3);
   } catch (err) {
     logger.warn(`Sales admin prior-tip extraction failed: ${err.message}`);
-    return ['Review prior HubSpot meeting notes.'];
+    return [];
   }
+}
+
+function isUsefulPriorTip(tip) {
+  const text = normalizeDigestText(tip);
+  if (!text) return false;
+  if (/\b(actual meeting notes|actual transcript|meeting content|paste|provide|send|share).*\b(notes|transcript|content)\b/.test(text)) return false;
+  if (/\b(notes|transcript|content)\b.*\b(didn'?t come through|missing|not available|unavailable|not provided)\b/.test(text)) return false;
+  if (/\bi'?d be happy to help\b/.test(text)) return false;
+  if (/\bcould you\b.*\b(paste|provide|send|share)\b/.test(text)) return false;
+  return true;
 }
 
 function inputElement(initialValue) {
@@ -763,7 +773,7 @@ function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, g
     : `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. Meeting completed; review next steps.`;
   return [
     { type: 'section', text: { type: 'mrkdwn', text } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${dealLink(hubspot, meeting, stageDecision)}` }] },
     ...(stageDecision ? [{
       type: 'section',
       block_id: 'deal_stage',
@@ -940,8 +950,8 @@ class SalesAdminWorkflow {
             const prior = await this.hubspot.findPriorMeeting(meeting);
             const tips = await extractPriorTips({ anthropic: this.anthropic, priorMeeting: prior, logger: this.logger });
             lines.push(`\n*${formatLocalTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)} - ${meetingTitle(meeting)}*`);
-            lines.push(meetingLinks(this.hubspot, meeting));
-            lines.push(`Tips: ${tips.map(tip => `• ${tip}`).join(' ')}`);
+            lines.push(dealLink(this.hubspot, meeting));
+            if (tips.length) lines.push(`Tips: ${tips.map(tip => `• ${tip}`).join(' ')}`);
           }
           if (cancelled.length > 0) {
             lines.push('\n*Cancelled today, not yet separately alerted:*');
@@ -1026,7 +1036,6 @@ class SalesAdminWorkflow {
               `Original time: ${formatLocalDateTime(meeting.properties?.hs_meeting_start_time, this.config.timezone)}`,
               `Source: ${source}`,
               hubspotDealLine(this.hubspot, meeting),
-              meetingLinks(this.hubspot, meeting),
             ].join('\n');
             const posted = await this.safePostMessage(ae, { text });
             const alertRecord = { type: 'cancel', ae, meetingId: meeting.id, source, slackTs: posted.ts, slackChannel: posted.channel || this.channelFor(ae), status: 'alerted', hubspotNoteStatus: 'pending' };
