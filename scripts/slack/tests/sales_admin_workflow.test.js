@@ -134,14 +134,14 @@ test('sales admin HubSpot enrichment falls back to company and contact deals', a
 });
 
 test('sales admin roster requires channel, Slack user, and HubSpot owner', () => {
-  const roster = parseRoster(JSON.stringify([{ name: 'Alex Lee', hubspotOwnerId: '60918610', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: '#gtm-salesadmin-alex' }]));
-  assert.deepEqual(roster, [{ name: 'Alex Lee', hubspotOwnerId: '60918610', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' }]);
+  const roster = parseRoster(JSON.stringify([{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: '#gtm-salesadmin-alex' }]));
+  assert.deepEqual(roster, [{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' }]);
   assert.throws(() => parseRoster(JSON.stringify([{ name: 'Missing Channel', hubspotOwnerId: '1', email: 'a@example.com', slackUserId: 'U1' }])), /salesAdminChannel/);
 });
 
 test('sales admin default roster includes confirmed Alex and Amy IDs', () => {
   const byName = Object.fromEntries(DEFAULT_AE_ROSTER.map(ae => [ae.name, ae]));
-  assert.equal(byName['Alex Lee'].hubspotOwnerId, '60918610');
+  assert.equal(byName['Alex Lee'].hubspotOwnerId, '559564379');
   assert.equal(byName['Alex Lee'].slackUserId, 'U04BPMPR29G');
   assert.equal(byName['Amy Vetter'].hubspotOwnerId, '92555980');
   assert.equal(byName['Amy Vetter'].slackUserId, 'U0B4MRN83FE');
@@ -350,7 +350,7 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
       SALES_ADMIN_ENABLED: 'true',
       SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
         { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
-        { name: 'Alex Lee', hubspotOwnerId: '60918610', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
+        { name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
       ]),
       SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-skip-${Date.now()}-${Math.random()}.json`),
       SLACK_BOT_TOKEN: 'xoxb-test',
@@ -358,7 +358,7 @@ test('sales admin skips configured AEs whose channel has not resolved', async ()
     logger: { log() {}, warn() {}, error() {} },
   });
   workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
-  workflow.missingChannelsByOwnerId.add('60918610');
+  workflow.missingChannelsByOwnerId.add('559564379');
   workflow.meetingsForToday = async () => [];
 
   const stats = await workflow.runMorningSummaries(new Date('2026-06-03T18:00:00.000Z'));

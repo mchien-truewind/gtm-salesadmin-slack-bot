@@ -20,7 +20,7 @@ const DEFAULT_AE_ROSTER = [
   { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
   { name: 'Jenilee Chen', hubspotOwnerId: '91143842', email: 'jenilee@trytruewind.com', slackUserId: 'U0ATZSNCE5T', salesAdminChannel: 'gtm-salesadmin-jenilee' },
   { name: 'Mercedes Chien', hubspotOwnerId: '87811681', email: 'mercedes@trytruewind.com', slackUserId: 'U0ABULY5TEK', salesAdminChannel: 'gtm-salesadmin-mercedes' },
-  { name: 'Alex Lee', hubspotOwnerId: '60918610', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
+  { name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' },
   { name: 'Amy Vetter', hubspotOwnerId: '92555980', email: 'amy@trytruewind.com', slackUserId: 'U0B4MRN83FE', salesAdminChannel: 'gtm-salesadmin-amy' },
 ];
 
