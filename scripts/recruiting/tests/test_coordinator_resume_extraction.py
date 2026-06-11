@@ -237,6 +237,8 @@ class SlackMentionBehaviorTests(unittest.TestCase):
             self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "")
         with mock.patch.dict(os.environ, {"RECRUITING_SLACK_MENTION_USER_ID": "U123"}, clear=True):
             self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U123")
+        with mock.patch.dict(os.environ, {"SLACK_USER_ID": "U0ANATFF8BB"}, clear=True):
+            self.assertEqual(cli.resolve_recruiting_slack_mention_user_id(), "U0ABULY5TEK")
 
     def test_blank_slack_mention_user_id_does_not_fallback_to_auth_test(self):
         candidate = {

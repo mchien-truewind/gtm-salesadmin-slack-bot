@@ -406,10 +406,7 @@ def parse_csv_set(value: str, default: str = "") -> set[str]:
 
 
 def resolve_recruiting_slack_mention_user_id() -> str:
-    configured = (
-        os.getenv("RECRUITING_SLACK_MENTION_USER_ID", "").strip()
-        or os.getenv("SLACK_USER_ID", "").strip()
-    )
+    configured = os.getenv("RECRUITING_SLACK_MENTION_USER_ID", "").strip()
     if configured.lower() in {"none", "off", "false", "0"}:
         return ""
     return configured or DEFAULT_RECRUITING_SLACK_MENTION_USER_ID
