@@ -13,6 +13,7 @@ const {
   cancellationSourceLabel,
   classifyMeetingStatus,
   getLocalDayRange,
+  hubspotNextStepSummary,
   meetingEndMs,
   msUntilNextLocalTime,
   parseRoster,
@@ -517,6 +518,24 @@ test('sales admin compacts long Grain summaries for HubSpot next step', async ()
   assert.doesNotMatch(extraction.summary, /##|\*\*/);
   assert.match(extraction.summary, /EdOps is evaluating Truewind/);
   assert.match(extraction.summary, /send pricing/);
+});
+
+test('sales admin HubSpot next step stops at a complete phrase', () => {
+  const summary = hubspotNextStepSummary({
+    meeting: {
+      properties: { hs_meeting_title: 'Diocese of San Bernardino - Xavier Marco - 2026-05-21' },
+      _companies: [{ name: 'Diocese of San Bernardino' }],
+    },
+    extraction: {
+      summary: 'Full demo rescheduled to Monday at 12 PM Pacific after conflicts; confirm Angie availability for the Monday noon meeting',
+      nextSteps: [{ text: 'Send rescheduled meeting invite for Monday at noon' }],
+    },
+    datePrefix: '06/15',
+  });
+
+  assert.equal(summary, '06/15: Send rescheduled meeting invite for Monday at noon; Full demo rescheduled to Monday at 12 PM Pacific after conflicts');
+  assert.ok(summary.replace(/^06\/15:\s*/, '').split(/\s+/).length <= 20);
+  assert.doesNotMatch(summary, /;\s*confirm$/i);
 });
 
 test('sales admin resolves public channels without requiring private channel scope', async () => {

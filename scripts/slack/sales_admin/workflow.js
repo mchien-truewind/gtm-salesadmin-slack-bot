@@ -396,6 +396,25 @@ function wordParts(value) {
   return String(value || '').trim().split(/\s+/).filter(Boolean);
 }
 
+function truncateToCompletePhrase(value, maxWords) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  const words = wordParts(text);
+  if (!maxWords || words.length <= maxWords) return text;
+
+  const candidate = words.slice(0, maxWords).join(' ');
+  const boundaryMatches = [...candidate.matchAll(/[.;!?](?=\s|$)/g)];
+  const lastBoundary = boundaryMatches[boundaryMatches.length - 1];
+  if (lastBoundary) {
+    const complete = candidate.slice(0, lastBoundary.index).replace(/[.;!?\s]+$/g, '').trim();
+    if (wordParts(complete).length >= 6) return complete;
+  }
+
+  const trimmed = candidate
+    .replace(/\s+(?:and|or|but|to|for|with|about|after|before|confirm|check|send|share|schedule|attend|cover|follow|review|discuss|finalize)$/i, '')
+    .trim();
+  return trimmed || candidate;
+}
+
 function compactCroNextStepPhrase(value, extraction = null) {
   let phrase = cleanSalesSummaryText(value)
     .replace(/^(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}-\d{1,2}-\d{1,2}|\?\?\/\?\?|tbd)\s*:\s*/i, '')
@@ -407,7 +426,7 @@ function compactCroNextStepPhrase(value, extraction = null) {
     phrase = `${phrase}; ${summary}`.replace(/\s+/g, ' ').trim();
   }
   const words = wordParts(phrase);
-  if (words.length > 20) return words.slice(0, 20).join(' ');
+  if (words.length > 20) return truncateToCompletePhrase(phrase, 20);
   return phrase;
 }
 
@@ -1452,6 +1471,7 @@ module.exports = {
   extractNextSteps,
   getLocalDayRange,
   buildStageDecision,
+  hubspotNextStepSummary,
   meetingEndMs,
   msUntilNextLocalTime,
   parseRoster,
