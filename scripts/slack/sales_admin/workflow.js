@@ -305,7 +305,16 @@ function tomorrowMeetingText({ hubspot, meeting, timeZone, stageDecision = null 
     `*${formatLocalTime(meeting.properties?.hs_meeting_start_time, timeZone)} — ${slackMrkdwn(companyName)}*`,
   ];
   if (title && title !== companyName) lines.push(slackMrkdwn(title));
-  if (stageDecision?.currentStageLabel) lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
+  if (stageDecision?.currentStageIsClosed) {
+    // A closed deal shouldn't have an upcoming call. Don't hide it — flag it loudly so
+    // the rep verifies whether the meeting is real (it may have been cancelled on the
+    // calendar without HubSpot picking it up) or the deal status needs fixing.
+    lines.push(`:rotating_light: *${slackMrkdwn(stageDecision.currentStageLabel)} — please check.* Deal is closed but a call is still on the calendar. Confirm this meeting is really happening; it may have been cancelled.`);
+  } else if (stageDecision?.currentStageLabel) {
+    lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
+  } else if (!primaryDeal(meeting)) {
+    lines.push('_No deal attached._');
+  }
   lines.push(meetingLinks(hubspot, meeting));
   return lines.join('\n');
 }
@@ -777,35 +786,45 @@ function postMeetingActionElements(promptKey, defaultNoShow = false) {
 function buildPostMeetingBlocks({ ae, meeting, hubspot, extraction, promptKey, grainUrl, grainSource = '', nextStepDatePrefix = '', stageDecision }) {
   const companyName = companyNameForMeeting(meeting);
   const defaultNoShow = shouldDefaultNoShow({ grainSource, extraction });
-  const text = defaultNoShow
-    ? `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. No Grain recording was found, so default to *No-Show* unless this meeting happened.`
-    : `*${slackMrkdwn(companyName)}*\nPost-meeting check for <@${ae.slackUserId}>. Meeting completed; review next steps.`;
+  const contextLine = {
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }],
+  };
+
+  if (defaultNoShow) {
+    // No recording → almost certainly a no-show. Keep it to a single ask; stage
+    // and next-step don't apply to a no-show, so don't clutter the message.
+    const contact = primaryContact(meeting);
+    const who = contact ? contactLabel(contact) : 'the attendee';
+    return [
+      { type: 'section', text: { type: 'mrkdwn', text: `*${slackMrkdwn(companyName)} — ${slackMrkdwn(who)}*\nDoesn't look like they showed up (no Grain recording). Mark as a confirmed *No-Show* in HubSpot?` } },
+      contextLine,
+      { type: 'actions', elements: postMeetingActionElements(promptKey, true) },
+    ];
+  }
+
+  // Meeting happened → keep the useful actions: the deal-stage dropdown and the
+  // HubSpot Next step. The verbose "Suggested follow-up from Grain" block is removed.
   return [
-    { type: 'section', text: { type: 'mrkdwn', text } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `${formatLocalDateTime(meeting.properties?.hs_meeting_start_time)} | ${meetingLinks(hubspot, meeting)}${grainUrl ? ` | <${grainUrl}|Grain recording>` : ''}` }] },
+    { type: 'section', text: { type: 'mrkdwn', text: `*${slackMrkdwn(companyName)}* — meeting completed.` } },
+    contextLine,
     ...(stageDecision ? [{
       type: 'section',
       block_id: 'deal_stage',
       text: { type: 'mrkdwn', text: stageBlockText(stageDecision) },
       accessory: stageSelectElement(stageDecision, stageDecision.recommendedStageId),
     }] : []),
-    { type: 'section', text: { type: 'mrkdwn', text: nextStepsBlockText(extraction) } },
     { type: 'section', text: { type: 'mrkdwn', text: hubspotNextStepBlockText({ meeting, extraction, datePrefix: nextStepDatePrefix }) } },
     {
       type: 'context',
       elements: [{
         type: 'mrkdwn',
-        text: defaultNoShow
-          ? ':information_source: Click *No-Show* if the meeting did not happen. If it did happen, use *Confirm Completed* or *Edit Notes*.'
-          : stageDecision
+        text: stageDecision
           ? ':information_source: *Confirm & Save* updates HubSpot `Next step`, writes a note, and applies the selected deal stage.'
           : ':information_source: *Confirm & Save* updates HubSpot `Next step` and writes a note.',
       }],
     },
-    {
-      type: 'actions',
-      elements: postMeetingActionElements(promptKey, defaultNoShow),
-    },
+    { type: 'actions', elements: postMeetingActionElements(promptKey, false) },
   ];
 }
 
@@ -1249,6 +1268,11 @@ class SalesAdminWorkflow {
     const nextStepPropertyUpdate = status === 'no_show'
       ? { updated: false, reason: 'No-show confirmation does not update HubSpot Next step.' }
       : await this.updateHubSpotNextStep(record, effectiveHubSpotNextStep).catch(err => ({ updated: false, reason: err.message }));
+    const meetingOutcomeUpdate = status === 'no_show'
+      ? await this.hubspot.updateMeetingOutcome(meeting.id, 'NO_SHOW')
+          .then(() => ({ updated: true }))
+          .catch(err => ({ updated: false, reason: err.message }))
+      : { updated: false, reason: 'not a no-show' };
     const body = buildWritebackNote({
       ae,
       meeting,
@@ -1262,8 +1286,11 @@ class SalesAdminWorkflow {
       stageUpdate,
       nextStepPropertyUpdate,
     });
+    const noShowOutcomeLine = status === 'no_show'
+      ? `\nHubSpot meeting outcome set to No-Show.${meetingOutcomeUpdate.updated ? '' : ` (outcome update failed: ${meetingOutcomeUpdate.reason})`}`
+      : '';
     const note = await this.hubspot.createNote({
-      body: `${body}\nConfirmed by Slack user: ${slackUserId || 'unknown'}`,
+      body: `${body}${noShowOutcomeLine}\nConfirmed by Slack user: ${slackUserId || 'unknown'}`,
       meeting,
       contacts: meeting._contacts || [],
       companies: meeting._companies || [],
@@ -1295,6 +1322,7 @@ class SalesAdminWorkflow {
       selectedStageId: effectiveStageId,
       stageUpdate,
       nextStepPropertyUpdate,
+      meetingOutcomeUpdate,
       writebackStatus: 'written',
       status: status === 'no_show' ? 'no_show' : 'confirmed',
     });
@@ -1305,7 +1333,7 @@ class SalesAdminWorkflow {
         token: this.env.SLACK_BOT_TOKEN,
         channel,
         thread_ts: threadTs,
-        text: `Recorded in HubSpot. Note ID: ${note.id}${nextStepPropertyUpdate?.updated ? '; Next step updated' : ''}${stageUpdate?.updated ? `; deal moved to ${stageUpdate.toLabel}` : ''}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
+        text: `Recorded in HubSpot. Note ID: ${note.id}${status === 'no_show' ? '; marked No-Show' : ''}${nextStepPropertyUpdate?.updated ? '; Next step updated' : ''}${stageUpdate?.updated ? `; deal moved to ${stageUpdate.toLabel}` : ''}${taskIds.length ? `; tasks: ${taskIds.join(', ')}` : ''}`,
       }).catch(err => this.logger.warn(`Sales admin confirmation Slack reply failed: ${err.message}`));
     }
     return updated;

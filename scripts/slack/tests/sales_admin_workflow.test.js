@@ -454,6 +454,44 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
 
+test('sales admin tomorrow summary flags closed-deal meetings instead of hiding them', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-closed-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.meetingsForTomorrow = async () => [
+    {
+      id: 'm1',
+      properties: { hs_meeting_title: 'Truewind Intro', hs_meeting_start_time: '2026-06-04T16:30:00.000Z' },
+      _companies: [{ id: 'c1', name: 'GRF' }],
+      _deals: [{ id: 'd1', dealname: 'GRF - Sarah Elix', pipeline: '105321581', dealstage: '190380587' }], // Closed/Lost
+      _contacts: [{ id: 'ct1', firstname: 'Andrew', lastname: 'Deyhle' }],
+    },
+  ];
+  const closedStages = STAGES.map(stage => stage.id === '190380587' ? { ...stage, metadata: { isClosed: 'true' } } : stage);
+  workflow.buildStageDecisionForMeeting = async meeting => buildStageDecision({ deal: meeting._deals?.[0], stages: closedStages });
+
+  await workflow.runTomorrowSummaries(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(posts.length, 1);
+  // Surfaced (not hidden) with an alarm, and NOT shown as a plain stage line.
+  assert.match(posts[0].text, /:rotating_light:/);
+  assert.match(posts[0].text, /please check/i);
+  assert.ok(!/Deal stage: Stage 7: Closed\/Lost/.test(posts[0].text), 'closed deal shows the alarm, not a plain stage line');
+});
+
 test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
   const workflow = new SalesAdminWorkflow({
     app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
@@ -605,10 +643,10 @@ test('sales admin post-meeting scan can force a single targeted meeting', async 
   assert.equal(posts.length, 1);
   assert.match(posts[0].text, /EdOps/);
   assert.match(posts[0].blocks[0].text.text, /^\*EdOps \/ Truewind\*/);
-  assert.match(posts[0].blocks[0].text.text, /Meeting completed; review next steps/);
+  assert.match(posts[0].blocks[0].text.text, /meeting completed/i);
   assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Outcome from Grain*')));
-  const nextStepsBlock = posts[0].blocks.find(block => block.text?.text?.includes('*Suggested follow-up from Grain*'));
-  assert.match(nextStepsBlock.text.text, /1\. Send implementation pricing, confirm decision timeline, and identify finance owner for close plan _\(Due: 2026-06-10\)_/);
+  // The verbose "Suggested follow-up from Grain" block was removed.
+  assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Suggested follow-up from Grain*')), 'Grain follow-up block should be removed');
   const hubspotNextStepBlock = posts[0].blocks.find(block => block.text?.text?.includes('*HubSpot Next Step*'));
   assert.match(hubspotNextStepBlock.text.text, /saved to HubSpot under `Next step`/);
   assert.match(hubspotNextStepBlock.text.text, /\d{2}\/\d{2}: Send implementation pricing, confirm decision timeline, and identify finance owner for close plan/);
@@ -843,10 +881,12 @@ test('sales admin post-meeting prompt defaults to no-show when no Grain recordin
 
   assert.equal(stats.prompted, 1);
   const headerBlock = posts[0].blocks[0];
-  assert.match(headerBlock.text.text, /No Grain recording was found/);
-  assert.match(headerBlock.text.text, /default to \*No-Show\*/);
-  const contextBlock = posts[0].blocks.find(block => block.type === 'context' && block.elements?.[0]?.text?.includes('Click *No-Show*'));
-  assert.ok(contextBlock);
+  assert.match(headerBlock.text.text, /Doesn't look like they showed up/);
+  assert.match(headerBlock.text.text, /\*No-Show\*/);
+  // No-show message is minimal: header, context line, actions — no stage/next-step/Grain blocks.
+  assert.ok(!posts[0].blocks.some(block => block.block_id === 'deal_stage'), 'no stage block on no-show');
+  assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*HubSpot Next Step*')), 'no next-step block on no-show');
+  assert.ok(!posts[0].blocks.some(block => block.text?.text?.includes('*Suggested follow-up from Grain*')), 'no Grain block on no-show');
   const actions = posts[0].blocks.find(block => block.type === 'actions');
   assert.deepEqual(actions.elements.map(element => element.type === 'button' ? element.text.text : element.options[0].text.text), ['No-Show', 'Confirm Completed', 'Edit Notes', 'Not this meeting']);
   assert.equal(actions.elements[0].style, 'primary');
@@ -909,6 +949,50 @@ test('sales admin confirmation updates HubSpot deal next step summary', async ()
   assert.equal(updated.nextStepPropertyUpdate.updated, true);
   assert.match(notes[0], /HubSpot Next step: 06\/08: Send pricing; Acme is interested/);
   assert.match(notes[0], /- Send pricing/);
+});
+
+test('sales admin no-show sets HubSpot meeting outcome and writes a no-show note', async () => {
+  const outcomeCalls = [];
+  const notes = [];
+  let stageUpdated = false;
+  let nextStepUpdated = false;
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async () => ({ ts: 'reply' }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-noshow-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.hubspot = {
+    updateDealStage: async () => { stageUpdated = true; return {}; },
+    updateDealProperty: async () => { nextStepUpdated = true; return {}; },
+    updateMeetingOutcome: async (meetingId, outcome) => { outcomeCalls.push({ meetingId, outcome }); return {}; },
+    createNote: async input => { notes.push(input.body); return { id: 'note-1' }; },
+    createTask: async () => ({ id: 'task-1' }),
+  };
+  workflow.state.set('post:m1:84547076', {
+    ae: { name: 'Sarah Elix', email: 'sarah@trytruewind.com', hubspotOwnerId: '84547076' },
+    meeting: { id: 'm1', properties: { hs_meeting_title: 'Intro', hs_meeting_start_time: '2026-06-03T18:00:00.000Z' }, _deals: [{ id: 'deal-1' }] },
+    extraction: { summary: '', nextSteps: [] },
+    slackChannel: 'C_SARAH',
+    slackTs: '1',
+  });
+
+  const updated = await workflow.writeMeetingOutcome('post:m1:84547076', { status: 'no_show', slackUserId: 'U_TEST' });
+
+  assert.deepEqual(outcomeCalls, [{ meetingId: 'm1', outcome: 'NO_SHOW' }]);
+  assert.equal(stageUpdated, false, 'no-show must not move the deal stage');
+  assert.equal(nextStepUpdated, false, 'no-show must not update Next step');
+  assert.equal(updated.status, 'no_show');
+  assert.match(notes[0], /No[- ]?show/i);
+  assert.match(notes[0], /meeting outcome set to No-Show/i);
 });
 
 test('sales admin edit action acks before opening modal', async () => {
