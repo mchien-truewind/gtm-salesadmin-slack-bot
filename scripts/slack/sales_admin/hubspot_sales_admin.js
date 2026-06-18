@@ -143,6 +143,13 @@ class HubSpotSalesAdminClient {
     });
   }
 
+  async updateMeetingOutcome(meetingId, outcome) {
+    if (!meetingId || !outcome) return null;
+    return this.hubspotRequest(`/crm/v3/objects/meetings/${encodeURIComponent(meetingId)}`, 'PATCH', {
+      properties: { hs_meeting_outcome: String(outcome) },
+    });
+  }
+
   async fallbackDealIdsForMeeting(contactIds = [], companyIds = []) {
     const dealIds = [];
     for (const companyId of companyIds.slice(0, 3)) {
