@@ -305,7 +305,16 @@ function tomorrowMeetingText({ hubspot, meeting, timeZone, stageDecision = null 
     `*${formatLocalTime(meeting.properties?.hs_meeting_start_time, timeZone)} — ${slackMrkdwn(companyName)}*`,
   ];
   if (title && title !== companyName) lines.push(slackMrkdwn(title));
-  if (stageDecision?.currentStageLabel) lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
+  if (stageDecision?.currentStageIsClosed) {
+    // A closed deal shouldn't have an upcoming call. Don't hide it — flag it loudly so
+    // the rep verifies whether the meeting is real (it may have been cancelled on the
+    // calendar without HubSpot picking it up) or the deal status needs fixing.
+    lines.push(`:rotating_light: *${slackMrkdwn(stageDecision.currentStageLabel)} — please check.* Deal is closed but a call is still on the calendar. Confirm this meeting is really happening; it may have been cancelled.`);
+  } else if (stageDecision?.currentStageLabel) {
+    lines.push(`Deal stage: ${slackMrkdwn(stageDecision.currentStageLabel)}`);
+  } else if (!primaryDeal(meeting)) {
+    lines.push('_No deal attached._');
+  }
   lines.push(meetingLinks(hubspot, meeting));
   return lines.join('\n');
 }

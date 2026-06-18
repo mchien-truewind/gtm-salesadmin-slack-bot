@@ -454,6 +454,44 @@ test('sales admin tomorrow summary posts next-day calls after 5pm schedule', asy
   assert.equal(workflow.state.get('tomorrow:2026-06-04:84547076').status, 'posted');
 });
 
+test('sales admin tomorrow summary flags closed-deal meetings instead of hiding them', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-closed-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  workflow.meetingsForTomorrow = async () => [
+    {
+      id: 'm1',
+      properties: { hs_meeting_title: 'Truewind Intro', hs_meeting_start_time: '2026-06-04T16:30:00.000Z' },
+      _companies: [{ id: 'c1', name: 'GRF' }],
+      _deals: [{ id: 'd1', dealname: 'GRF - Sarah Elix', pipeline: '105321581', dealstage: '190380587' }], // Closed/Lost
+      _contacts: [{ id: 'ct1', firstname: 'Andrew', lastname: 'Deyhle' }],
+    },
+  ];
+  const closedStages = STAGES.map(stage => stage.id === '190380587' ? { ...stage, metadata: { isClosed: 'true' } } : stage);
+  workflow.buildStageDecisionForMeeting = async meeting => buildStageDecision({ deal: meeting._deals?.[0], stages: closedStages });
+
+  await workflow.runTomorrowSummaries(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(posts.length, 1);
+  // Surfaced (not hidden) with an alarm, and NOT shown as a plain stage line.
+  assert.match(posts[0].text, /:rotating_light:/);
+  assert.match(posts[0].text, /please check/i);
+  assert.ok(!/Deal stage: Stage 7: Closed\/Lost/.test(posts[0].text), 'closed deal shows the alarm, not a plain stage line');
+});
+
 test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
   const workflow = new SalesAdminWorkflow({
     app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
