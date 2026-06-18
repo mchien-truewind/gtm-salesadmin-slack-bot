@@ -1,4 +1,5 @@
 const path = require('path');
+const https = require('https');
 const {
   dedupeDigestMeetings,
   dedupeGrainRecordings,
@@ -83,8 +84,50 @@ function buildConfig(env = process.env) {
     grainToken: env.GRAIN_API_TOKEN || env.GRAIN_API || env.GRAIN_ACCESS_TOKEN || env.GRAIN_WORKSPACE_TOKEN || '',
     grainBaseUrl: env.GRAIN_API_BASE || 'https://api.grain.com/_/public-api/v2',
     grainTeamId: String(env.SALES_ADMIN_GRAIN_TEAM_ID || '').trim(),
+    calendlyToken: env.CALENDLY_API_MASTER || env.CALENDLY_API || env.CALENDLY_API_KEY || '',
+    calendlyBaseUrl: (env.CALENDLY_API_BASE || 'https://api.calendly.com').replace(/\/$/, ''),
+    calendlyOrganization: String(env.CALENDLY_ORGANIZATION || '').trim(),
     roster: parseRoster(env.SALES_ADMIN_AE_ROSTER_JSON),
   };
+}
+
+// Calendly is the source of truth for booked intro meetings. Known AE Calendly user
+// URIs (from calendly_hubspot.js). Andrew/Ari are not mapped yet — they fall back to the
+// HubSpot cancellation signal until their Calendly user URIs are added (here or via the
+// roster's optional calendlyUserUri field).
+const CALENDLY_USER_URI_BY_OWNER = {
+  '84547076': 'https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', // Sarah Elix
+  '89305622': 'https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', // Xavier Marco
+  '92555980': 'https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b', // Amy Vetter
+};
+
+function calendlyUserUriForAe(ae = {}) {
+  return ae.calendlyUserUri || CALENDLY_USER_URI_BY_OWNER[String(ae.hubspotOwnerId || '')] || '';
+}
+
+function calendlyHttpGetJson(url, token, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    // Calendly sits behind Cloudflare, which 1010-bans requests with no/bot User-Agent.
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    };
+    const req = https.request(url, { method: 'GET', headers }, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`Calendly ${res.statusCode}: ${String(data).slice(0, 200)}`));
+          return;
+        }
+        try { resolve(JSON.parse(data)); } catch (err) { reject(err); }
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('Calendly request timed out')));
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 function getTimeZoneOffsetMs(date, timeZone) {
@@ -189,6 +232,9 @@ function formatLocalDateTime(iso, timeZone = 'America/Los_Angeles') {
 }
 
 function classifyMeetingStatus(meeting) {
+  // Calendly is the source of truth for booked meetings — its verdict overrides
+  // HubSpot's (possibly stale/duplicate) record when we were able to check it.
+  if (meeting?._calendlyStatus === 'canceled') return 'cancelled';
   const props = meeting?.properties || {};
   const title = normalizeDigestText(props.hs_meeting_title || meeting?.title || '');
   const outcome = String(props.hs_meeting_outcome || '').trim().toUpperCase();
@@ -949,7 +995,60 @@ class SalesAdminWorkflow {
     const { start, end } = getLocalDayRange(now, this.config.timezone, dayOffset);
     const meetings = await this.hubspot.searchMeetingsForOwnerBetween(ae.hubspotOwnerId, start, end);
     const enriched = await Promise.all(meetings.map(meeting => this.hubspot.attachAssociations(meeting)));
-    return dedupeDigestMeetings(enriched);
+    const deduped = dedupeDigestMeetings(enriched);
+    await this.annotateCalendlyStatus(ae, deduped, { start, end });
+    return deduped;
+  }
+
+  // Calendly is the booking source of truth (used for intro meetings). Org-level event
+  // reads require the organization URI alongside the user URI; fetch it once and cache.
+  async getCalendlyOrganization() {
+    if (this.config.calendlyOrganization) return this.config.calendlyOrganization;
+    if (this._calendlyOrgUri !== undefined) return this._calendlyOrgUri;
+    this._calendlyOrgUri = '';
+    try {
+      const me = await calendlyHttpGetJson(`${this.config.calendlyBaseUrl}/users/me`, this.config.calendlyToken);
+      this._calendlyOrgUri = me?.resource?.current_organization || '';
+    } catch (err) {
+      this.logger.warn(`Sales admin Calendly org lookup failed: ${err.message}`);
+    }
+    return this._calendlyOrgUri;
+  }
+
+  async fetchCalendlyEvents({ userUri, status, minStart, maxStart }) {
+    const token = this.config.calendlyToken;
+    if (!token || !userUri) return [];
+    const organization = await this.getCalendlyOrganization();
+    const params = new URLSearchParams({
+      user: userUri,
+      min_start_time: new Date(minStart).toISOString(),
+      max_start_time: new Date(maxStart).toISOString(),
+      count: '100',
+    });
+    if (organization) params.set('organization', organization);
+    if (status) params.set('status', status);
+    const res = await calendlyHttpGetJson(`${this.config.calendlyBaseUrl}/scheduled_events?${params.toString()}`, token);
+    return Array.isArray(res?.collection) ? res.collection : [];
+  }
+
+  // Override a HubSpot meeting's status with Calendly's when Calendly says the booked
+  // event at that start time was canceled. Safe no-op when there's no Calendly token /
+  // user URI or on any error — the digest then falls back to the HubSpot signal.
+  async annotateCalendlyStatus(ae, meetings = [], { start, end } = {}) {
+    const userUri = calendlyUserUriForAe(ae);
+    if (!this.config.calendlyToken || !userUri || !meetings.length) return meetings;
+    try {
+      const canceled = await this.fetchCalendlyEvents({ userUri, status: 'canceled', minStart: start, maxStart: end });
+      const canceledStartMs = new Set(canceled.map(event => Date.parse(event.start_time)).filter(Number.isFinite));
+      if (!canceledStartMs.size) return meetings;
+      for (const meeting of meetings) {
+        const startMs = Date.parse(meeting.properties?.hs_meeting_start_time || '');
+        if (Number.isFinite(startMs) && canceledStartMs.has(startMs)) meeting._calendlyStatus = 'canceled';
+      }
+    } catch (err) {
+      this.logger.warn(`Sales admin Calendly verification skipped for ${ae.name}: ${err.message}`);
+    }
+    return meetings;
   }
 
   async meetingsForToday(ae, now = new Date()) {

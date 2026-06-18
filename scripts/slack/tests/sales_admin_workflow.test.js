@@ -531,6 +531,42 @@ test('sales admin tomorrow summary excludes NO_SHOW/cancelled duplicate meetings
   assert.match(posts[0].text, /Real Demo/);
 });
 
+test('sales admin marks a meeting cancelled when Calendly (source of truth) says so', async () => {
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async () => ({ ts: '1' }) } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-cal-${Date.now()}-${Math.random()}.json`),
+      CALENDLY_API_MASTER: 'cal-test-token',
+      CALENDLY_ORGANIZATION: 'https://api.calendly.com/organizations/org',
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  // Stub the Calendly fetch with the real Calendly timestamp format (6-digit fractional).
+  workflow.fetchCalendlyEvents = async ({ status }) => (status === 'canceled'
+    ? [{ start_time: '2026-06-18T12:00:00.000000Z', name: 'Truewind Intro Meeting' }]
+    : []);
+  const ae = workflow.config.roster[0];
+  const meetings = [
+    { id: 'm1', properties: { hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_start_time: '2026-06-18T12:00:00Z' } },
+    { id: 'm2', properties: { hs_meeting_title: 'Real call', hs_meeting_start_time: '2026-06-18T18:00:00Z' } },
+  ];
+
+  await workflow.annotateCalendlyStatus(ae, meetings, { start: new Date('2026-06-18T00:00:00Z'), end: new Date('2026-06-19T00:00:00Z') });
+
+  // Calendly's canceled verdict overrides HubSpot's stale record (by exact start time).
+  assert.equal(meetings[0]._calendlyStatus, 'canceled');
+  assert.equal(classifyMeetingStatus(meetings[0]), 'cancelled');
+  assert.equal(meetings[1]._calendlyStatus, undefined);
+  assert.equal(classifyMeetingStatus(meetings[1]), 'scheduled');
+});
+
 test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
   const workflow = new SalesAdminWorkflow({
     app: { client: { chat: { postMessage: async payload => ({ ts: '1', channel: payload.channel }) } } },
