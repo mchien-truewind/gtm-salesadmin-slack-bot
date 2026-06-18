@@ -139,6 +139,32 @@ test('sales admin HubSpot enrichment falls back to company and contact deals', a
   assert.equal(enriched._deals[0]._associationSource, 'fallback');
 });
 
+test('sales admin createNote associates to contacts/companies/deals, never the meeting', async () => {
+  const calls = [];
+  const client = new HubSpotSalesAdminClient({
+    hubspotRequest: async (path, method = 'GET') => {
+      calls.push({ path, method });
+      if (path === '/crm/v3/objects/notes' && method === 'POST') return { id: 'note-1' };
+      return {};
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  const note = await client.createNote({
+    body: 'No-Show',
+    meeting: { id: 'm1' },
+    contacts: [{ id: 'ct1' }],
+    companies: [{ id: 'co1' }],
+    deals: [{ id: 'd1' }],
+  });
+  assert.equal(note.id, 'note-1');
+  const assocPaths = calls.filter(c => c.method === 'PUT').map(c => c.path);
+  // HubSpot has no notes<->meetings association — must never attempt it (was the 400).
+  assert.ok(!assocPaths.some(p => p.includes('/associations/default/meetings/')), 'must NOT associate note to meeting');
+  assert.ok(assocPaths.some(p => p.includes('/associations/default/contacts/ct1')), 'associates to contact');
+  assert.ok(assocPaths.some(p => p.includes('/associations/default/companies/co1')), 'associates to company');
+  assert.ok(assocPaths.some(p => p.includes('/associations/default/deals/d1')), 'associates to deal');
+});
+
 test('sales admin roster requires channel, Slack user, and HubSpot owner', () => {
   const roster = parseRoster(JSON.stringify([{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: '#gtm-salesadmin-alex' }]));
   assert.deepEqual(roster, [{ name: 'Alex Lee', hubspotOwnerId: '559564379', email: 'alex@trytruewind.com', slackUserId: 'U04BPMPR29G', salesAdminChannel: 'gtm-salesadmin-alex' }]);

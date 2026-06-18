@@ -265,12 +265,18 @@ class HubSpotSalesAdminClient {
       },
     });
     const noteId = note.id;
-    const associations = [];
-    if (meeting?.id) associations.push(this.createDefaultAssociation('notes', noteId, 'meetings', meeting.id));
-    for (const contact of contacts.slice(0, 5)) associations.push(this.createDefaultAssociation('notes', noteId, 'contacts', contact.id || contact));
-    for (const company of companies.slice(0, 3)) associations.push(this.createDefaultAssociation('notes', noteId, 'companies', company.id || company));
-    for (const deal of deals.slice(0, 3)) associations.push(this.createDefaultAssociation('notes', noteId, 'deals', deal.id || deal));
-    await Promise.all(associations.filter(Boolean));
+    // Notes can only be associated to contacts/companies/deals. HubSpot has NO
+    // notes<->meetings association type, so associating to the meeting 400s
+    // ("Invalid Association Creation Requests") and previously failed the whole write.
+    // Associate to the meeting's contacts/companies/deals instead, and isolate each
+    // association so one failure can't drop the note.
+    const targets = [
+      ...contacts.slice(0, 5).map(contact => ['contacts', contact.id || contact]),
+      ...companies.slice(0, 3).map(company => ['companies', company.id || company]),
+      ...deals.slice(0, 3).map(deal => ['deals', deal.id || deal]),
+    ];
+    await Promise.all(targets.map(([toType, toId]) => this.createDefaultAssociation('notes', noteId, toType, toId)
+      .catch(err => this.logger.warn(`Sales admin note association ${toType}/${toId} failed: ${err.message}`))));
     return note;
   }
 
