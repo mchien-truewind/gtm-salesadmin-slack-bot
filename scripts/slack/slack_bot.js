@@ -221,7 +221,7 @@ function createSlackApp() {
   });
 }
 
-async function hubspotRequest(endpoint, method = 'GET', body = null) {
+function hubspotRequestOnce(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint.startsWith('http') ? endpoint : `https://api.hubapi.com${endpoint}`);
     const options = {
@@ -249,6 +249,7 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
             : parsed;
           const err = new Error(`HubSpot ${res.statusCode}: ${responseMessage}`);
           err.statusCode = res.statusCode;
+          err.retryAfterMs = Number(res.headers['retry-after']) > 0 ? Number(res.headers['retry-after']) * 1000 : 0;
           err.body = parsed;
           reject(err);
           return;
@@ -264,6 +265,24 @@ async function hubspotRequest(endpoint, method = 'GET', body = null) {
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
+}
+
+// Retry on HubSpot rate limits (429 "secondly limit") and transient 5xx with backoff,
+// honoring Retry-After. The sales-admin scans fan out many calls per AE and were
+// failing whole scans on bursts; backing off and retrying lets them complete.
+const HUBSPOT_MAX_ATTEMPTS = Number(process.env.HUBSPOT_MAX_ATTEMPTS || 5);
+async function hubspotRequest(endpoint, method = 'GET', body = null) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await hubspotRequestOnce(endpoint, method, body);
+    } catch (err) {
+      const retryable = err.statusCode === 429 || (err.statusCode >= 500 && err.statusCode < 600);
+      if (!retryable || attempt >= HUBSPOT_MAX_ATTEMPTS) throw err;
+      const waitMs = err.retryAfterMs || Math.min(500 * 2 ** (attempt - 1), 8000);
+      console.log(`HubSpot ${err.statusCode}; retry ${attempt}/${HUBSPOT_MAX_ATTEMPTS - 1} in ${waitMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
 }
 
 function resolveCredentialPath(envVar, defaultPath) {
