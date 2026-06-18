@@ -220,7 +220,7 @@ function testGtmSlackUsersMapToHubSpotOwners() {
     ['U0AURH4KMRN', '91143844', 'Brendan Moody'],
     ['U0AKMHVCJMA', '89305622', 'Xavier Marco'],
     ['U09QC3B292R', '84547076', 'Sarah Elix'],
-    ['U04BPMPR29G', '60918610', 'Alex Lee'],
+    ['U04BPMPR29G', '559564379', 'Alex Lee'],
     ['U0B4MRN83FE', '92555980', 'Amy Vetter'],
     ['U0ABULY5TEK', '91143842', 'Jenilee Chen'],
   ];

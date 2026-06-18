@@ -126,8 +126,8 @@ const TRUEWIND_HUBSPOT = {
     xavier: { id: '89305622', name: 'Xavier Marco' },
     'mercedes chien': { id: '87811681', name: 'Mercedes Chien' },
     mercedes: { id: '87811681', name: 'Mercedes Chien' },
-    'alex lee': { id: '60918610', name: 'Alex Lee' },
-    alex: { id: '60918610', name: 'Alex Lee' },
+    'alex lee': { id: '559564379', name: 'Alex Lee' },
+    alex: { id: '559564379', name: 'Alex Lee' },
     'amy vetter': { id: '92555980', name: 'Amy Vetter' },
     amy: { id: '92555980', name: 'Amy Vetter' },
     'aidan gleghorn': { id: '89053735', name: 'Aidan Gleghorn' },
@@ -148,7 +148,7 @@ const DEFAULT_SLACK_TO_HUBSPOT_OWNER = {
   U0AURH4KMRN: { id: '91143844', name: 'Brendan Moody' },
   U0AKMHVCJMA: { id: '89305622', name: 'Xavier Marco' },
   U09QC3B292R: { id: '84547076', name: 'Sarah Elix' },
-  U04BPMPR29G: { id: '60918610', name: 'Alex Lee' },
+  U04BPMPR29G: { id: '559564379', name: 'Alex Lee' },
   U0B4MRN83FE: { id: '92555980', name: 'Amy Vetter' },
   U0ABULY5TEK: { id: '91143842', name: 'Jenilee Chen' },
 };
@@ -3492,7 +3492,7 @@ When someone asks you to schedule, book, or create an invite for a recruiting in
 Key owner IDs:
 - Xavier Marco: 89305622
 - Mercedes Chien: 87811681
-- Alex Lee: 60918610
+- Alex Lee: 559564379
 - Amy Vetter: 92555980
 - Aidan Gleghorn: 89053735
 - Noah Salah: 90960689
