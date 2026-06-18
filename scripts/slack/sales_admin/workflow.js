@@ -195,6 +195,10 @@ function classifyMeetingStatus(meeting) {
   if (outcome === 'CANCELED' || outcome === 'CANCELLED') return 'cancelled';
   if (title.startsWith('canceled:') || title.startsWith('cancelled:')) return 'cancelled';
   if (/^\[cancell?ed\]/.test(title)) return 'cancelled';
+  // Any other terminal outcome means this isn't a live upcoming call. Calendly often
+  // leaves a duplicate of a cancelled meeting marked NO_SHOW; treating these as
+  // resolved keeps them out of the "upcoming calls" digest.
+  if (outcome === 'NO_SHOW' || outcome === 'COMPLETED' || outcome === 'RESCHEDULED') return 'resolved';
   return 'scheduled';
 }
 
@@ -970,7 +974,7 @@ class SalesAdminWorkflow {
         if (this.state.has(key)) { stats.skipped += 1; continue; }
         try {
           const meetings = await this.meetingsForToday(ae, now);
-          const scheduled = meetings.filter(meeting => classifyMeetingStatus(meeting) !== 'cancelled');
+          const scheduled = meetings.filter(meeting => classifyMeetingStatus(meeting) === 'scheduled');
           const cancelled = meetings.filter(meeting => classifyMeetingStatus(meeting) === 'cancelled' && !this.state.has(`cancel:${meeting.id}:${ae.hubspotOwnerId}`));
           const lines = [`Good morning <@${ae.slackUserId}>. Here are your meetings for today.`];
           if (scheduled.length === 0) lines.push('\nNo scheduled meetings found.');
@@ -1013,7 +1017,7 @@ class SalesAdminWorkflow {
         if (this.state.has(key)) { stats.skipped += 1; continue; }
         try {
           const meetings = await this.meetingsForTomorrow(ae, now);
-          const scheduled = meetings.filter(meeting => classifyMeetingStatus(meeting) !== 'cancelled');
+          const scheduled = meetings.filter(meeting => classifyMeetingStatus(meeting) === 'scheduled');
           const cancelled = meetings.filter(meeting => classifyMeetingStatus(meeting) === 'cancelled');
           const lines = [
             `:calendar: *Tomorrow's calls — ${dateLabel}*`,
@@ -1151,7 +1155,7 @@ class SalesAdminWorkflow {
           const meetings = await this.meetingsForToday(ae, now);
           for (const meeting of meetings) {
             if (meetingId && String(meeting.id) !== meetingId) { stats.skipped += 1; continue; }
-            if (classifyMeetingStatus(meeting) === 'cancelled') { stats.skipped += 1; continue; }
+            if (classifyMeetingStatus(meeting) !== 'scheduled') { stats.skipped += 1; continue; }
             const key = `post:${meeting.id}:${ae.hubspotOwnerId}`;
             if (!force && this.state.has(key)) { stats.skipped += 1; continue; }
             const endMs = meetingEndMs(meeting);

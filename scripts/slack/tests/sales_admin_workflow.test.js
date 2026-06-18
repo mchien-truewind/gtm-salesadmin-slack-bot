@@ -43,6 +43,11 @@ test('sales admin cancellation detection handles CalendarSync, Calendly, and out
   assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: '[Canceled] Calendly: Intro to Truewind' })), 'cancelled');
   assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Intro to Truewind', hs_meeting_outcome: 'CANCELED' })), 'cancelled');
   assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Intro to Truewind' })), 'scheduled');
+  // Terminal outcomes (e.g. Calendly's NO_SHOW duplicate of a cancelled meeting) are
+  // resolved, not live upcoming calls.
+  assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_outcome: 'NO_SHOW' })), 'resolved');
+  assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_outcome: 'COMPLETED' })), 'resolved');
+  assert.equal(classifyMeetingStatus(meeting({ hs_meeting_title: 'Truewind Intro Meeting', hs_meeting_outcome: 'RESCHEDULED' })), 'resolved');
 });
 
 test('sales admin cancellation source labeling distinguishes CalendarSync and Calendly', () => {
@@ -490,6 +495,40 @@ test('sales admin tomorrow summary flags closed-deal meetings instead of hiding 
   assert.match(posts[0].text, /:rotating_light:/);
   assert.match(posts[0].text, /please check/i);
   assert.ok(!/Deal stage: Stage 7: Closed\/Lost/.test(posts[0].text), 'closed deal shows the alarm, not a plain stage line');
+});
+
+test('sales admin tomorrow summary excludes NO_SHOW/cancelled duplicate meetings', async () => {
+  const posts = [];
+  const workflow = new SalesAdminWorkflow({
+    app: { client: { chat: { postMessage: async payload => { posts.push(payload); return { ts: '1', channel: payload.channel }; } } } },
+    hubspotRequest: async () => ({ results: [] }),
+    anthropic: null,
+    env: {
+      SALES_ADMIN_ENABLED: 'true',
+      SALES_ADMIN_AE_ROSTER_JSON: JSON.stringify([
+        { name: 'Sarah Elix', hubspotOwnerId: '84547076', email: 'sarah@trytruewind.com', slackUserId: 'U09QC3B292R', salesAdminChannel: 'gtm-salesadmin-sarah' },
+      ]),
+      SALES_ADMIN_STATE_PATH: path.join(os.tmpdir(), `sales-admin-resolved-${Date.now()}-${Math.random()}.json`),
+      SLACK_BOT_TOKEN: 'xoxb-test',
+    },
+    logger: { log() {}, warn() {}, error() {} },
+  });
+  workflow.channelIdsByOwnerId.set('84547076', 'C_SARAH');
+  // Mirrors the real GRF data: a NO_SHOW duplicate + its [Canceled] twin, plus a real call.
+  workflow.meetingsForTomorrow = async () => [
+    { id: 'noshow', properties: { hs_meeting_title: 'Ghost Meeting', hs_meeting_outcome: 'NO_SHOW', hs_meeting_start_time: '2026-06-04T12:00:00.000Z' }, _companies: [{ id: 'c1', name: 'GRF' }] },
+    { id: 'canceled', properties: { hs_meeting_title: '[Canceled] Real Cancel', hs_meeting_start_time: '2026-06-04T12:30:00.000Z' }, _companies: [{ id: 'c1', name: 'GRF' }] },
+    { id: 'live', properties: { hs_meeting_title: 'Real Demo', hs_meeting_start_time: '2026-06-04T18:00:00.000Z' }, _companies: [{ id: 'c2', name: 'Acme' }], _deals: [{ id: 'd1', dealname: 'Acme', pipeline: '105321581', dealstage: '190380582' }] },
+  ];
+  workflow.buildStageDecisionForMeeting = async meeting => buildStageDecision({ deal: meeting._deals?.[0], stages: STAGES });
+
+  await workflow.runTomorrowSummaries(new Date('2026-06-03T18:00:00.000Z'));
+
+  assert.equal(posts.length, 1);
+  assert.ok(!/Ghost Meeting/.test(posts[0].text), 'NO_SHOW duplicate must not appear as a live call');
+  assert.match(posts[0].text, /Cancelled tomorrow/);
+  assert.match(posts[0].text, /Real Cancel/);
+  assert.match(posts[0].text, /Real Demo/);
 });
 
 test('sales admin day fetch dedupes duplicate HubSpot meeting records', async () => {
