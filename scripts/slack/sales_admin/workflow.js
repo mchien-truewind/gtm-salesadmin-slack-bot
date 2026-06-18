@@ -91,18 +91,25 @@ function buildConfig(env = process.env) {
   };
 }
 
-// Calendly is the source of truth for booked intro meetings. Known AE Calendly user
-// URIs (from calendly_hubspot.js). Andrew/Ari are not mapped yet — they fall back to the
-// HubSpot cancellation signal until their Calendly user URIs are added (here or via the
-// roster's optional calendlyUserUri field).
-const CALENDLY_USER_URI_BY_OWNER = {
-  '84547076': 'https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01', // Sarah Elix
-  '89305622': 'https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d', // Xavier Marco
-  '92555980': 'https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b', // Amy Vetter
+// Calendly is the source of truth for booked intro meetings. AE Calendly user URIs,
+// keyed by work email (stable; avoids HubSpot owner-id ambiguity). Pulled from the
+// Calendly org membership list. A roster entry's optional calendlyUserUri overrides.
+const CALENDLY_USER_URI_BY_EMAIL = {
+  'sarah@trytruewind.com': 'https://api.calendly.com/users/069e97c6-0691-4472-84f2-cad9c76b6e01',
+  'xavier@trytruewind.com': 'https://api.calendly.com/users/ac8a0acf-71b8-4db8-b74d-31ea6eaef11d',
+  'amy@trytruewind.com': 'https://api.calendly.com/users/faa4a75c-b934-4b35-8b42-eef03611a78b',
+  'andrew@trytruewind.com': 'https://api.calendly.com/users/44374fd3-909c-488f-a2d9-82228913696e',
+  'ari@trytruewind.com': 'https://api.calendly.com/users/39bb9112-8657-42a1-b28e-8038fae1f506',
+  'alex@trytruewind.com': 'https://api.calendly.com/users/e48355a2-611c-4757-bc0c-670e4d8061f3',
+  'brendan@trytruewind.com': 'https://api.calendly.com/users/eed5543c-719e-408a-8342-f1af44fff9fe',
+  'jenilee@trytruewind.com': 'https://api.calendly.com/users/53fad818-0025-4434-96f3-1941e6146b57',
+  'mercedes@trytruewind.com': 'https://api.calendly.com/users/bd163793-9165-4b66-83d8-66f0e528cc9a',
+  'noah@trytruewind.com': 'https://api.calendly.com/users/c01da68a-1dec-4c65-be1a-443e4fcd57e4',
+  'tenn@trytruewind.com': 'https://api.calendly.com/users/c461478b-2453-4642-bf77-82dd5c468f6c',
 };
 
 function calendlyUserUriForAe(ae = {}) {
-  return ae.calendlyUserUri || CALENDLY_USER_URI_BY_OWNER[String(ae.hubspotOwnerId || '')] || '';
+  return ae.calendlyUserUri || CALENDLY_USER_URI_BY_EMAIL[String(ae.email || '').trim().toLowerCase()] || '';
 }
 
 function calendlyHttpGetJson(url, token, timeoutMs = 15000) {
